@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+#
+# Aperture installer for macOS/Linux.
+#
+# Installs -- or reinstalls/upgrades, if already present -- every
+# dependency Aperture needs (Go, Node.js, ffuf, feroxbuster), then builds
+# the frontend and the aperture binary from this checkout and installs
+# everything into one directory on PATH.
+#
+# Usage: ./install.sh
+# Override the install location with: APERTURE_INSTALL_DIR=/some/dir ./install.sh
+
+set -euo pipefail
+
+# Resolve the directory this script lives in so it works regardless of the
+# caller's cwd (e.g. `bash /path/to/install.sh`), and treat it as the repo root.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+REPO_ROOT="$SCRIPT_DIR"
+cd "$REPO_ROOT"
+
+INSTALL_DIR="${APERTURE_INSTALL_DIR:-$HOME/.local/bin}"
+MIN_GO_VERSION="1.23"
+MIN_NODE_MAJOR="20"
+
+# --- output helpers ---------------------------------------------------------
+BOLD=$'\033[1m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; RED=$'\033[31m'; RESET=$'\033[0m'
+info() { printf '%s==>%s %s\n' "$BOLD" "$RESET" "$1"; }
+ok()   { printf '%s✓%s %s\n' "$GREEN" "$RESET" "$1"; }
+warn() { printf '%s!%s %s\n' "$YELLOW" "$RESET" "$1" >&2; }
+fail() { printf '%s✗ %s%s\n' "$RED" "$1" "$RESET" >&2; exit 1; }
+
+# Bail out early if this script has been copied somewhere other than the
+# repo root -- everything below assumes it can build Aperture from source.
+if [[ ! -f "$REPO_ROOT/go.mod" || ! -d "$REPO_ROOT/cmd/aperture" ]]; then
+  fail "install.sh must be run from the root of the Aperture repo checkout."
+fi
+
+mkdir -p "$INSTALL_DIR"
+
+# --- OS / arch detection -----------------------------------------------------
+OS="$(uname -s)"
+ARCH="$(uname -m)"
+
+# Only macOS and Linux are supported here; Windows users run install.ps1.
+case "$OS" in
+  Darwin) PLATFORM="macos" ;;
+  Linux)  PLATFORM="linux" ;;
+  *) fail "Unsupported OS: $OS (this script supports macOS and Linux; use install.ps1 on Windows)" ;;
+esac
+
+# Map `uname -m` to feroxbuster's release-asset architecture naming.
+case "$ARCH" in
+  x86_64|amd64)  FEROX_ARCH="x86_64" ;;
+  arm64|aarch64) FEROX_ARCH="aarch64" ;;
+  armv7l|armv7)  FEROX_ARCH="armv7" ;;
+  i386|i686)     FEROX_ARCH="x86" ;;
+  *) fail "Unsupported architecture: $ARCH" ;;
+esac
+
+# --- package manager helper --------------------------------------------------
+# Tries every package manager we know how to drive, in the order given
+# below, and installs with whichever is found first. Each argument is the
+# package name(s) to pass to that specific manager (names vary by distro).
+# Returns 1 (without printing anything) if none of them are present, so
+# callers can fall back to a manual-install message.
+pkg_install() {
+  local pkgs_brew="$1" pkgs_apt="$2" pkgs_dnf="$3" pkgs_pacman="$4" pkgs_apk="$5" pkgs_zypper="$6"
+  if command -v brew &>/dev/null; then
+    brew install $pkgs_brew
+  elif command -v apt-get &>/dev/null; then
+    sudo apt-get update -y && sudo apt-get install -y $pkgs_apt
+  elif command -v dnf &>/dev/null; then
+    sudo dnf install -y $pkgs_dnf
+  elif command -v pacman &>/dev/null; then
+    sudo pacman -Sy --noconfirm $pkgs_pacman
+  elif command -v apk &>/dev/null; then
+    sudo apk add --no-cache $pkgs_apk
+  elif command -v zypper &>/dev/null; then
+    sudo zypper install -y $pkgs_zypper
+  else
+    return 1
+  fi
+}
+
+# Returns success if version $1 >= version $2 (dotted numeric comparison).
+version_ge() {
+  [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1)" = "$2" ]
+}
+
+# --- prerequisites: Go and Node ----------------------------------------------
+
+ensure_go() {
+  info "Checking Go toolchain..."
+  # Skip the (re)install entirely if a sufficiently new Go is already there.
+  if command -v go &>/dev/null; then
+    local ver
+    ver="$(go version | awk '{print $3}' | sed 's/^go//')"
+    if version_ge "$ver" "$MIN_GO_VERSION"; then
+      ok "Go $ver already installed"
+      return
+    fi
+    warn "Go $ver is older than the required $MIN_GO_VERSION; attempting an upgrade"
+  fi
+  if ! pkg_install "go" "golang-go" "golang" "go" "go" "go"; then
+    fail "Go >= $MIN_GO_VERSION is required. Automatic install did not succeed -- install it manually from https://go.dev/dl/ and re-run this script."
+  fi
+  command -v go &>/dev/null || fail "Go installation appears to have failed."
+  ok "Go $(go version | awk '{print $3}') installed"
+}
+
+ensure_node() {
+  info "Checking Node.js..."
+  # Skip the (re)install entirely if a sufficiently new Node is already there.
+  if command -v node &>/dev/null; then
+    local major
+    major="$(node -v | sed 's/^v//' | cut -d. -f1)"
+    if [ "$major" -ge "$MIN_NODE_MAJOR" ]; then
+      ok "Node $(node -v) already installed"
+      return
+    fi
+    warn "Node $(node -v) is older than required v$MIN_NODE_MAJOR.x; attempting an upgrade"
+  fi
+  if ! pkg_install "node" "nodejs npm" "nodejs npm" "nodejs npm" "nodejs npm" "nodejs npm"; then
+    fail "Node.js >= $MIN_NODE_MAJOR is required. Automatic install did not succeed -- install it manually from https://nodejs.org/ and re-run this script."
+  fi
+  command -v npm &>/dev/null || fail "Node.js installation appears to have failed."
+  ok "Node $(node -v) installed"
+}
+
+# --- Aperture's own tool dependencies ----------------------------------------
+
+install_ffuf() {
+  info "Installing ffuf (latest) via go install..."
+  # `go install ...@latest` always re-fetches and rebuilds, so this is
+  # inherently an upgrade-or-fresh-install regardless of prior state.
+  GOBIN="$INSTALL_DIR" go install github.com/ffuf/ffuf/v2@latest
+  ok "ffuf $("$INSTALL_DIR/ffuf" -V 2>&1 | head -n1) installed to $INSTALL_DIR/ffuf"
+}
+
+install_feroxbuster() {
+  info "Installing feroxbuster (latest release) for ${PLATFORM}/${FEROX_ARCH}..."
+  local asset="${FEROX_ARCH}-${PLATFORM}-feroxbuster.zip"
+  local url="https://github.com/epi052/feroxbuster/releases/latest/download/${asset}"
+  local tmp
+  tmp="$(mktemp -d)"
+  # Always clean up the scratch directory, whether this function succeeds or fails.
+  trap 'rm -rf "$tmp"' RETURN
+
+  curl -fsSL "$url" -o "$tmp/ferox.zip" || fail "Failed to download feroxbuster from $url"
+
+  # unzip ships with macOS by default but not all minimal Linux installs.
+  if ! command -v unzip &>/dev/null; then
+    pkg_install "unzip" "unzip" "unzip" "unzip" "unzip" "unzip" || fail "unzip is required to install feroxbuster and could not be installed automatically."
+  fi
+  unzip -oq "$tmp/ferox.zip" -d "$tmp" || fail "Failed to extract feroxbuster archive"
+
+  mv "$tmp/feroxbuster" "$INSTALL_DIR/feroxbuster"
+  chmod +x "$INSTALL_DIR/feroxbuster"
+  ok "feroxbuster $("$INSTALL_DIR/feroxbuster" -V) installed to $INSTALL_DIR/feroxbuster"
+}
+
+# --- build Aperture itself from this checkout --------------------------------
+
+build_frontend() {
+  info "Building frontend..."
+  ( cd "$REPO_ROOT/web" && npm install && npm run build )
+  ok "Frontend built into internal/webui/dist"
+}
+
+build_aperture() {
+  info "Building aperture binary..."
+  go build -o "$INSTALL_DIR/aperture" ./cmd/aperture
+  chmod +x "$INSTALL_DIR/aperture"
+  ok "aperture installed to $INSTALL_DIR/aperture"
+}
+
+# --- PATH setup ---------------------------------------------------------------
+
+ensure_path() {
+  # Only touch shell rc files if INSTALL_DIR isn't already resolvable.
+  case ":$PATH:" in
+    *":$INSTALL_DIR:"*) ok "$INSTALL_DIR is already on PATH"; return ;;
+  esac
+
+  local rc
+  case "$(basename "${SHELL:-bash}")" in
+    zsh)  rc="$HOME/.zshrc" ;;
+    fish) rc="$HOME/.config/fish/config.fish" ;;
+    *)
+      # Prefer .bash_profile on macOS (login shells), .bashrc on Linux.
+      if [[ "$OS" == "Darwin" ]]; then rc="$HOME/.bash_profile"; else rc="$HOME/.bashrc"; fi
+      ;;
+  esac
+
+  # Re-running install.sh within the same shell session (before the rc
+  # file has been re-sourced) would otherwise append a duplicate line
+  # every time, since $PATH itself hasn't picked up the earlier change yet.
+  if [[ -f "$rc" ]] && grep -qF "$INSTALL_DIR" "$rc" 2>/dev/null; then
+    export PATH="$INSTALL_DIR:$PATH"
+    ok "$INSTALL_DIR is already configured in $rc (open a new shell if it's not on PATH yet)"
+    return
+  fi
+
+  if [[ "$rc" == *fish* ]]; then
+    printf '\nfish_add_path %s\n' "$INSTALL_DIR" >> "$rc"
+  else
+    printf '\nexport PATH="%s:$PATH"\n' "$INSTALL_DIR" >> "$rc"
+  fi
+  export PATH="$INSTALL_DIR:$PATH"
+  warn "Added $INSTALL_DIR to PATH in $rc -- open a new shell (or run: source $rc)"
+}
+
+# --- main ----------------------------------------------------------------------
+
+info "Installing Aperture and its dependencies into $INSTALL_DIR"
+ensure_go
+ensure_node
+install_ffuf
+install_feroxbuster
+build_frontend
+build_aperture
+ensure_path
+
+echo
+ok "Done. Installed:"
+printf '  go          %s\n' "$(go version | awk '{print $3}')"
+printf '  node        %s\n' "$(node -v)"
+printf '  ffuf        %s\n' "$("$INSTALL_DIR/ffuf" -V 2>&1 | head -n1)"
+printf '  feroxbuster %s\n' "$("$INSTALL_DIR/feroxbuster" -V)"
+printf '  aperture    %s\n' "$INSTALL_DIR/aperture"
+echo
+info "Run 'aperture' to start (open a new shell first if PATH was just updated)."

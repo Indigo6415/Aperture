@@ -1,0 +1,4 @@
+/aperture
+*.db
+*.db-journal
+.DS_Store
