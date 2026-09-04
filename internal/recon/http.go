@@ -24,7 +24,12 @@ const maxBodyPeek = 64 * 1024
 //
 // Data shape: {"scheme": string, "finalUrl": string, "statusCode": int,
 // "server": string, "title": string, "headers": map[string]string,
-// "redirects": []string}
+// "redirects": []string, "cloudflare": bool, "bodySnippet": string}
+//
+// bodySnippet is the same bytes already read to look for <title> (see
+// maxBodyPeek) -- surfaced here too so a subdomain takeover check
+// (takeover.go) can look for a provider's "unclaimed" fingerprint without a
+// second request.
 func checkHTTP(ctx context.Context, domain string) (map[string]any, error) {
 	var lastErr error
 	for _, scheme := range []string{"https", "http"} {
@@ -75,12 +80,30 @@ func fetchOnce(ctx context.Context, scheme, domain string) (map[string]any, erro
 	}
 
 	return map[string]any{
-		"scheme":     scheme,
-		"finalUrl":   resp.Request.URL.String(),
-		"statusCode": resp.StatusCode,
-		"server":     resp.Header.Get("Server"),
-		"title":      title,
-		"headers":    headers,
-		"redirects":  redirects,
+		"scheme":      scheme,
+		"finalUrl":    resp.Request.URL.String(),
+		"statusCode":  resp.StatusCode,
+		"server":      resp.Header.Get("Server"),
+		"title":       title,
+		"headers":     headers,
+		"redirects":   redirects,
+		"cloudflare":  isCloudflare(headers),
+		"bodySnippet": string(body),
 	}, nil
+}
+
+// isCloudflare reports whether a response looks like it was served (or at
+// least fronted) by Cloudflare -- checked via headers Cloudflare adds on
+// virtually every response it proxies, rather than relying on any one of
+// them alone since a site can suppress individual headers.
+func isCloudflare(headers map[string]string) bool {
+	if strings.Contains(strings.ToLower(headers["Server"]), "cloudflare") {
+		return true
+	}
+	for _, h := range []string{"Cf-Ray", "Cf-Cache-Status", "Cf-Request-Id"} {
+		if _, ok := headers[h]; ok {
+			return true
+		}
+	}
+	return false
 }

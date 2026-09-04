@@ -67,3 +67,48 @@ func (s *Server) handleDeleteWordlist(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
+
+type setCategoriesRequest struct {
+	Categories []wordlists.Category `json:"categories"`
+}
+
+// handleSetWordlistCategories replaces the full category set a wordlist
+// belongs to -- the drag-and-drop UI sends the complete resulting set on
+// every drop rather than one add/remove at a time.
+func (s *Server) handleSetWordlistCategories(w http.ResponseWriter, r *http.Request) {
+	var req setCategoriesRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := wordlists.SetCategories(s.wordlistsDir, r.PathValue("name"), req.Categories); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+type duplicateWordlistRequest struct {
+	NewName    string               `json:"newName"`
+	Categories []wordlists.Category `json:"categories,omitempty"`
+}
+
+// handleDuplicateWordlist copies a wordlist under a new name so the same
+// content can be tagged into a second category (e.g. drag "common.txt"
+// into Misc too) without the original losing its own category.
+func (s *Server) handleDuplicateWordlist(w http.ResponseWriter, r *http.Request) {
+	var req duplicateWordlistRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.NewName == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("newName is required"))
+		return
+	}
+	if err := wordlists.Duplicate(s.wordlistsDir, r.PathValue("name"), req.NewName, req.Categories); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}

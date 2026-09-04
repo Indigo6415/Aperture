@@ -3,6 +3,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"io/fs"
 	"log"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"sync"
 
 	"github.com/Indigo6415/Aperture/internal/adapters"
 	"github.com/Indigo6415/Aperture/internal/engine"
@@ -22,7 +24,24 @@ type Server struct {
 	hub          *hub
 	mux          *http.ServeMux
 	wordlistsDir string
+
+	// cancelMu guards scanCancels/runCancels, populated while a scan's recon
+	// phase (scanCancels) or a scanner run (runCancels) is in flight so
+	// handleCancelScan can stop them on demand -- see cancel.go.
+	cancelMu    sync.Mutex
+	scanCancels map[string]context.CancelFunc
+	runCancels  map[string]context.CancelFunc
+
+	// screenshotSem bounds how many headless-Chrome screenshot captures run
+	// concurrently across the whole server (see captureScreenshot in
+	// screenshots.go) -- each is a real browser process, so fanning one out
+	// per discovered subdomain unbounded would be its own resource-exhaustion
+	// bug.
+	screenshotSem chan struct{}
 }
+
+// maxConcurrentScreenshots is screenshotSem's capacity.
+const maxConcurrentScreenshots = 4
 
 // NewServer wires up all routes. uiFS is the embedded, built frontend; pass
 // nil when running against a separate frontend dev server. wordlistsDir is
@@ -31,11 +50,14 @@ type Server struct {
 // the wordlist-management endpoints both read/write it.
 func NewServer(st *store.Store, eng *engine.Engine, uiFS fs.FS, wordlistsDir string) *Server {
 	s := &Server{
-		store:        st,
-		engine:       eng,
-		hub:          newHub(),
-		mux:          http.NewServeMux(),
-		wordlistsDir: wordlistsDir,
+		store:         st,
+		engine:        eng,
+		hub:           newHub(),
+		mux:           http.NewServeMux(),
+		wordlistsDir:  wordlistsDir,
+		scanCancels:   map[string]context.CancelFunc{},
+		runCancels:    map[string]context.CancelFunc{},
+		screenshotSem: make(chan struct{}, maxConcurrentScreenshots),
 	}
 
 	s.mux.HandleFunc("GET /api/tools", s.handleListTools)
@@ -43,20 +65,22 @@ func NewServer(st *store.Store, eng *engine.Engine, uiFS fs.FS, wordlistsDir str
 	s.mux.HandleFunc("POST /api/scan", s.handleStartScan)
 	s.mux.HandleFunc("GET /api/scans", s.handleListScans)
 	s.mux.HandleFunc("GET /api/scans/{id}", s.handleGetScan)
+	s.mux.HandleFunc("GET /api/scans/{id}/runs", s.handleListScanRuns)
+	s.mux.HandleFunc("POST /api/scans/{id}/content-discovery", s.handleScanContentDiscovery)
+	s.mux.HandleFunc("POST /api/scans/{id}/restart", s.handleRestartScan)
+	s.mux.HandleFunc("POST /api/scans/{id}/runs/{kind}/restart", s.handleRestartScanRun)
+	s.mux.HandleFunc("POST /api/scans/{id}/cancel", s.handleCancelScan)
+	s.mux.HandleFunc("GET /api/scans/{id}/report", s.handleScanReport)
+	s.mux.HandleFunc("GET /api/scans/{id}/screenshots", s.handleListScreenshots)
+	s.mux.HandleFunc("GET /api/scans/{id}/screenshots/{hostname}", s.handleGetScreenshot)
 	s.mux.HandleFunc("GET /ws/scans/{id}", s.handleWatchScan)
 
 	s.mux.HandleFunc("GET /api/wordlists", s.handleListWordlists)
 	s.mux.HandleFunc("GET /api/wordlists/catalog", s.handleWordlistCatalog)
 	s.mux.HandleFunc("POST /api/wordlists/download", s.handleDownloadWordlist)
 	s.mux.HandleFunc("DELETE /api/wordlists/{name}", s.handleDeleteWordlist)
-
-	s.mux.HandleFunc("GET /api/flows", s.handleListFlows)
-	s.mux.HandleFunc("POST /api/flows", s.handleCreateFlow)
-	s.mux.HandleFunc("GET /api/flows/{id}", s.handleGetFlow)
-	s.mux.HandleFunc("PUT /api/flows/{id}", s.handleUpdateFlow)
-	s.mux.HandleFunc("DELETE /api/flows/{id}", s.handleDeleteFlow)
-	s.mux.HandleFunc("POST /api/flows/{id}/run", s.handleRunFlow)
-	s.mux.HandleFunc("GET /api/flows/{id}/runs", s.handleListRuns)
+	s.mux.HandleFunc("PATCH /api/wordlists/{name}/categories", s.handleSetWordlistCategories)
+	s.mux.HandleFunc("POST /api/wordlists/{name}/duplicate", s.handleDuplicateWordlist)
 
 	s.mux.HandleFunc("GET /api/runs/{id}", s.handleGetRun)
 	s.mux.HandleFunc("GET /api/runs/{id}/findings", s.handleListFindings)

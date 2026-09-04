@@ -24,6 +24,10 @@ const (
 	KindHTTP       CheckKind = "http"
 	KindSubdomains CheckKind = "subdomains"
 	KindWHOIS      CheckKind = "whois"
+	// KindTakeover is only ever emitted for a subdomain flagged as a
+	// possible dangling-CNAME takeover (see fanOutSubdomains) -- a clean
+	// subdomain gets no takeover Check at all, rather than one saying so.
+	KindTakeover CheckKind = "takeover"
 )
 
 // Status is the lifecycle state of one Check.
@@ -175,10 +179,63 @@ func fanOutSubdomains(ctx context.Context, subdomains []string, onCheck func(Che
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			onCheck(runCheck(ctx, sub, KindDNS, subdomainTimeout, func(c context.Context) (map[string]any, error) { return checkDNS(c, sub) }))
+			dnsCheck := runCheck(ctx, sub, KindDNS, subdomainTimeout, func(c context.Context) (map[string]any, error) { return checkDNS(c, sub) })
+			onCheck(dnsCheck)
 			onCheck(runCheck(ctx, sub, KindTLS, subdomainTimeout, func(c context.Context) (map[string]any, error) { return checkTLS(c, sub) }))
-			onCheck(runCheck(ctx, sub, KindHTTP, subdomainTimeout, func(c context.Context) (map[string]any, error) { return checkHTTP(c, sub) }))
+			httpCheck := runCheck(ctx, sub, KindHTTP, subdomainTimeout, func(c context.Context) (map[string]any, error) { return checkHTTP(c, sub) })
+			onCheck(httpCheck)
+
+			if takeover, flagged := detectTakeover(sub, dnsCheck, httpCheck); flagged {
+				onCheck(takeover)
+			}
 		}()
 	}
 	wg.Wait()
+}
+
+// detectTakeover correlates a subdomain's already-completed DNS and HTTP
+// checks (no extra lookups) to flag a possible dangling-CNAME takeover: the
+// CNAME names a known cloud provider, and either DNS itself never resolved
+// an IP for it (the classic dangling case) or the HTTP response body
+// matches that provider's own "unclaimed" fingerprint. A subdomain that
+// doesn't match is not flagged at all -- ok is false, and there's nothing
+// for the caller to emit.
+func detectTakeover(domain string, dnsCheck, httpCheck Check) (Check, bool) {
+	if dnsCheck.Status != StatusDone {
+		return Check{}, false
+	}
+	cname, _ := dnsCheck.Data["cname"].(string)
+	provider, matchesProvider := detectDanglingCNAME(cname)
+	if !matchesProvider {
+		return Check{}, false
+	}
+	a, _ := dnsCheck.Data["a"].([]string)
+	aaaa, _ := dnsCheck.Data["aaaa"].([]string)
+	danglingDNS := len(a) == 0 && len(aaaa) == 0
+
+	bodyConfirms := false
+	if httpCheck.Status == StatusDone {
+		body, _ := httpCheck.Data["bodySnippet"].(string)
+		bodyConfirms = bodyMatchesProvider(provider, body)
+	} else if httpCheck.Status == StatusError {
+		// A dangling CNAME frequently can't even be connected to -- that
+		// failure is itself corroborating evidence, not a reason to skip.
+		bodyConfirms = true
+	}
+
+	if !danglingDNS && !bodyConfirms {
+		return Check{}, false
+	}
+
+	return Check{
+		Domain:    domain,
+		Kind:      KindTakeover,
+		Status:    StatusDone,
+		StartedAt: time.Now(),
+		Data: map[string]any{
+			"cname":    cname,
+			"provider": provider,
+		},
+		FinishedAt: time.Now(),
+	}, true
 }

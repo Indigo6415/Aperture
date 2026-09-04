@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -85,10 +86,24 @@ CREATE INDEX IF NOT EXISTS idx_findings_node_id ON findings(run_id, node_id);
 CREATE TABLE IF NOT EXISTS scans (
 	id TEXT PRIMARY KEY,
 	domain TEXT NOT NULL,
-	flow_id TEXT,
-	run_id TEXT,
+	scheme TEXT,
 	created_at DATETIME NOT NULL
 );
+
+-- One scan fans out into several independently-run scanners (content
+-- discovery, subdomain bruteforce, vhost bruteforce); content discovery in
+-- particular can accumulate more than one run as the user rescans a
+-- filtered subdomain selection, so this is a scan -> many-runs table rather
+-- than columns on scans itself.
+CREATE TABLE IF NOT EXISTS scan_runs (
+	scan_id TEXT NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
+	kind TEXT NOT NULL,
+	flow_id TEXT NOT NULL,
+	run_id TEXT NOT NULL,
+	targets TEXT,
+	created_at DATETIME NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_scan_runs_scan_id ON scan_runs(scan_id);
 
 CREATE TABLE IF NOT EXISTS scan_checks (
 	scan_id TEXT NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
@@ -102,10 +117,36 @@ CREATE TABLE IF NOT EXISTS scan_checks (
 	PRIMARY KEY (scan_id, domain, kind)
 );
 CREATE INDEX IF NOT EXISTS idx_scan_checks_scan_id ON scan_checks(scan_id);
+
+-- One screenshot per scan+hostname, captured opportunistically once a host's
+-- HTTP recon check resolves a live URL for it (see api.captureScreenshot).
+CREATE TABLE IF NOT EXISTS screenshots (
+	scan_id TEXT NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
+	hostname TEXT NOT NULL,
+	url TEXT NOT NULL,
+	image BLOB NOT NULL,
+	captured_at DATETIME NOT NULL,
+	PRIMARY KEY (scan_id, hostname)
+);
 `
 	_, err := s.db.Exec(schema)
 	if err != nil {
 		return fmt.Errorf("store: migrate: %w", err)
+	}
+	// Columns added after the tables above first shipped; ALTER TABLE ADD
+	// COLUMN is the only way to bring an existing on-disk database forward
+	// since CREATE TABLE IF NOT EXISTS never alters an existing table. The
+	// "duplicate column" error is SQLite's way of saying "already migrated",
+	// which is expected and fine on every run after the first.
+	alters := []string{
+		`ALTER TABLE scans ADD COLUMN scheme TEXT`,
+		`ALTER TABLE scans ADD COLUMN options TEXT`,
+		`ALTER TABLE scan_runs ADD COLUMN targets TEXT`,
+	}
+	for _, stmt := range alters {
+		if _, err := s.db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			return fmt.Errorf("store: migrate: %s: %w", stmt, err)
+		}
 	}
 	return nil
 }
@@ -145,38 +186,6 @@ func (s *Store) GetFlow(id string) (engine.Flow, error) {
 	return f, nil
 }
 
-type FlowSummary struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	UpdatedAt time.Time `json:"updatedAt"`
-}
-
-func (s *Store) ListFlows() ([]FlowSummary, error) {
-	rows, err := s.db.Query(`SELECT id, name, updated_at FROM flows ORDER BY updated_at DESC`)
-	if err != nil {
-		return nil, fmt.Errorf("store: list flows: %w", err)
-	}
-	defer rows.Close()
-
-	out := []FlowSummary{}
-	for rows.Next() {
-		var fs FlowSummary
-		if err := rows.Scan(&fs.ID, &fs.Name, &fs.UpdatedAt); err != nil {
-			return nil, fmt.Errorf("store: scan flow: %w", err)
-		}
-		out = append(out, fs)
-	}
-	return out, rows.Err()
-}
-
-func (s *Store) DeleteFlow(id string) error {
-	_, err := s.db.Exec(`DELETE FROM flows WHERE id = ?`, id)
-	if err != nil {
-		return fmt.Errorf("store: delete flow: %w", err)
-	}
-	return nil
-}
-
 // --- Runs ---
 
 type RunStatus string
@@ -186,6 +195,7 @@ const (
 	RunRunning   RunStatus = "running"
 	RunSucceeded RunStatus = "succeeded"
 	RunFailed    RunStatus = "failed"
+	RunCancelled RunStatus = "cancelled"
 )
 
 type Run struct {
@@ -232,30 +242,6 @@ func (s *Store) GetRun(id string) (Run, error) {
 		r.FinishedAt = &finishedAt.Time
 	}
 	return r, nil
-}
-
-func (s *Store) ListRuns(flowID string) ([]Run, error) {
-	rows, err := s.db.Query(`SELECT id, flow_id, status, error, started_at, finished_at FROM runs WHERE flow_id = ? ORDER BY started_at DESC`, flowID)
-	if err != nil {
-		return nil, fmt.Errorf("store: list runs: %w", err)
-	}
-	defer rows.Close()
-
-	out := []Run{}
-	for rows.Next() {
-		var r Run
-		var finishedAt sql.NullTime
-		var errMsg sql.NullString
-		if err := rows.Scan(&r.ID, &r.FlowID, &r.Status, &errMsg, &r.StartedAt, &finishedAt); err != nil {
-			return nil, fmt.Errorf("store: scan run: %w", err)
-		}
-		r.Error = errMsg.String
-		if finishedAt.Valid {
-			r.FinishedAt = &finishedAt.Time
-		}
-		out = append(out, r)
-	}
-	return out, rows.Err()
 }
 
 // --- Findings ---
@@ -325,56 +311,61 @@ func (s *Store) ListFindings(runID, nodeID string) ([]model.Finding, error) {
 
 // --- Scans ---
 
-// Scan is one "enter a domain" dashboard run: the recon checks plus the
-// auto-generated ffuf/feroxbuster flow it kicks off alongside them.
-// FlowID/RunID are empty until the HTTP check resolves and the flow can be
-// built (see api.handleStartScan), so callers should tolerate either being
-// unset for a brief window right after creation.
+// Scan is one "enter a domain" dashboard run: the recon checks plus every
+// scanner (content discovery, subdomain bruteforce, vhost bruteforce) it
+// kicks off alongside them -- see ScanRun for those. Scheme is empty until
+// the apex HTTP check resolves it (see api.runScan), so callers should
+// tolerate it being unset for a brief window right after creation.
 type Scan struct {
 	ID        string    `json:"id"`
 	Domain    string    `json:"domain"`
-	FlowID    string    `json:"flowId,omitempty"`
-	RunID     string    `json:"runId,omitempty"`
+	Scheme    string    `json:"scheme,omitempty"`
+	Options   string    `json:"options,omitempty"` // raw JSON (engine.ScanOptions); opaque to store
 	CreatedAt time.Time `json:"createdAt"`
 }
 
-func (s *Store) CreateScan(id, domain string) error {
-	_, err := s.db.Exec(`INSERT INTO scans (id, domain, created_at) VALUES (?, ?, ?)`, id, domain, time.Now())
+// CreateScan records a new scan. options is the raw JSON-encoded per-scan
+// tuning (thread count/timeout/wordlist/rate limit preset) every scanner
+// flow this scan builds should read back via GetScan -- pass "" to fall
+// back to the engine-wide defaults.
+func (s *Store) CreateScan(id, domain, options string) error {
+	_, err := s.db.Exec(`INSERT INTO scans (id, domain, options, created_at) VALUES (?, ?, ?, ?)`, id, domain, options, time.Now())
 	if err != nil {
 		return fmt.Errorf("store: create scan: %w", err)
 	}
 	return nil
 }
 
-// SetScanFlow links the auto-generated flow/run onto a scan once they've
-// been created (this happens slightly after CreateScan, once the apex HTTP
-// check has determined which scheme to point ffuf/feroxbuster at).
-func (s *Store) SetScanFlow(id, flowID, runID string) error {
-	_, err := s.db.Exec(`UPDATE scans SET flow_id = ?, run_id = ? WHERE id = ?`, flowID, runID, id)
+// SetScanScheme records which scheme (http/https) the apex domain answered
+// on, once the apex HTTP check resolves it -- every scanner built for this
+// scan afterwards (including a later "scan selected subdomains" content
+// discovery run) reuses it instead of re-probing.
+func (s *Store) SetScanScheme(id, scheme string) error {
+	_, err := s.db.Exec(`UPDATE scans SET scheme = ? WHERE id = ?`, scheme, id)
 	if err != nil {
-		return fmt.Errorf("store: set scan flow: %w", err)
+		return fmt.Errorf("store: set scan scheme: %w", err)
 	}
 	return nil
 }
 
 func (s *Store) GetScan(id string) (Scan, error) {
 	var sc Scan
-	var flowID, runID sql.NullString
-	err := s.db.QueryRow(`SELECT id, domain, flow_id, run_id, created_at FROM scans WHERE id = ?`, id).
-		Scan(&sc.ID, &sc.Domain, &flowID, &runID, &sc.CreatedAt)
+	var scheme, options sql.NullString
+	err := s.db.QueryRow(`SELECT id, domain, scheme, options, created_at FROM scans WHERE id = ?`, id).
+		Scan(&sc.ID, &sc.Domain, &scheme, &options, &sc.CreatedAt)
 	if err == sql.ErrNoRows {
 		return Scan{}, fmt.Errorf("store: scan %s: %w", id, ErrNotFound)
 	}
 	if err != nil {
 		return Scan{}, fmt.Errorf("store: get scan: %w", err)
 	}
-	sc.FlowID = flowID.String
-	sc.RunID = runID.String
+	sc.Scheme = scheme.String
+	sc.Options = options.String
 	return sc, nil
 }
 
 func (s *Store) ListScans() ([]Scan, error) {
-	rows, err := s.db.Query(`SELECT id, domain, flow_id, run_id, created_at FROM scans ORDER BY created_at DESC`)
+	rows, err := s.db.Query(`SELECT id, domain, scheme, options, created_at FROM scans ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("store: list scans: %w", err)
 	}
@@ -383,15 +374,280 @@ func (s *Store) ListScans() ([]Scan, error) {
 	out := []Scan{}
 	for rows.Next() {
 		var sc Scan
-		var flowID, runID sql.NullString
-		if err := rows.Scan(&sc.ID, &sc.Domain, &flowID, &runID, &sc.CreatedAt); err != nil {
+		var scheme, options sql.NullString
+		if err := rows.Scan(&sc.ID, &sc.Domain, &scheme, &options, &sc.CreatedAt); err != nil {
 			return nil, fmt.Errorf("store: scan row: %w", err)
 		}
-		sc.FlowID = flowID.String
-		sc.RunID = runID.String
+		sc.Scheme = scheme.String
+		sc.Options = options.String
 		out = append(out, sc)
 	}
 	return out, rows.Err()
+}
+
+// --- Scan runs ---
+
+// ScanKind identifies which of a scan's independent scanners a ScanRun
+// belongs to.
+type ScanKind string
+
+const (
+	ScanKindContentDiscovery    ScanKind = "content-discovery"
+	ScanKindSubdomainBruteforce ScanKind = "subdomain-bruteforce"
+	ScanKindVHostBruteforce     ScanKind = "vhost-bruteforce"
+	ScanKindPortScan            ScanKind = "port-scan"
+	ScanKindVulnScan            ScanKind = "vuln-scan"
+)
+
+// ScanRun is one scanner run belonging to a scan. A scan can own several --
+// content discovery in particular accumulates one per "scan selected
+// subdomains" click, in addition to its initial apex-only run.
+type ScanRun struct {
+	Kind      ScanKind  `json:"kind"`
+	FlowID    string    `json:"flowId"`
+	RunID     string    `json:"runId"`
+	Status    RunStatus `json:"status"`
+	Targets   []string  `json:"targets,omitempty"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+// CreateScanRun records a new scanner run. targets is the set of hostnames
+// this run covers (e.g. the content-discovery targets it was built
+// against) -- used by CoveredTargets to figure out what's already been (or
+// is being) scanned so a later "scan selected"/restart doesn't redundantly
+// re-scan the same hosts. Pass nil for scanners with no per-target concept
+// (subdomain/vhost bruteforce).
+func (s *Store) CreateScanRun(scanID string, kind ScanKind, flowID, runID string, targets []string) error {
+	targetsJSON, err := json.Marshal(targets)
+	if err != nil {
+		return fmt.Errorf("store: marshal scan run targets: %w", err)
+	}
+	_, err = s.db.Exec(`INSERT INTO scan_runs (scan_id, kind, flow_id, run_id, targets, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+		scanID, kind, flowID, runID, string(targetsJSON), time.Now())
+	if err != nil {
+		return fmt.Errorf("store: create scan run: %w", err)
+	}
+	return nil
+}
+
+// ListScanRuns returns every scanner run for a scan, joined with its
+// current run status, in the order they were started -- so a client
+// reloading a past scan can reconstruct which scanners exist and reopen a
+// watch on any still running.
+func (s *Store) ListScanRuns(scanID string) ([]ScanRun, error) {
+	rows, err := s.db.Query(`
+		SELECT sr.kind, sr.flow_id, sr.run_id, r.status, sr.targets, sr.created_at
+		FROM scan_runs sr
+		JOIN runs r ON r.id = sr.run_id
+		WHERE sr.scan_id = ?
+		ORDER BY sr.created_at ASC
+	`, scanID)
+	if err != nil {
+		return nil, fmt.Errorf("store: list scan runs: %w", err)
+	}
+	defer rows.Close()
+
+	out := []ScanRun{}
+	for rows.Next() {
+		var r ScanRun
+		var targets sql.NullString
+		if err := rows.Scan(&r.Kind, &r.FlowID, &r.RunID, &r.Status, &targets, &r.CreatedAt); err != nil {
+			return nil, fmt.Errorf("store: scan run row: %w", err)
+		}
+		if targets.Valid && targets.String != "" && targets.String != "null" {
+			_ = json.Unmarshal([]byte(targets.String), &r.Targets)
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ScanRunRef identifies which scan + scanner kind a run_id belongs to --
+// looked up when a run finishes and the caller (executeRun) needs to decide
+// whether finishing it should trigger another scanner (e.g. a
+// content-discovery run completing kicks off a vuln-scan against its hits).
+type ScanRunRef struct {
+	ScanID string
+	Kind   ScanKind
+}
+
+// GetScanRunByRunID looks up which scan + scanner kind a run_id belongs to.
+func (s *Store) GetScanRunByRunID(runID string) (ScanRunRef, error) {
+	var ref ScanRunRef
+	err := s.db.QueryRow(`SELECT scan_id, kind FROM scan_runs WHERE run_id = ?`, runID).Scan(&ref.ScanID, &ref.Kind)
+	if err == sql.ErrNoRows {
+		return ScanRunRef{}, fmt.Errorf("store: scan run for run %s: %w", runID, ErrNotFound)
+	}
+	if err != nil {
+		return ScanRunRef{}, fmt.Errorf("store: get scan run by run id: %w", err)
+	}
+	return ref, nil
+}
+
+// KindRunning reports whether a scan already has a scanner run of kind
+// currently running -- callers use this to refuse starting a duplicate,
+// overlapping run of the same kind rather than piling up redundant
+// subprocesses while one is already in flight.
+func (s *Store) KindRunning(scanID string, kind ScanKind) (bool, error) {
+	var running bool
+	err := s.db.QueryRow(`
+		SELECT EXISTS(
+			SELECT 1 FROM scan_runs sr JOIN runs r ON r.id = sr.run_id
+			WHERE sr.scan_id = ? AND sr.kind = ? AND r.status = 'running'
+		)
+	`, scanID, kind).Scan(&running)
+	if err != nil {
+		return false, fmt.Errorf("store: kind running: %w", err)
+	}
+	return running, nil
+}
+
+// CoveredTargets returns the set of hostnames already claimed by a
+// running-or-succeeded scan_runs row of kind for this scan -- a failed or
+// cancelled run's targets are deliberately excluded so they remain eligible
+// for a retry. Hostnames are lowercased since that's how recon.NormalizeDomain
+// and the frontend's hostname extraction both produce them.
+func (s *Store) CoveredTargets(scanID string, kind ScanKind) (map[string]bool, error) {
+	rows, err := s.db.Query(`
+		SELECT sr.targets FROM scan_runs sr JOIN runs r ON r.id = sr.run_id
+		WHERE sr.scan_id = ? AND sr.kind = ? AND r.status IN ('running', 'succeeded')
+	`, scanID, kind)
+	if err != nil {
+		return nil, fmt.Errorf("store: covered targets: %w", err)
+	}
+	defer rows.Close()
+
+	covered := map[string]bool{}
+	for rows.Next() {
+		var targets sql.NullString
+		if err := rows.Scan(&targets); err != nil {
+			return nil, fmt.Errorf("store: covered targets row: %w", err)
+		}
+		if !targets.Valid || targets.String == "" || targets.String == "null" {
+			continue
+		}
+		var list []string
+		if err := json.Unmarshal([]byte(targets.String), &list); err != nil {
+			continue
+		}
+		for _, t := range list {
+			covered[strings.ToLower(t)] = true
+		}
+	}
+	return covered, rows.Err()
+}
+
+// --- Scan aggregates (for the dashboard) ---
+
+// SubdomainCount returns how many subdomains crt.sh found for a scan's
+// apex domain, and whether that check has completed yet.
+func (s *Store) SubdomainCount(scanID, domain string) (count int, done bool, err error) {
+	var status string
+	var data sql.NullString
+	err = s.db.QueryRow(`SELECT status, data FROM scan_checks WHERE scan_id = ? AND domain = ? AND kind = 'subdomains'`, scanID, domain).
+		Scan(&status, &data)
+	if err == sql.ErrNoRows {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("store: subdomain count: %w", err)
+	}
+	if status != string(recon.StatusDone) || !data.Valid {
+		return 0, false, nil
+	}
+	var parsed struct {
+		Count int `json:"count"`
+	}
+	if jsonErr := json.Unmarshal([]byte(data.String), &parsed); jsonErr != nil {
+		return 0, false, nil
+	}
+	return parsed.Count, true, nil
+}
+
+// ApexHTTP returns the apex domain's HTTP status code and page title, if
+// that check has completed.
+func (s *Store) ApexHTTP(scanID, domain string) (statusCode int, title string, ok bool, err error) {
+	var status string
+	var data sql.NullString
+	err = s.db.QueryRow(`SELECT status, data FROM scan_checks WHERE scan_id = ? AND domain = ? AND kind = 'http'`, scanID, domain).
+		Scan(&status, &data)
+	if err == sql.ErrNoRows {
+		return 0, "", false, nil
+	}
+	if err != nil {
+		return 0, "", false, fmt.Errorf("store: apex http: %w", err)
+	}
+	if status != string(recon.StatusDone) || !data.Valid {
+		return 0, "", false, nil
+	}
+	var parsed struct {
+		StatusCode int    `json:"statusCode"`
+		Title      string `json:"title"`
+	}
+	if jsonErr := json.Unmarshal([]byte(data.String), &parsed); jsonErr != nil {
+		return 0, "", false, nil
+	}
+	return parsed.StatusCode, parsed.Title, true, nil
+}
+
+// ApexCloudflare reports whether the apex domain's HTTP check detected
+// Cloudflare fronting it (see recon.isCloudflare) -- false (not just
+// "unknown") if that check hasn't completed yet, since the dashboard only
+// ever wants a definite yes/no badge.
+func (s *Store) ApexCloudflare(scanID, domain string) (bool, error) {
+	var status string
+	var data sql.NullString
+	err := s.db.QueryRow(`SELECT status, data FROM scan_checks WHERE scan_id = ? AND domain = ? AND kind = 'http'`, scanID, domain).
+		Scan(&status, &data)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("store: apex cloudflare: %w", err)
+	}
+	if status != string(recon.StatusDone) || !data.Valid {
+		return false, nil
+	}
+	var parsed struct {
+		Cloudflare bool `json:"cloudflare"`
+	}
+	if jsonErr := json.Unmarshal([]byte(data.String), &parsed); jsonErr != nil {
+		return false, nil
+	}
+	return parsed.Cloudflare, nil
+}
+
+// ContentDiscoveryFindingCount counts findings reaching the terminal table
+// sink ("table") across every content-discovery run belonging to a scan.
+func (s *Store) ContentDiscoveryFindingCount(scanID string) (int, error) {
+	var count int
+	err := s.db.QueryRow(`
+		SELECT COUNT(*) FROM findings f
+		JOIN scan_runs sr ON sr.run_id = f.run_id
+		WHERE sr.scan_id = ? AND sr.kind = ? AND f.node_id = 'table'
+	`, scanID, ScanKindContentDiscovery).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("store: content discovery finding count: %w", err)
+	}
+	return count, nil
+}
+
+// ScanRunning reports whether any apex/subdomain check or scanner run for a
+// scan is still in progress, so the dashboard can show a "scanning..." vs
+// "done" pill.
+func (s *Store) ScanRunning(scanID string) (bool, error) {
+	var running bool
+	err := s.db.QueryRow(`
+		SELECT EXISTS(
+			SELECT 1 FROM scan_checks WHERE scan_id = ? AND status = 'running'
+			UNION
+			SELECT 1 FROM scan_runs sr JOIN runs r ON r.id = sr.run_id WHERE sr.scan_id = ? AND r.status = 'running'
+		)
+	`, scanID, scanID).Scan(&running)
+	if err != nil {
+		return false, fmt.Errorf("store: scan running: %w", err)
+	}
+	return running, nil
 }
 
 // --- Scan checks ---
@@ -441,6 +697,77 @@ func (s *Store) ListChecks(scanID string) ([]recon.Check, error) {
 		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+
+// --- Screenshots ---
+
+// ScreenshotMeta is a screenshot's metadata without its image bytes, for
+// listing what's available without pulling every PNG over the wire.
+type ScreenshotMeta struct {
+	Hostname   string    `json:"hostname"`
+	URL        string    `json:"url"`
+	CapturedAt time.Time `json:"capturedAt"`
+}
+
+// SaveScreenshot upserts the captured PNG for one scan+hostname -- a
+// re-capture (e.g. a scan restart) replaces the previous image rather than
+// accumulating history, since only the latest view of a host is useful.
+func (s *Store) SaveScreenshot(scanID, hostname, url string, image []byte) error {
+	_, err := s.db.Exec(`
+		INSERT INTO screenshots (scan_id, hostname, url, image, captured_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(scan_id, hostname) DO UPDATE SET url=excluded.url, image=excluded.image, captured_at=excluded.captured_at
+	`, scanID, hostname, url, image, time.Now())
+	if err != nil {
+		return fmt.Errorf("store: save screenshot: %w", err)
+	}
+	return nil
+}
+
+// ListScreenshots returns metadata for every screenshot captured so far for
+// a scan, so the UI knows which hostnames have a thumbnail to fetch.
+func (s *Store) ListScreenshots(scanID string) ([]ScreenshotMeta, error) {
+	rows, err := s.db.Query(`SELECT hostname, url, captured_at FROM screenshots WHERE scan_id = ? ORDER BY hostname ASC`, scanID)
+	if err != nil {
+		return nil, fmt.Errorf("store: list screenshots: %w", err)
+	}
+	defer rows.Close()
+
+	out := []ScreenshotMeta{}
+	for rows.Next() {
+		var m ScreenshotMeta
+		if err := rows.Scan(&m.Hostname, &m.URL, &m.CapturedAt); err != nil {
+			return nil, fmt.Errorf("store: screenshot row: %w", err)
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// GetScreenshot returns one hostname's captured PNG bytes.
+func (s *Store) GetScreenshot(scanID, hostname string) ([]byte, error) {
+	var image []byte
+	err := s.db.QueryRow(`SELECT image FROM screenshots WHERE scan_id = ? AND hostname = ?`, scanID, hostname).Scan(&image)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("store: screenshot %s/%s: %w", scanID, hostname, ErrNotFound)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: get screenshot: %w", err)
+	}
+	return image, nil
+}
+
+// HasScreenshot reports whether a screenshot already exists for scanID +
+// hostname, so the capture pipeline can skip a host it's already shot
+// instead of re-launching a browser for it on every recon check that fires
+// (e.g. a restarted scan re-observing the same live host).
+func (s *Store) HasScreenshot(scanID, hostname string) (bool, error) {
+	var exists bool
+	err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM screenshots WHERE scan_id = ? AND hostname = ?)`, scanID, hostname).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("store: has screenshot: %w", err)
+	}
+	return exists, nil
 }
 
 var ErrNotFound = fmt.Errorf("not found")

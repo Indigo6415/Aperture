@@ -1,16 +1,47 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
-import type { WordlistCatalogEntry, WordlistInfo } from '../types'
+import type { WordlistCatalogEntry, WordlistCategory, WordlistInfo } from '../types'
+
+const CATEGORY_ORDER: WordlistCategory[] = ['directories', 'subdomains', 'extensions', 'misc']
+
+const CATEGORY_META: Record<WordlistCategory, { label: string; hint: string }> = {
+  directories: { label: 'Directories', hint: 'Content discovery (ffuf + feroxbuster -w)' },
+  subdomains: { label: 'Subdomains', hint: 'Subdomain + vhost bruteforce (ffuf -w)' },
+  extensions: { label: 'Extensions', hint: 'Content discovery -e/-x (one extension per line)' },
+  misc: { label: 'Misc', hint: 'Not used by any scanner automatically' },
+}
+
+// nextCopyName picks a filename for a duplicate that doesn't collide with
+// anything already installed, so "Duplicate" never needs to interrupt the
+// user for a name -- name.txt -> name-copy.txt -> name-copy-2.txt, ...
+function nextCopyName(existing: Set<string>, name: string): string {
+  const dot = name.lastIndexOf('.')
+  const base = dot > 0 ? name.slice(0, dot) : name
+  const ext = dot > 0 ? name.slice(dot) : ''
+  let candidate = `${base}-copy${ext}`
+  let n = 2
+  while (existing.has(candidate)) {
+    candidate = `${base}-copy-${n}${ext}`
+    n++
+  }
+  return candidate
+}
 
 // Wordlists lets the user browse what's installed, grab a well-known list
 // (SecLists/dirb) with one click, or pull an arbitrary URL -- so the
 // ffuf/feroxbuster nodes (and the auto-generated domain-scan flow) always
 // have something real to point at without the user hunting a file down
-// themselves first.
+// themselves first. Installed wordlists are organized into four category
+// containers (Directories/Subdomains/Extensions/Misc); the auto-generated
+// scan flows fuzz with whatever's tagged into the category their scanner
+// needs, so dragging a downloaded list into the right container is what
+// actually makes it get used, not just downloading it.
 export function Wordlists() {
   const [installed, setInstalled] = useState<WordlistInfo[]>([])
   const [catalog, setCatalog] = useState<WordlistCatalogEntry[]>([])
   const [downloading, setDownloading] = useState<string | null>(null)
+  const [busy, setBusy] = useState<string | null>(null)
+  const [dragOverCategory, setDragOverCategory] = useState<WordlistCategory | null>(null)
   const [customName, setCustomName] = useState('')
   const [customUrl, setCustomUrl] = useState('')
   const [error, setError] = useState('')
@@ -41,6 +72,33 @@ export function Wordlists() {
     refresh()
   }
 
+  const moveToCategory = async (name: string, category: WordlistCategory) => {
+    setError('')
+    setBusy(name)
+    try {
+      await api.setWordlistCategories(name, [category])
+      await refresh()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const duplicate = async (name: string) => {
+    setError('')
+    setBusy(name)
+    try {
+      const newName = nextCopyName(new Set(installed.map((w) => w.name)), name)
+      await api.duplicateWordlist(name, newName)
+      await refresh()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(null)
+    }
+  }
+
   const submitCustom = (e: React.FormEvent) => {
     e.preventDefault()
     const name = customName.trim()
@@ -54,33 +112,95 @@ export function Wordlists() {
   const installedNames = new Set(installed.map((w) => w.name))
 
   return (
-    <div className="mx-auto h-full max-w-3xl overflow-y-auto px-6 py-10">
-      <h1 className="mb-6 text-xl font-semibold text-neutral-100">Wordlists</h1>
+    <div className="mx-auto h-full max-w-5xl overflow-y-auto px-6 py-10">
+      <h1 className="mb-1 text-xl font-semibold text-neutral-100">Wordlists</h1>
+      <p className="mb-6 text-sm text-neutral-500">
+        Drag a wordlist into the category its scanner should use it for. Use{' '}
+        <span className="font-mono text-neutral-400">⧉ Duplicate</span> to put the same list to work in two categories at once.
+      </p>
 
-      <h2 className="mb-2 px-1 text-xs font-semibold uppercase tracking-wide text-neutral-500">Installed</h2>
-      <div className="mb-8 divide-y divide-neutral-800 rounded-lg border border-neutral-800">
-        {installed.map((w) => (
-          <div key={w.name} className="flex items-center justify-between px-4 py-3">
-            <div>
-              <p className="font-mono text-sm text-neutral-100">
-                {w.name}
-                {w.builtin && (
-                  <span className="ml-2 rounded-full border border-neutral-700 px-1.5 py-0.5 text-[10px] text-neutral-500">built-in</span>
+      <div className="mb-10 grid grid-cols-1 gap-4 sm:grid-cols-2">
+        {CATEGORY_ORDER.map((category) => {
+          const meta = CATEGORY_META[category]
+          const members = installed.filter((w) => w.categories.includes(category))
+          const isDragTarget = dragOverCategory === category
+          return (
+            <div
+              key={category}
+              onDragOver={(e) => {
+                e.preventDefault()
+                e.dataTransfer.dropEffect = 'move'
+                setDragOverCategory(category)
+              }}
+              onDragLeave={() => setDragOverCategory((c) => (c === category ? null : c))}
+              onDrop={(e) => {
+                e.preventDefault()
+                setDragOverCategory(null)
+                const name = e.dataTransfer.getData('text/plain')
+                if (name && installedNames.has(name)) moveToCategory(name, category)
+              }}
+              className={`rounded-lg border p-3 transition-colors ${
+                isDragTarget ? 'border-sky-500 bg-sky-950/20' : 'border-neutral-800 bg-neutral-900/30'
+              }`}
+            >
+              <div className="mb-2 flex items-baseline justify-between">
+                <h2 className="text-xs font-semibold uppercase tracking-wide text-neutral-300">{meta.label}</h2>
+                <span className="text-[10px] text-neutral-600">{members.length}</span>
+              </div>
+              <p className="mb-3 text-[11px] text-neutral-600">{meta.hint}</p>
+              <div className="flex flex-col gap-1.5">
+                {members.map((w) => (
+                  <div
+                    key={w.name}
+                    draggable
+                    onDragStart={(e) => {
+                      e.dataTransfer.setData('text/plain', w.name)
+                      e.dataTransfer.effectAllowed = 'move'
+                    }}
+                    className={`flex items-center justify-between gap-2 rounded border border-neutral-700 bg-neutral-900 px-2 py-1.5 ${
+                      busy === w.name ? 'opacity-50' : 'cursor-grab active:cursor-grabbing'
+                    }`}
+                  >
+                    <div className="min-w-0">
+                      <p className="truncate font-mono text-xs text-neutral-100">
+                        {w.name}
+                        {w.builtin && (
+                          <span className="ml-1.5 rounded-full border border-neutral-700 px-1 py-px text-[9px] text-neutral-500">built-in</span>
+                        )}
+                      </p>
+                      <p className="text-[10px] text-neutral-500">
+                        {w.lines.toLocaleString()} lines · {formatSize(w.size)}
+                      </p>
+                    </div>
+                    <div className="flex shrink-0 items-center gap-1.5">
+                      <button
+                        onClick={() => duplicate(w.name)}
+                        disabled={busy === w.name}
+                        title="Duplicate into another category"
+                        className="text-xs text-neutral-500 hover:text-sky-400 disabled:opacity-40"
+                      >
+                        ⧉
+                      </button>
+                      {!w.builtin && (
+                        <button onClick={() => remove(w.name)} title="Delete" className="text-xs text-neutral-600 hover:text-red-400">
+                          ✕
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ))}
+                {members.length === 0 && (
+                  <p className="rounded border border-dashed border-neutral-800 px-2 py-3 text-center text-[11px] text-neutral-600">
+                    Drag a wordlist here
+                  </p>
                 )}
-              </p>
-              <p className="text-xs text-neutral-500">
-                {w.lines.toLocaleString()} lines · {formatSize(w.size)}
-              </p>
+              </div>
             </div>
-            {!w.builtin && (
-              <button onClick={() => remove(w.name)} className="text-xs text-neutral-600 hover:text-red-400">
-                Delete
-              </button>
-            )}
-          </div>
-        ))}
-        {installed.length === 0 && <p className="px-4 py-8 text-center text-sm text-neutral-600">No wordlists yet.</p>}
+          )
+        })}
       </div>
+
+      {error && <p className="mb-4 text-sm text-red-400">{error}</p>}
 
       <h2 className="mb-2 px-1 text-xs font-semibold uppercase tracking-wide text-neutral-500">Download common wordlists</h2>
       <div className="mb-8 divide-y divide-neutral-800 rounded-lg border border-neutral-800">
@@ -123,7 +243,6 @@ export function Wordlists() {
           Download
         </button>
       </form>
-      {error && <p className="mt-3 text-sm text-red-400">{error}</p>}
     </div>
   )
 }

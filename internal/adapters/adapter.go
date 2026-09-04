@@ -26,6 +26,12 @@ func newFindingID() string {
 // scan to finish.
 type Emit func(model.Finding)
 
+// Progress reports how far a running tool has gotten. total == 0 means the
+// total is unknowable (e.g. feroxbuster's recursive crawling), in which
+// case done is just a running counter and callers should render an
+// indeterminate progress indicator instead of a percentage.
+type Progress func(done, total int)
+
 // RunMeta carries identifiers that get stamped onto every Finding an
 // adapter produces.
 type RunMeta struct {
@@ -34,11 +40,12 @@ type RunMeta struct {
 }
 
 // Adapter runs one external recon tool and streams its results as
-// model.Finding via emit. Run blocks until the tool exits, ctx is
-// cancelled, or an unrecoverable error occurs.
+// model.Finding via emit, reporting progress via progress as it goes. Run
+// blocks until the tool exits, ctx is cancelled, or an unrecoverable error
+// occurs.
 type Adapter interface {
 	Name() string
-	Run(ctx context.Context, config json.RawMessage, meta RunMeta, emit Emit) error
+	Run(ctx context.Context, config json.RawMessage, meta RunMeta, emit Emit, progress Progress) error
 }
 
 // Registry maps a node type name to the adapter that implements it.

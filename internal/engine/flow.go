@@ -14,6 +14,8 @@ type NodeKind string
 const (
 	KindFFuf        NodeKind = "ffuf"
 	KindFeroxbuster NodeKind = "feroxbuster"
+	KindNmap        NodeKind = "nmap"
+	KindNuclei      NodeKind = "nuclei"
 	KindFilter      NodeKind = "filter"
 	KindMerge       NodeKind = "merge"
 	KindTable       NodeKind = "table"
@@ -23,7 +25,7 @@ const (
 // IsSource reports whether a node kind is a scan node (no inputs, wraps an
 // external tool via the adapters package) as opposed to a filter/merge/sink.
 func (k NodeKind) IsSource() bool {
-	return k == KindFFuf || k == KindFeroxbuster
+	return k == KindFFuf || k == KindFeroxbuster || k == KindNmap || k == KindNuclei
 }
 
 // Position is purely UI metadata (canvas layout) round-tripped through the
@@ -67,4 +69,5 @@ const (
 	StatusRunning   NodeStatus = "running"
 	StatusSucceeded NodeStatus = "succeeded"
 	StatusFailed    NodeStatus = "failed"
+	StatusCancelled NodeStatus = "cancelled"
 )

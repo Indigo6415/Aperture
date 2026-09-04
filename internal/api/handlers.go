@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"net/http"
 
@@ -19,97 +18,19 @@ func newID() string {
 	return hex.EncodeToString(b)
 }
 
-func (s *Server) handleListFlows(w http.ResponseWriter, r *http.Request) {
-	flows, err := s.store.ListFlows()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, flows)
-}
-
-func (s *Server) handleCreateFlow(w http.ResponseWriter, r *http.Request) {
-	var f engine.Flow
-	if err := json.NewDecoder(r.Body).Decode(&f); err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	if f.ID == "" {
-		f.ID = newID()
-	}
-	if f.Name == "" {
-		f.Name = "Untitled flow"
-	}
-	if err := s.store.SaveFlow(f); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	writeJSON(w, http.StatusCreated, f)
-}
-
-func (s *Server) handleGetFlow(w http.ResponseWriter, r *http.Request) {
-	f, err := s.store.GetFlow(r.PathValue("id"))
-	if errors.Is(err, store.ErrNotFound) {
-		writeError(w, http.StatusNotFound, err)
-		return
-	}
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, f)
-}
-
-func (s *Server) handleUpdateFlow(w http.ResponseWriter, r *http.Request) {
-	var f engine.Flow
-	if err := json.NewDecoder(r.Body).Decode(&f); err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	f.ID = r.PathValue("id")
-	if err := s.store.SaveFlow(f); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, f)
-}
-
-func (s *Server) handleDeleteFlow(w http.ResponseWriter, r *http.Request) {
-	if err := s.store.DeleteFlow(r.PathValue("id")); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-// handleRunFlow starts a flow running in the background and returns
-// immediately with the new run's id; clients stream progress over
-// /ws/runs/{id} and/or poll /api/runs/{id}/findings.
-func (s *Server) handleRunFlow(w http.ResponseWriter, r *http.Request) {
-	flowID := r.PathValue("id")
-	flow, err := s.store.GetFlow(flowID)
-	if errors.Is(err, store.ErrNotFound) {
-		writeError(w, http.StatusNotFound, err)
-		return
-	}
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-
-	runID := newID()
-	if err := s.store.CreateRun(runID, flowID); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-
-	go s.executeRun(flow, runID)
-
-	writeJSON(w, http.StatusAccepted, map[string]string{"runId": runID})
-}
-
+// executeRun drives one flow to completion, streaming findings/status over
+// the run's hub channel and persisting the final status. Called for every
+// scanner a scan starts (content discovery, subdomain bruteforce, vhost
+// bruteforce) -- see runScan and handleScanContentDiscovery in
+// handlers_scan.go, which build the flow and create the run row before
+// calling this.
 func (s *Server) executeRun(flow engine.Flow, runID string) {
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	s.trackRunCancel(runID, cancel)
+	defer func() {
+		s.untrackRunCancel(runID)
+		cancel()
+	}()
 
 	onResult := func(nodeID string, f model.Finding) {
 		f.RunID = runID
@@ -123,26 +44,31 @@ func (s *Server) executeRun(flow engine.Flow, runID string) {
 	onStatus := func(nodeID string, status engine.NodeStatus, message string) {
 		s.hub.publish(runID, RunEvent{Type: "status", NodeID: nodeID, Status: status, Message: message})
 	}
+	onProgress := func(nodeID string, done, total int) {
+		s.hub.publish(runID, RunEvent{Type: "progress", NodeID: nodeID, Done: done, Total: total})
+	}
 
-	err := s.engine.Execute(ctx, flow, runID, onResult, onStatus)
+	err := s.engine.Execute(ctx, flow, runID, onResult, onStatus, onProgress)
 
 	final := store.RunSucceeded
 	errMsg := ""
 	if err != nil {
-		final = store.RunFailed
-		errMsg = err.Error()
+		if errors.Is(err, context.Canceled) {
+			final = store.RunCancelled
+		} else {
+			final = store.RunFailed
+			errMsg = err.Error()
+		}
 	}
 	_ = s.store.FinishRun(runID, final, errMsg)
 	s.hub.publish(runID, RunEvent{Type: "done", Status: engine.NodeStatus(final), Message: errMsg})
-}
 
-func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
-	runs, err := s.store.ListRuns(r.PathValue("id"))
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+	if final == store.RunSucceeded {
+		// A content-discovery run finishing successfully is the trigger for
+		// an auto-kicked vuln-scan against its hits -- see maybeChainVulnScan
+		// (handlers_scan.go), which no-ops for every other scanner kind.
+		s.maybeChainVulnScan(runID)
 	}
-	writeJSON(w, http.StatusOK, runs)
 }
 
 func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {

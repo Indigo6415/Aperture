@@ -15,6 +15,10 @@ type ResultFunc func(nodeID string, f model.Finding)
 // StatusFunc is called whenever a node's lifecycle state changes.
 type StatusFunc func(nodeID string, status NodeStatus, message string)
 
+// ProgressFunc is called whenever a source node reports how far it's
+// gotten. total == 0 means the total is unknowable (see adapters.Progress).
+type ProgressFunc func(nodeID string, done, total int)
+
 // Engine executes Flows.
 type Engine struct{}
 
@@ -25,7 +29,7 @@ func New() *Engine { return &Engine{} }
 // instead of waiting for an upstream node to fully finish. It blocks until
 // every node has finished (or ctx is cancelled) and returns the first
 // node error encountered, if any.
-func (e *Engine) Execute(ctx context.Context, flow Flow, runID string, onResult ResultFunc, onStatus StatusFunc) error {
+func (e *Engine) Execute(ctx context.Context, flow Flow, runID string, onResult ResultFunc, onStatus StatusFunc, onProgress ProgressFunc) error {
 	if len(flow.Nodes) == 0 {
 		return nil
 	}
@@ -94,8 +98,13 @@ func (e *Engine) Execute(ctx context.Context, flow Flow, runID string, onResult 
 
 			onStatus(n.ID, StatusRunning, "")
 			emit := func(f model.Finding) { onResult(n.ID, f) }
-			err := e.runNode(ctx, n, runID, incoming[n.ID], edgeCh, produced[n.ID], emit)
-			if err != nil && ctx.Err() == nil {
+			progress := func(done, total int) { onProgress(n.ID, done, total) }
+			err := e.runNode(ctx, n, runID, incoming[n.ID], edgeCh, produced[n.ID], emit, progress)
+			if err != nil && ctx.Err() != nil {
+				onStatus(n.ID, StatusCancelled, "")
+				return
+			}
+			if err != nil {
 				onStatus(n.ID, StatusFailed, err.Error())
 				errCh <- fmt.Errorf("node %s (%s): %w", n.ID, n.Kind, err)
 				return
@@ -114,10 +123,13 @@ func (e *Engine) Execute(ctx context.Context, flow Flow, runID string, onResult 
 			firstErr = err
 		}
 	}
+	if firstErr == nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
 	return firstErr
 }
 
-func (e *Engine) runNode(ctx context.Context, n Node, runID string, in []Edge, edgeCh map[string]chan model.Finding, out chan<- model.Finding, emit func(model.Finding)) error {
+func (e *Engine) runNode(ctx context.Context, n Node, runID string, in []Edge, edgeCh map[string]chan model.Finding, out chan<- model.Finding, emit func(model.Finding), progress func(done, total int)) error {
 	inputs := make([]<-chan model.Finding, len(in))
 	for i, ed := range in {
 		inputs[i] = edgeCh[ed.ID]
@@ -130,7 +142,7 @@ func (e *Engine) runNode(ctx context.Context, n Node, runID string, in []Edge, e
 		}
 		return adapter.Run(ctx, n.Config, adapters.RunMeta{RunID: runID, NodeID: n.ID}, func(f model.Finding) {
 			_ = sendAndEmit(ctx, out, f, emit)
-		})
+		}, adapters.Progress(progress))
 	}
 
 	switch n.Kind {

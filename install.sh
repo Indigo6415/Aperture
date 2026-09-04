@@ -3,9 +3,10 @@
 # Aperture installer for macOS/Linux.
 #
 # Installs -- or reinstalls/upgrades, if already present -- every
-# dependency Aperture needs (Go, Node.js, ffuf, feroxbuster), then builds
-# the frontend and the aperture binary from this checkout and installs
-# everything into one directory on PATH.
+# dependency Aperture needs (Go, Node.js, ffuf, feroxbuster, nmap, nuclei,
+# and, best-effort, a headless-Chrome-compatible browser for screenshots/PDF
+# report export), then builds the frontend and the aperture binary from
+# this checkout and installs everything into one directory on PATH.
 #
 # Usage: ./install.sh
 # Override the install location with: APERTURE_INSTALL_DIR=/some/dir ./install.sh
@@ -159,6 +160,60 @@ install_feroxbuster() {
   ok "feroxbuster $("$INSTALL_DIR/feroxbuster" -V) installed to $INSTALL_DIR/feroxbuster"
 }
 
+install_nmap() {
+  info "Checking nmap..."
+  # Unlike ffuf/feroxbuster (fetched as pinned binaries), nmap comes from
+  # the system package manager -- skip reinstalling over whatever version
+  # is already there rather than fighting a distro's own package state.
+  if command -v nmap &>/dev/null; then
+    ok "nmap $(nmap --version | head -n1 | awk '{print $NF}') already installed"
+    return
+  fi
+  if ! pkg_install "nmap" "nmap" "nmap" "nmap" "nmap" "nmap"; then
+    fail "nmap is required for the port-scan scanner. Automatic install did not succeed -- install it manually from https://nmap.org/download.html and re-run this script."
+  fi
+  command -v nmap &>/dev/null || fail "nmap installation appears to have failed."
+  ok "nmap $(nmap --version | head -n1 | awk '{print $NF}') installed"
+}
+
+install_nuclei() {
+  info "Installing nuclei (latest) via go install..."
+  # Same rationale as install_ffuf: `go install ...@latest` always re-fetches
+  # and rebuilds, so this is inherently an upgrade-or-fresh-install.
+  GOBIN="$INSTALL_DIR" go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+  ok "nuclei $("$INSTALL_DIR/nuclei" -version 2>&1 | head -n1) installed to $INSTALL_DIR/nuclei"
+}
+
+# chrome_binary_names lists the executable names install_headless_browser
+# checks for -- kept in sync with adapters.chromeBinaries (internal/adapters
+# /screenshot.go), since both are looking for the same thing.
+CHROME_BINARY_NAMES=(google-chrome google-chrome-stable chromium chromium-browser chrome microsoft-edge)
+
+install_headless_browser() {
+  info "Checking for a headless-Chrome-compatible browser (used for screenshots and PDF report export)..."
+  for name in "${CHROME_BINARY_NAMES[@]}"; do
+    if command -v "$name" &>/dev/null; then
+      ok "$name already installed"
+      return
+    fi
+  done
+  # Best-effort only: unlike the scanners above, Aperture runs fine without
+  # this -- screenshots/PDF export just silently stay unavailable (see
+  # adapters.CaptureScreenshot/report.RenderPDF), so a failure here warns
+  # instead of aborting the whole install.
+  if ! pkg_install "--cask google-chrome" "chromium" "chromium" "chromium" "chromium" "chromium"; then
+    warn "No headless-Chrome-compatible browser found and automatic install did not succeed -- screenshots and PDF report export will be unavailable until one is installed (Chrome, Chromium, or Edge all work)."
+    return
+  fi
+  for name in "${CHROME_BINARY_NAMES[@]}"; do
+    if command -v "$name" &>/dev/null; then
+      ok "$name installed"
+      return
+    fi
+  done
+  warn "Browser install command succeeded but no known binary was found on PATH afterward -- screenshots/PDF report export may be unavailable."
+}
+
 # --- build Aperture itself from this checkout --------------------------------
 
 build_frontend() {
@@ -217,9 +272,23 @@ ensure_go
 ensure_node
 install_ffuf
 install_feroxbuster
+install_nmap
+install_nuclei
+install_headless_browser
 build_frontend
 build_aperture
 ensure_path
+
+# Find whichever headless-Chrome-compatible binary ended up on PATH (if
+# any) for the summary line below -- install_headless_browser only warns
+# rather than failing, so this may come up empty.
+FOUND_BROWSER=""
+for name in "${CHROME_BINARY_NAMES[@]}"; do
+  if command -v "$name" &>/dev/null; then
+    FOUND_BROWSER="$name"
+    break
+  fi
+done
 
 echo
 ok "Done. Installed:"
@@ -227,6 +296,9 @@ printf '  go          %s\n' "$(go version | awk '{print $3}')"
 printf '  node        %s\n' "$(node -v)"
 printf '  ffuf        %s\n' "$("$INSTALL_DIR/ffuf" -V 2>&1 | head -n1)"
 printf '  feroxbuster %s\n' "$("$INSTALL_DIR/feroxbuster" -V)"
+printf '  nmap        %s\n' "$(nmap --version | head -n1)"
+printf '  nuclei      %s\n' "$("$INSTALL_DIR/nuclei" -version 2>&1 | head -n1)"
+printf '  browser     %s\n' "${FOUND_BROWSER:-none found -- screenshots/PDF report export unavailable}"
 printf '  aperture    %s\n' "$INSTALL_DIR/aperture"
 echo
 info "Run 'aperture' to start (open a new shell first if PATH was just updated)."

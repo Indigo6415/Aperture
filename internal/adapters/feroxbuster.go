@@ -27,6 +27,8 @@ type FeroxbusterConfig struct {
 	Threads     int               `json:"threads,omitempty"`
 	Depth       int               `json:"depth,omitempty"` // 0 = ferox default; 1 = no recursion
 	NoRecursion bool              `json:"noRecursion,omitempty"`
+	Timeout     int               `json:"timeoutSeconds,omitempty"`
+	RateLimit   int               `json:"rateLimit,omitempty"` // feroxbuster --rate-limit: requests/sec across the whole run; 0 = unlimited
 	ExtraArgs   []string          `json:"extraArgs,omitempty"`
 }
 
@@ -47,7 +49,11 @@ type feroxResponse struct {
 	Headers       map[string]string `json:"headers"`
 }
 
-func (a *FeroxbusterAdapter) Run(ctx context.Context, config json.RawMessage, meta RunMeta, emit Emit) error {
+// feroxProgressEvery is how many parsed response lines pass between
+// progress callbacks (see progressEvery in ffuf.go for why this exists).
+const feroxProgressEvery = 10
+
+func (a *FeroxbusterAdapter) Run(ctx context.Context, config json.RawMessage, meta RunMeta, emit Emit, progress Progress) error {
 	var cfg FeroxbusterConfig
 	if err := json.Unmarshal(config, &cfg); err != nil {
 		return &ErrConfig{Adapter: a.Name(), Err: err}
@@ -72,6 +78,12 @@ func (a *FeroxbusterAdapter) Run(ctx context.Context, config json.RawMessage, me
 	if cfg.NoRecursion {
 		args = append(args, "-n")
 	}
+	if cfg.Timeout > 0 {
+		args = append(args, "--timeout", strconv.Itoa(cfg.Timeout))
+	}
+	if cfg.RateLimit > 0 {
+		args = append(args, "--rate-limit", strconv.Itoa(cfg.RateLimit))
+	}
 	if len(cfg.Extensions) > 0 {
 		args = append(args, "-x", strings.Join(cfg.Extensions, ","))
 	}
@@ -89,6 +101,13 @@ func (a *FeroxbusterAdapter) Run(ctx context.Context, config json.RawMessage, me
 		return fmt.Errorf("feroxbuster: start: %w (is feroxbuster installed and on PATH?)", err)
 	}
 
+	if progress != nil {
+		// Recursion means the total request count is unknowable upfront --
+		// total 0 tells callers to render this as indeterminate progress.
+		progress(0, 0)
+	}
+
+	done := 0
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
@@ -111,17 +130,26 @@ func (a *FeroxbusterAdapter) Run(ctx context.Context, config json.RawMessage, me
 			Words:         resp.WordCount,
 			Lines:         resp.LineCount,
 			ContentType:   resp.Headers["content-type"],
+			RedirectLoc:   resp.Headers["location"],
 			Method:        resp.Method,
+			Headers:       resp.Headers,
 			SourceTool:    a.Name(),
 			SourceNodeID:  meta.NodeID,
 			RunID:         meta.RunID,
 			Timestamp:     time.Now(),
 		})
+		done++
+		if progress != nil && done%feroxProgressEvery == 0 {
+			progress(done, 0)
+		}
 	}
 
 	waitErr := cmd.Wait()
 	if scanErr := scanner.Err(); scanErr != nil {
 		return fmt.Errorf("feroxbuster: reading output: %w", scanErr)
+	}
+	if progress != nil {
+		progress(done, 0)
 	}
 	if waitErr != nil {
 		if ctx.Err() != nil {

@@ -1,18 +1,33 @@
-import { useMemo, useState } from 'react'
+import { Fragment, useMemo, useState } from 'react'
 import type { Finding } from '../types'
+import { statusHexColor } from '../statusColor'
+import { extensionOf, hostnameOf } from '../url'
+import { isDangerousExtension } from '../extensions'
+import { api } from '../api'
+import { FacetFilterBar, type FacetDimension } from './FacetFilterBar'
 
-type SortKey = 'url' | 'statusCode' | 'contentLength' | 'words' | 'lines' | 'sourceTool'
+type SortKey = 'url' | 'statusCode' | 'extension' | 'contentLength' | 'words' | 'lines' | 'sourceTool'
 
 const COLUMNS: { key: SortKey; label: string }[] = [
   { key: 'statusCode', label: 'Status' },
   { key: 'url', label: 'URL' },
+  { key: 'extension', label: 'Ext' },
   { key: 'contentLength', label: 'Size' },
   { key: 'words', label: 'Words' },
   { key: 'lines', label: 'Lines' },
   { key: 'sourceTool', label: 'Tool' },
 ]
 
-function statusColor(code: number): string {
+// sortValueOf reads the value a given SortKey sorts by -- a plain property
+// for everything but 'extension', which isn't a Finding field and has to
+// be derived from the URL the same way the Ext column/facet do.
+function sortValueOf(f: Finding, key: SortKey): string | number {
+  return key === 'extension' ? (extensionOf(f.url) ?? '') : f[key]
+}
+
+// statusTextClass is the Tailwind-class counterpart to statusHexColor, for
+// table cells (which use a class) rather than inline-styled chips/badges.
+function statusTextClass(code: number): string {
   if (code >= 200 && code < 300) return 'text-emerald-400'
   if (code >= 300 && code < 400) return 'text-sky-400'
   if (code >= 400 && code < 500) return 'text-amber-400'
@@ -20,25 +35,56 @@ function statusColor(code: number): string {
   return 'text-neutral-400'
 }
 
-export function ResultsTable({ findings }: { findings: Finding[] }) {
-  const [filter, setFilter] = useState('')
+// extensionOf returns undefined for paths with no extension, but that's a
+// real, common, filterable category here (most brute-forced paths have no
+// extension) -- unlike the size/words/lines dimensions, where "undefined"
+// means "not applicable to this row" and should always pass through. So
+// this dimension maps it to an explicit "none" value instead of leaving it
+// undefined, and drops FacetFilterBar's blanket "missing value always
+// passes" behavior for that value alone.
+const NO_EXTENSION = '(none)'
+
+const FINDING_DIMENSIONS: FacetDimension<Finding>[] = [
+  { key: 'statusCode', label: 'Status', getValue: (f) => f.statusCode, colorFor: (v) => statusHexColor(Number(v)) },
+  {
+    key: 'extension',
+    label: 'Extension',
+    getValue: (f) => extensionOf(f.url) ?? NO_EXTENSION,
+    warningFor: (v) => isDangerousExtension(String(v)),
+  },
+  { key: 'contentLength', label: 'Size', getValue: (f) => f.contentLength },
+  { key: 'words', label: 'Words', getValue: (f) => f.words },
+  { key: 'lines', label: 'Lines', getValue: (f) => f.lines },
+]
+
+// rowKey uniquely identifies a finding within one ResultsTable -- the same
+// key scheme the row's React key already used, reused here to track which
+// row is currently expanded.
+function rowKey(f: Finding): string {
+  return `${f.sourceNodeId}:${f.id}`
+}
+
+export function ResultsTable({ findings, scanId }: { findings: Finding[]; scanId?: string }) {
+  const [faceted, setFaceted] = useState<Finding[]>(findings)
+  const [search, setSearch] = useState('')
   const [sortKey, setSortKey] = useState<SortKey>('statusCode')
   const [sortDir, setSortDir] = useState<1 | -1>(1)
+  const [expanded, setExpanded] = useState<string | null>(null)
 
   const rows = useMemo(() => {
-    const needle = filter.trim().toLowerCase()
+    const needle = search.trim().toLowerCase()
     const filtered = needle
-      ? findings.filter(
+      ? faceted.filter(
           (f) => f.url.toLowerCase().includes(needle) || String(f.statusCode).includes(needle) || f.sourceTool.toLowerCase().includes(needle),
         )
-      : findings
+      : faceted
     return [...filtered].sort((a, b) => {
-      const av = a[sortKey]
-      const bv = b[sortKey]
+      const av = sortValueOf(a, sortKey)
+      const bv = sortValueOf(b, sortKey)
       const cmp = typeof av === 'number' && typeof bv === 'number' ? av - bv : String(av).localeCompare(String(bv))
       return cmp * sortDir
     })
-  }, [findings, filter, sortKey, sortDir])
+  }, [faceted, search, sortKey, sortDir])
 
   const toggleSort = (key: SortKey) => {
     if (key === sortKey) setSortDir((d) => (d === 1 ? -1 : 1))
@@ -50,12 +96,13 @@ export function ResultsTable({ findings }: { findings: Finding[] }) {
 
   return (
     <div className="flex h-full flex-col">
+      <FacetFilterBar items={findings} dimensions={FINDING_DIMENSIONS} onChange={setFaceted} />
       <div className="flex items-center gap-2 border-b border-neutral-800 px-3 py-2">
         <input
           className="w-64 rounded border border-neutral-700 bg-neutral-800 px-2 py-1 text-sm text-neutral-100 outline-none focus:border-sky-500"
-          placeholder="Filter by URL, status, tool…"
-          value={filter}
-          onChange={(e) => setFilter(e.target.value)}
+          placeholder="Search URL, status, tool…"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
         />
         <span className="text-xs text-neutral-500">
           {rows.length} of {findings.length} finding{findings.length === 1 ? '' : 's'}
@@ -65,6 +112,9 @@ export function ResultsTable({ findings }: { findings: Finding[] }) {
         <table className="w-full text-left text-sm">
           <thead className="sticky top-0 bg-neutral-950">
             <tr>
+              {scanId && (
+                <th className="border-b border-neutral-800 px-3 py-2 text-xs font-medium uppercase tracking-wide text-neutral-500">Preview</th>
+              )}
               {COLUMNS.map((col) => (
                 <th
                   key={col.key}
@@ -78,21 +128,61 @@ export function ResultsTable({ findings }: { findings: Finding[] }) {
             </tr>
           </thead>
           <tbody>
-            {rows.map((f) => (
-              <tr key={`${f.sourceNodeId}:${f.id}`} className="border-b border-neutral-900 hover:bg-neutral-900/60">
-                <td className={`px-3 py-1.5 font-mono ${statusColor(f.statusCode)}`}>{f.statusCode}</td>
-                <td className="max-w-[520px] truncate px-3 py-1.5 font-mono text-neutral-200" title={f.url}>
-                  {f.url}
-                </td>
-                <td className="px-3 py-1.5 text-neutral-400">{f.contentLength}</td>
-                <td className="px-3 py-1.5 text-neutral-400">{f.words}</td>
-                <td className="px-3 py-1.5 text-neutral-400">{f.lines}</td>
-                <td className="px-3 py-1.5 text-neutral-500">{f.sourceTool}</td>
-              </tr>
-            ))}
+            {rows.map((f) => {
+              const ext = extensionOf(f.url)
+              const dangerous = isDangerousExtension(ext)
+              const key = rowKey(f)
+              const isExpanded = expanded === key
+              return (
+                <Fragment key={key}>
+                  <tr
+                    onClick={() => setExpanded(isExpanded ? null : key)}
+                    className={`cursor-pointer border-b border-neutral-900 hover:bg-neutral-900/60 ${dangerous ? 'bg-red-950/20' : ''} ${isExpanded ? 'bg-neutral-900/80' : ''}`}
+                  >
+                    {scanId && (
+                      <td className="px-3 py-1.5">
+                        <Thumbnail scanId={scanId} hostname={hostnameOf(f.url)} />
+                      </td>
+                    )}
+                    <td className={`px-3 py-1.5 font-mono ${statusTextClass(f.statusCode)}`}>{f.statusCode}</td>
+                    <td className="max-w-[480px] truncate px-3 py-1.5 font-mono text-neutral-200" title={f.url}>
+                      <span className="mr-1 inline-block w-3 text-neutral-600">{isExpanded ? '▾' : '▸'}</span>
+                      {dangerous && (
+                        <span className="mr-1" title={`Potentially sensitive .${ext} file`}>
+                          ⚠️
+                        </span>
+                      )}
+                      {f.url}
+                      <a
+                        href={f.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        onClick={(e) => e.stopPropagation()}
+                        title="Open in new tab"
+                        className="ml-1.5 text-neutral-600 hover:text-sky-400"
+                      >
+                        ↗
+                      </a>
+                    </td>
+                    <td className={`px-3 py-1.5 font-mono text-xs ${dangerous ? 'font-semibold text-red-400' : 'text-neutral-500'}`}>{ext ?? '—'}</td>
+                    <td className="px-3 py-1.5 text-neutral-400">{f.contentLength}</td>
+                    <td className="px-3 py-1.5 text-neutral-400">{f.words}</td>
+                    <td className="px-3 py-1.5 text-neutral-400">{f.lines}</td>
+                    <td className="px-3 py-1.5 text-neutral-500">{f.sourceTool}</td>
+                  </tr>
+                  {isExpanded && (
+                    <tr className="border-b border-neutral-900 bg-neutral-950/60">
+                      <td colSpan={scanId ? COLUMNS.length + 1 : COLUMNS.length} className="px-3 py-3">
+                        <FindingDetail finding={f} />
+                      </td>
+                    </tr>
+                  )}
+                </Fragment>
+              )
+            })}
             {rows.length === 0 && (
               <tr>
-                <td colSpan={COLUMNS.length} className="px-3 py-8 text-center text-neutral-600">
+                <td colSpan={scanId ? COLUMNS.length + 1 : COLUMNS.length} className="px-3 py-8 text-center text-neutral-600">
                   No findings yet
                 </td>
               </tr>
@@ -101,5 +191,83 @@ export function ResultsTable({ findings }: { findings: Finding[] }) {
         </table>
       </div>
     </div>
+  )
+}
+
+// FindingDetail is the row a click on a finding expands into -- everything
+// about that one request/response beyond what fits in the table's columns.
+// Headers/redirect target are only present for tools that surface them
+// (currently feroxbuster; ffuf's live text output doesn't carry headers),
+// so those sections just don't render for a finding that has none.
+function FindingDetail({ finding: f }: { finding: Finding }) {
+  const headerEntries = f.headers ? Object.entries(f.headers) : []
+  return (
+    <div className="flex flex-col gap-3 font-mono text-xs">
+      <div className="flex items-center gap-2">
+        <a href={f.url} target="_blank" rel="noopener noreferrer" className="break-all text-sky-400 hover:underline">
+          {f.url}
+        </a>
+        <a
+          href={f.url}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="shrink-0 rounded border border-neutral-700 px-1.5 py-0.5 text-neutral-300 hover:border-sky-500 hover:text-sky-400"
+        >
+          Open ↗
+        </a>
+      </div>
+      <div className="grid grid-cols-2 gap-x-6 gap-y-1 sm:grid-cols-3">
+        <DetailField label="Method" value={f.method || 'GET'} />
+        <DetailField label="Status" value={String(f.statusCode)} />
+        <DetailField label="Content-Type" value={f.contentType} />
+        <DetailField label="Content length" value={`${f.contentLength} bytes`} />
+        <DetailField label="Words / Lines" value={`${f.words} / ${f.lines}`} />
+        <DetailField label="Redirects to" value={f.redirectLocation} />
+        <DetailField label="Tool" value={f.sourceTool} />
+        <DetailField label="Timestamp" value={new Date(f.timestamp).toLocaleString()} />
+      </div>
+      {headerEntries.length > 0 && (
+        <div>
+          <p className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-neutral-500">Response headers</p>
+          <div className="divide-y divide-neutral-900 rounded border border-neutral-800">
+            {headerEntries.map(([name, value]) => (
+              <div key={name} className="flex gap-2 px-2 py-1">
+                <span className="w-40 shrink-0 text-neutral-500">{name}</span>
+                <span className="break-all text-neutral-300">{value}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function DetailField({ label, value }: { label: string; value?: string }) {
+  if (!value) return null
+  return (
+    <div>
+      <p className="text-[10px] font-semibold uppercase tracking-wide text-neutral-500">{label}</p>
+      <p className="text-neutral-200">{value}</p>
+    </div>
+  )
+}
+
+// Thumbnail renders a small preview of a finding's host, captured
+// opportunistically by the backend (see api.captureScreenshot) once that
+// host's HTTP recon check resolves a live URL. A host with none yet (still
+// capturing, or no headless-Chrome-compatible browser installed) renders
+// nothing rather than a broken-image icon.
+export function Thumbnail({ scanId, hostname }: { scanId: string; hostname?: string }) {
+  const [failed, setFailed] = useState(false)
+  if (!hostname || failed) return <div className="h-8 w-12 rounded bg-neutral-900" />
+  return (
+    <img
+      src={api.screenshotUrl(scanId, hostname)}
+      onError={() => setFailed(true)}
+      loading="lazy"
+      className="h-8 w-12 rounded-sm object-cover object-top"
+      alt=""
+    />
   )
 }
