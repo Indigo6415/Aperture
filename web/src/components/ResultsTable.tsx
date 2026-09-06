@@ -3,7 +3,7 @@ import type { Finding } from '../types'
 import { statusHexColor } from '../statusColor'
 import { extensionOf, hostnameOf } from '../url'
 import { isDangerousExtension } from '../extensions'
-import { api } from '../api'
+import { api, screenshotPreviewEnabled } from '../api'
 import { FacetFilterBar, type FacetDimension } from './FacetFilterBar'
 
 type SortKey = 'url' | 'statusCode' | 'extension' | 'contentLength' | 'words' | 'lines' | 'sourceTool'
@@ -65,6 +65,10 @@ function rowKey(f: Finding): string {
 }
 
 export function ResultsTable({ findings, scanId }: { findings: Finding[]; scanId?: string }) {
+  // The Preview column only makes sense while the screenshot preview
+  // feature is enabled -- otherwise every thumbnail would just be a
+  // permanent placeholder for images the backend never captures.
+  const showPreview = Boolean(scanId) && screenshotPreviewEnabled
   const [faceted, setFaceted] = useState<Finding[]>(findings)
   const [search, setSearch] = useState('')
   const [sortKey, setSortKey] = useState<SortKey>('statusCode')
@@ -96,7 +100,7 @@ export function ResultsTable({ findings, scanId }: { findings: Finding[]; scanId
 
   return (
     <div className="flex h-full flex-col">
-      <FacetFilterBar items={findings} dimensions={FINDING_DIMENSIONS} onChange={setFaceted} />
+      <FacetFilterBar items={findings} dimensions={FINDING_DIMENSIONS} onChange={setFaceted} restrictStatusByDefault />
       <div className="flex items-center gap-2 border-b border-neutral-800 px-3 py-2">
         <input
           className="w-64 rounded border border-neutral-700 bg-neutral-800 px-2 py-1 text-sm text-neutral-100 outline-none focus:border-sky-500"
@@ -112,7 +116,7 @@ export function ResultsTable({ findings, scanId }: { findings: Finding[]; scanId
         <table className="w-full text-left text-sm">
           <thead className="sticky top-0 bg-neutral-950">
             <tr>
-              {scanId && (
+              {showPreview && (
                 <th className="border-b border-neutral-800 px-3 py-2 text-xs font-medium uppercase tracking-wide text-neutral-500">Preview</th>
               )}
               {COLUMNS.map((col) => (
@@ -139,7 +143,7 @@ export function ResultsTable({ findings, scanId }: { findings: Finding[]; scanId
                     onClick={() => setExpanded(isExpanded ? null : key)}
                     className={`cursor-pointer border-b border-neutral-900 hover:bg-neutral-900/60 ${dangerous ? 'bg-red-950/20' : ''} ${isExpanded ? 'bg-neutral-900/80' : ''}`}
                   >
-                    {scanId && (
+                    {scanId && screenshotPreviewEnabled && (
                       <td className="px-3 py-1.5">
                         <Thumbnail scanId={scanId} hostname={hostnameOf(f.url)} />
                       </td>
@@ -172,7 +176,7 @@ export function ResultsTable({ findings, scanId }: { findings: Finding[]; scanId
                   </tr>
                   {isExpanded && (
                     <tr className="border-b border-neutral-900 bg-neutral-950/60">
-                      <td colSpan={scanId ? COLUMNS.length + 1 : COLUMNS.length} className="px-3 py-3">
+                      <td colSpan={showPreview ? COLUMNS.length + 1 : COLUMNS.length} className="px-3 py-3">
                         <FindingDetail finding={f} />
                       </td>
                     </tr>
@@ -182,7 +186,7 @@ export function ResultsTable({ findings, scanId }: { findings: Finding[]; scanId
             })}
             {rows.length === 0 && (
               <tr>
-                <td colSpan={scanId ? COLUMNS.length + 1 : COLUMNS.length} className="px-3 py-8 text-center text-neutral-600">
+                <td colSpan={showPreview ? COLUMNS.length + 1 : COLUMNS.length} className="px-3 py-8 text-center text-neutral-600">
                   No findings yet
                 </td>
               </tr>

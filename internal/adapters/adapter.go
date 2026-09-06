@@ -12,6 +12,7 @@ import (
 	"fmt"
 
 	"github.com/Indigo6415/Aperture/internal/model"
+	"github.com/Indigo6415/Aperture/internal/wordlists"
 )
 
 // newFindingID generates a random 128-bit hex identifier for a Finding.
@@ -67,3 +68,33 @@ func (e *ErrConfig) Error() string {
 }
 
 func (e *ErrConfig) Unwrap() error { return e.Err }
+
+// maxFuzzRequests bounds how many requests one ffuf/feroxbuster run may fan
+// a wordlist out to (lines times extensions, plus one for the bare word).
+// Both tools build their whole job set in memory before starting, so an
+// oversized combination -- most commonly a large directory wordlist paired
+// with a long extensions list -- can exhaust several GB of RAM before a
+// single request goes out. 2,000,000 is generous for a legitimate scan
+// (even a big wordlist with no/few extensions fits comfortably under it)
+// while still catching the multiplicative blowups.
+const maxFuzzRequests = 2_000_000
+
+// checkFuzzRequestCount refuses a wordlist+extensions combination that would
+// produce more than maxFuzzRequests requests. A failure to count the
+// wordlist's lines is left non-fatal (nil, nil) -- the tool's own error
+// message once it tries to open the file will be clearer than ours, and
+// the caller should still be free to try.
+func checkFuzzRequestCount(adapterName, wordlistPath string, extensions []string) error {
+	lines, err := wordlists.CountLines(wordlistPath)
+	if err != nil {
+		return nil
+	}
+	multiplier := 1 + len(extensions)
+	if total := lines * multiplier; total > maxFuzzRequests {
+		return &ErrConfig{Adapter: adapterName, Err: fmt.Errorf(
+			"%d requests (%d wordlist lines x %d extensions) exceeds the %d-request safety cap -- the tool builds its whole job queue in memory upfront, so this would likely exhaust available RAM; use a smaller wordlist or fewer extensions",
+			total, lines, len(extensions), maxFuzzRequests,
+		)}
+	}
+	return nil
+}

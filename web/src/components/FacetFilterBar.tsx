@@ -20,6 +20,26 @@ export interface FacetDimension<T> {
 // even past this cap).
 const MAX_SUGGESTIONS = 300
 
+// Non-200 responses (404s, redirects the target doesn't care about, etc.)
+// are noise in most brute-force/crawl results, so callers can opt a
+// statusCode dimension into defaulting to "200 only" via
+// `restrictStatusByDefault`. The "show everything" override is a single
+// shared preference (not per-instance) so it stays consistent across every
+// facet bar that opts in, and persists across reloads.
+const SHOW_EVERYTHING_STORAGE_KEY = 'aperture.facetFilter.showEverything'
+const STATUS_ONLY_VALUE: FacetValue = 200
+const FORCED_STATUS_INCLUDE = new Set<FacetValue>([STATUS_ONLY_VALUE])
+
+function loadShowEverything(): boolean {
+  try {
+    return localStorage.getItem(SHOW_EVERYTHING_STORAGE_KEY) === 'true'
+  } catch {
+    // Storage can be unavailable (private browsing, disabled cookies) --
+    // fall back to the safe default of "200 only" rather than erroring.
+    return false
+  }
+}
+
 function compareValues(a: FacetValue, b: FacetValue): number {
   if (typeof a === 'number' && typeof b === 'number') return a - b
   return String(a).localeCompare(String(b))
@@ -54,35 +74,61 @@ export function FacetFilterBar<T>({
   items,
   dimensions,
   onChange,
+  restrictStatusByDefault = false,
 }: {
   items: T[]
   dimensions: FacetDimension<T>[]
   onChange: (kept: T[]) => void
+  // When true, this bar's statusCode dimension (if it has one) starts
+  // matching only 200 and hides its own button grid, until the user checks
+  // "show everything." See SHOW_EVERYTHING_STORAGE_KEY above.
+  restrictStatusByDefault?: boolean
 }) {
   const [included, setIncluded] = useState<Record<string, Set<FacetValue>>>({})
   const [excluded, setExcluded] = useState<Record<string, Set<FacetValue>>>({})
   const [drafts, setDrafts] = useState<Record<string, string>>({})
+  const [showEverything, setShowEverything] = useState(loadShowEverything)
+
+  // Only actually forces anything when this bar opted in AND the user
+  // hasn't flipped the override -- otherwise behaves exactly as before.
+  const forceStatusOnly = restrictStatusByDefault && !showEverything
+
+  const toggleShowEverything = () => {
+    setShowEverything((prev) => {
+      const next = !prev
+      try {
+        localStorage.setItem(SHOW_EVERYTHING_STORAGE_KEY, String(next))
+      } catch {
+        // Best-effort persistence; the in-memory toggle still works this session.
+      }
+      return next
+    })
+  }
 
   const kept = useMemo(
     () =>
       items.filter((item) =>
         dimensions.every((dim) => {
           const v = dim.getValue(item)
-          const includeSet = included[dim.key]
-          const hasActiveInclude = !!includeSet && includeSet.size > 0
+          const forced = forceStatusOnly && dim.key === 'statusCode'
+          const includeSet = forced ? FORCED_STATUS_INCLUDE : included[dim.key]
+          const hasActiveInclude = forced || (!!includeSet && includeSet.size > 0)
           // An item with no value for this dimension only survives when the
           // dimension has no active matcher tags -- once you've picked a
           // matcher (e.g. status code 200), items that were never scored on
           // this dimension (e.g. not yet verified) shouldn't slip through
           // as if they matched.
           if (v === undefined) return !hasActiveInclude
-          const excludeSet = excluded[dim.key]
+          // A forced-200 dimension ignores manual exclude tags too -- while
+          // forced, matching is entirely "is this value 200," not the
+          // include/exclude tags the user may have left set from before.
+          const excludeSet = forced ? undefined : excluded[dim.key]
           if (excludeSet?.has(v)) return false
           if (hasActiveInclude) return includeSet!.has(v)
           return true
         }),
       ),
-    [items, dimensions, included, excluded],
+    [items, dimensions, included, excluded, forceStatusOnly],
   )
 
   const facets = useMemo(
@@ -312,24 +358,37 @@ export function FacetFilterBar<T>({
         return (
           <div key={dim.key} className={`flex flex-wrap items-center gap-1.5 px-3 py-2 ${inputFacets.length > 0 ? 'border-t border-neutral-900' : ''}`}>
             <span className="text-[10px] font-semibold uppercase tracking-wide text-neutral-500">{dim.label}</span>
-            {suggestions.map((v) => {
-              const active = includeSet.has(v)
-              const count = keptCounts.get(v) ?? 0
-              return (
-                <button
-                  key={v}
-                  onClick={() => (active ? removeInclude(dim.key, v) : setInclude(dim.key, v))}
-                  title={`${count} result${count === 1 ? '' : 's'}`}
-                  className={`rounded border px-2.5 py-1.5 font-mono text-xs transition-colors ${
-                    active ? 'border-sky-500 bg-sky-950/40 text-sky-300' : 'border-neutral-700 bg-neutral-900 hover:border-sky-600'
-                  }`}
-                  style={!active && dim.colorFor ? { color: dim.colorFor(v) } : undefined}
-                >
-                  {v}
-                  <span className="ml-1 text-neutral-500">{count}</span>
-                </button>
-              )
-            })}
+            {restrictStatusByDefault && (
+              <label className="flex items-center gap-1.5 text-xs text-neutral-400">
+                <input type="checkbox" checked={showEverything} onChange={toggleShowEverything} className="accent-sky-500" />
+                Show everything
+              </label>
+            )}
+            {/* While forced, the button grid below is replaced with a plain
+                note -- it'd otherwise look interactive while every click
+                does nothing, since forceStatusOnly overrides it anyway. */}
+            {forceStatusOnly ? (
+              <span className="font-mono text-xs text-neutral-600">Showing 200 only</span>
+            ) : (
+              suggestions.map((v) => {
+                const active = includeSet.has(v)
+                const count = keptCounts.get(v) ?? 0
+                return (
+                  <button
+                    key={v}
+                    onClick={() => (active ? removeInclude(dim.key, v) : setInclude(dim.key, v))}
+                    title={`${count} result${count === 1 ? '' : 's'}`}
+                    className={`rounded border px-2.5 py-1.5 font-mono text-xs transition-colors ${
+                      active ? 'border-sky-500 bg-sky-950/40 text-sky-300' : 'border-neutral-700 bg-neutral-900 hover:border-sky-600'
+                    }`}
+                    style={!active && dim.colorFor ? { color: dim.colorFor(v) } : undefined}
+                  >
+                    {v}
+                    <span className="ml-1 text-neutral-500">{count}</span>
+                  </button>
+                )
+              })
+            )}
           </div>
         )
       })}

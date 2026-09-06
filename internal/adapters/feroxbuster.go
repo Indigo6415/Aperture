@@ -64,6 +64,13 @@ func (a *FeroxbusterAdapter) Run(ctx context.Context, config json.RawMessage, me
 	if cfg.Wordlist == "" {
 		return &ErrConfig{Adapter: a.Name(), Err: fmt.Errorf("wordlist is required")}
 	}
+	// Refuse a wordlist/extensions combination feroxbuster couldn't run
+	// without exhausting RAM building its job queue (see
+	// checkFuzzRequestCount) -- recursion can only make the real total
+	// larger than this base-level estimate, so this still catches it.
+	if err := checkFuzzRequestCount(a.Name(), cfg.Wordlist, cfg.Extensions); err != nil {
+		return err
+	}
 
 	args := []string{"-u", cfg.URL, "-w", cfg.Wordlist, "--json", "--silent"}
 	if cfg.Method != "" {

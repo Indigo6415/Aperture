@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { forceCenter, forceCollide, forceLink, forceManyBody, forceSimulation, type ForceLink, type Simulation } from 'd3-force'
 import type { GraphEdge, GraphNode, GraphNodeType } from '../useScanGraph'
 import { statusHexColor } from '../statusColor'
-import { api } from '../api'
+import { api, screenshotPreviewEnabled } from '../api'
 
 // Interactive controls (pan/zoom/drag) can be turned off for the small
 // read-only preview embedded in a scan's Overview tab -- it just needs to
@@ -183,7 +183,7 @@ export function GraphCanvas({ nodes, edges, interactive = true, scanId }: GraphC
           ))}
         </g>
       </svg>
-      {hovered && scanId && (
+      {hovered && scanId && screenshotPreviewEnabled && (
         <ScreenshotTooltip key={hovered.node.label} scanId={scanId} hostname={hovered.node.label} x={hovered.x} y={hovered.y} />
       )}
     </div>

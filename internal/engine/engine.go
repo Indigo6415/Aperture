@@ -19,10 +19,21 @@ type StatusFunc func(nodeID string, status NodeStatus, message string)
 // gotten. total == 0 means the total is unknowable (see adapters.Progress).
 type ProgressFunc func(nodeID string, done, total int)
 
-// Engine executes Flows.
-type Engine struct{}
+// maxConcurrentSourceNodes bounds how many source-node subprocesses (ffuf,
+// feroxbuster, nmap, nuclei) run at once across the whole server. Without
+// this, a flow with many source nodes -- e.g. content discovery built with
+// one ffuf+feroxbuster pair per selected subdomain -- launches all of them
+// as real subprocesses simultaneously, and a selection of dozens of hosts
+// can exhaust RAM the same way maxConcurrentScreenshots (api.Server) bounds
+// concurrent headless-Chrome captures.
+const maxConcurrentSourceNodes = 4
 
-func New() *Engine { return &Engine{} }
+// Engine executes Flows.
+type Engine struct {
+	sourceSem chan struct{}
+}
+
+func New() *Engine { return &Engine{sourceSem: make(chan struct{}, maxConcurrentSourceNodes)} }
 
 // Execute runs every node in flow concurrently, wiring edges as buffered
 // channels so results stream downstream as soon as they're produced
@@ -140,6 +151,15 @@ func (e *Engine) runNode(ctx context.Context, n Node, runID string, in []Edge, e
 		if !ok {
 			return fmt.Errorf("unknown source node kind %q", n.Kind)
 		}
+		// Block here (not before checking the node kind/adapter exists)
+		// until a slot frees up, so a flow with many source nodes queues
+		// its subprocesses instead of launching them all at once.
+		select {
+		case e.sourceSem <- struct{}{}:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		defer func() { <-e.sourceSem }()
 		return adapter.Run(ctx, n.Config, adapters.RunMeta{RunID: runID, NodeID: n.ID}, func(f model.Finding) {
 			_ = sendAndEmit(ctx, out, f, emit)
 		}, adapters.Progress(progress))

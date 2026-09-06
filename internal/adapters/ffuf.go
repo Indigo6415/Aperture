@@ -102,6 +102,12 @@ func (a *FFufAdapter) Run(ctx context.Context, config json.RawMessage, meta RunM
 		matchCodes = "all"
 	}
 
+	// Refuse a wordlist/extensions combination ffuf couldn't run without
+	// exhausting RAM building its job queue (see checkFuzzRequestCount).
+	if err := checkFuzzRequestCount(a.Name(), cfg.Wordlist, cfg.Extensions); err != nil {
+		return err
+	}
+
 	// ffuf fans out one request per extension per wordlist line (plus the
 	// bare word itself), so that's the total request count a progress bar
 	// should compare against. A failure to count is non-fatal -- the run

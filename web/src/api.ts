@@ -29,6 +29,13 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>
 }
 
+// screenshotPreviewEnabled is the frontend half of the screenshot preview
+// feature's on/off switch (see the matching constant in
+// internal/api/screenshots.go, which stops the backend from capturing
+// anything). Kept false here too so no component tries to fetch an image
+// the backend will never have produced.
+export const screenshotPreviewEnabled = false
+
 export const api = {
   listTools: () => req<ToolInfo[]>('/api/tools'),
 

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { api, watchRun, watchScan } from '../api'
+import { api, screenshotPreviewEnabled, watchRun, watchScan } from '../api'
 import type { Check, CheckKind, Finding, RunStatus, Scan, ScanKind, ScanRun } from '../types'
 import { STATUS_META } from '../statusMeta'
 import { statusHexColor } from '../statusColor'
@@ -243,10 +243,12 @@ export function ScanView({ scanId, onOpenGraph }: { scanId: string; onOpenGraph:
 
   // Critical files: content-discovery + vhost findings whose URL extension
   // is on the "worth a second look" list (backups, configs, credentials,
-  // archives), newest/most-relevant first via status code then URL.
+  // archives). Restricted to status 200 -- a 403/404 on a dangerous
+  // extension isn't an exposed file, it's just noise -- sorted by URL since
+  // every remaining row shares the same status code.
   const criticalFindings = [...contentFindings, ...vhostFindings]
-    .filter((f) => isDangerousExtension(extensionOf(f.url)))
-    .sort((a, b) => a.statusCode - b.statusCode || a.url.localeCompare(b.url))
+    .filter((f) => f.statusCode === 200 && isDangerousExtension(extensionOf(f.url)))
+    .sort((a, b) => a.url.localeCompare(b.url))
 
   // Page count per subdomain, for the subdomain list below -- counts
   // content-discovery findings (path bruteforce results) whose hostname
@@ -811,7 +813,9 @@ function SubdomainsTab({
         <table className="w-full text-left text-sm">
           <thead className="sticky top-0 bg-neutral-950">
             <tr>
-              <th className="border-b border-neutral-800 px-3 py-2 text-xs font-medium uppercase tracking-wide text-neutral-500">Preview</th>
+              {screenshotPreviewEnabled && (
+                <th className="border-b border-neutral-800 px-3 py-2 text-xs font-medium uppercase tracking-wide text-neutral-500">Preview</th>
+              )}
               <th className="border-b border-neutral-800 px-3 py-2 text-xs font-medium uppercase tracking-wide text-neutral-500">Hostname</th>
               <th className="border-b border-neutral-800 px-3 py-2 text-xs font-medium uppercase tracking-wide text-neutral-500">Status</th>
               <th className="border-b border-neutral-800 px-3 py-2 text-xs font-medium uppercase tracking-wide text-neutral-500">Size</th>
@@ -824,9 +828,11 @@ function SubdomainsTab({
           <tbody>
             {kept.map((r) => (
               <tr key={r.hostname} className={`border-b border-neutral-900 hover:bg-neutral-900/60 ${r.takeoverProvider ? 'bg-red-950/20' : ''}`}>
-                <td className="px-3 py-1.5">
-                  <Thumbnail scanId={scanId} hostname={r.hostname} />
-                </td>
+                {screenshotPreviewEnabled && (
+                  <td className="px-3 py-1.5">
+                    <Thumbnail scanId={scanId} hostname={r.hostname} />
+                  </td>
+                )}
                 <td className="px-3 py-1.5 font-mono text-neutral-200">{r.hostname}</td>
                 <td className="px-3 py-1.5 font-mono" style={{ color: r.statusCode ? statusHexColor(r.statusCode) : undefined }}>
                   {r.statusCode ?? '—'}

@@ -86,7 +86,7 @@ export function GraphView({ scanId }: { scanId: string }) {
           </div>
         </div>
 
-        <FacetFilterBar items={pageNodes} dimensions={PAGE_DIMENSIONS} onChange={setKeptPages} />
+        <FacetFilterBar items={pageNodes} dimensions={PAGE_DIMENSIONS} onChange={setKeptPages} restrictStatusByDefault />
 
         <input
           value={search}

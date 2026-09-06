@@ -15,6 +15,11 @@ import (
 // without letting one hung capture linger indefinitely in the background.
 const screenshotCaptureTimeout = 30 * time.Second
 
+// screenshotPreviewEnabled is the on/off switch for the whole screenshot
+// preview feature (capture + the thumbnails/tooltips that display it). Flip
+// to true to re-enable.
+const screenshotPreviewEnabled = false
+
 // captureScreenshot renders url headlessly and persists it, unless a
 // screenshot for this scan+hostname already exists -- called (in the
 // background, best-effort) from runScan's onCheck every time a host's HTTP
@@ -23,6 +28,11 @@ const screenshotCaptureTimeout = 30 * time.Second
 // many of these run concurrently across the whole server, since each is a
 // real browser process.
 func (s *Server) captureScreenshot(scanID, hostname, url string) {
+	// The feature is disabled: skip launching headless Chrome entirely
+	// rather than just hiding the result, since that's the expensive part.
+	if !screenshotPreviewEnabled {
+		return
+	}
 	if already, err := s.store.HasScreenshot(scanID, hostname); err != nil || already {
 		return
 	}
