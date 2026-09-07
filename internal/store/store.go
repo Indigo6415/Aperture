@@ -4,18 +4,30 @@
 package store
 
 import (
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
 
+	"golang.org/x/crypto/bcrypt"
 	_ "modernc.org/sqlite"
 
 	"github.com/Indigo6415/Aperture/internal/engine"
 	"github.com/Indigo6415/Aperture/internal/model"
 	"github.com/Indigo6415/Aperture/internal/recon"
 )
+
+// randomID generates a random 128-bit hex identifier, for the rare row this
+// package creates the ID for itself (only EnsureDefaultUser -- every other
+// table's ID is minted by the api package and passed in).
+func randomID() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
 
 type Store struct {
 	db *sql.DB
@@ -128,6 +140,29 @@ CREATE TABLE IF NOT EXISTS screenshots (
 	captured_at DATETIME NOT NULL,
 	PRIMARY KEY (scan_id, hostname)
 );
+
+-- App-wide key/value settings (e.g. the DNSDumpster API key) -- deliberately
+-- just one flat table since there's currently only ever one operator/one
+-- copy of each setting, not per-user config.
+CREATE TABLE IF NOT EXISTS settings (
+	key TEXT PRIMARY KEY,
+	value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS users (
+	id TEXT PRIMARY KEY,
+	email TEXT NOT NULL UNIQUE,
+	password_hash TEXT NOT NULL,
+	created_at DATETIME NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+	token TEXT PRIMARY KEY,
+	user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	created_at DATETIME NOT NULL,
+	expires_at DATETIME NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
 `
 	_, err := s.db.Exec(schema)
 	if err != nil {
@@ -397,6 +432,7 @@ const (
 	ScanKindVHostBruteforce     ScanKind = "vhost-bruteforce"
 	ScanKindPortScan            ScanKind = "port-scan"
 	ScanKindVulnScan            ScanKind = "vuln-scan"
+	ScanKindServiceProfile      ScanKind = "service-profile"
 )
 
 // ScanRun is one scanner run belonging to a scan. A scan can own several --
@@ -768,6 +804,152 @@ func (s *Store) HasScreenshot(scanID, hostname string) (bool, error) {
 		return false, fmt.Errorf("store: has screenshot: %w", err)
 	}
 	return exists, nil
+}
+
+// --- Settings ---
+
+// SetSetting upserts one app-wide setting (e.g. "dnsdumpster_api_key").
+// Passing an empty value clears it in the sense that GetSetting will still
+// return it (ok=true, value=""), so callers that treat "" as "not
+// configured" work the same either way.
+func (s *Store) SetSetting(key, value string) error {
+	_, err := s.db.Exec(`
+		INSERT INTO settings (key, value) VALUES (?, ?)
+		ON CONFLICT(key) DO UPDATE SET value=excluded.value
+	`, key, value)
+	if err != nil {
+		return fmt.Errorf("store: set setting: %w", err)
+	}
+	return nil
+}
+
+// GetSetting returns a setting's value and whether it's been set at all.
+func (s *Store) GetSetting(key string) (value string, ok bool, err error) {
+	err = s.db.QueryRow(`SELECT value FROM settings WHERE key = ?`, key).Scan(&value)
+	if err == sql.ErrNoRows {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("store: get setting: %w", err)
+	}
+	return value, true, nil
+}
+
+// --- Users & sessions ---
+
+// User is one login account. PasswordHash is never serialized out through
+// the API -- callers that need it (VerifyPassword) get it internally only.
+type User struct {
+	ID        string    `json:"id"`
+	Email     string    `json:"email"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+// CreateUserWithPassword hashes password with bcrypt and inserts a new
+// user -- the only place a plaintext password is ever handled on its way
+// into storage.
+func (s *Store) CreateUserWithPassword(id, email, password string) error {
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return fmt.Errorf("store: hash password: %w", err)
+	}
+	_, err = s.db.Exec(`INSERT INTO users (id, email, password_hash, created_at) VALUES (?, ?, ?, ?)`,
+		id, strings.ToLower(email), string(hash), time.Now())
+	if err != nil {
+		return fmt.Errorf("store: create user: %w", err)
+	}
+	return nil
+}
+
+// UserCount reports how many accounts exist, so the caller can decide
+// whether to seed a default one on first run.
+func (s *Store) UserCount() (int, error) {
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&n); err != nil {
+		return 0, fmt.Errorf("store: user count: %w", err)
+	}
+	return n, nil
+}
+
+// EnsureDefaultUser seeds one login (email/password) iff no users exist yet
+// -- called once at startup so a fresh install always has something to log
+// in with, without ever overwriting or recreating an account someone has
+// since changed, renamed, or deleted.
+func (s *Store) EnsureDefaultUser(email, password string) error {
+	n, err := s.UserCount()
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	return s.CreateUserWithPassword(randomID(), email, password)
+}
+
+// VerifyPassword looks up email and checks password against its stored
+// bcrypt hash. ok is false for both "no such user" and "wrong password" --
+// callers must not distinguish the two in any user-facing response, since
+// doing so would let an attacker enumerate valid emails.
+func (s *Store) VerifyPassword(email, password string) (User, bool, error) {
+	var u User
+	var hash string
+	err := s.db.QueryRow(`SELECT id, email, password_hash, created_at FROM users WHERE email = ?`, strings.ToLower(email)).
+		Scan(&u.ID, &u.Email, &hash, &u.CreatedAt)
+	if err == sql.ErrNoRows {
+		return User{}, false, nil
+	}
+	if err != nil {
+		return User{}, false, fmt.Errorf("store: verify password: %w", err)
+	}
+	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) != nil {
+		return User{}, false, nil
+	}
+	return u, true, nil
+}
+
+// CreateSession records a new login session token for userID, valid until
+// expiresAt.
+func (s *Store) CreateSession(token, userID string, expiresAt time.Time) error {
+	_, err := s.db.Exec(`INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)`,
+		token, userID, time.Now(), expiresAt)
+	if err != nil {
+		return fmt.Errorf("store: create session: %w", err)
+	}
+	return nil
+}
+
+// GetSessionUser resolves a session token to its user, treating an expired
+// session the same as a nonexistent one (ErrNotFound) -- it also deletes
+// the row in that case so expired sessions don't pile up indefinitely.
+func (s *Store) GetSessionUser(token string) (User, error) {
+	var u User
+	var expiresAt time.Time
+	err := s.db.QueryRow(`
+		SELECT u.id, u.email, u.created_at, s.expires_at
+		FROM sessions s JOIN users u ON u.id = s.user_id
+		WHERE s.token = ?
+	`, token).Scan(&u.ID, &u.Email, &u.CreatedAt, &expiresAt)
+	if err == sql.ErrNoRows {
+		return User{}, ErrNotFound
+	}
+	if err != nil {
+		return User{}, fmt.Errorf("store: get session: %w", err)
+	}
+	if time.Now().After(expiresAt) {
+		_ = s.DeleteSession(token)
+		return User{}, ErrNotFound
+	}
+	return u, nil
+}
+
+// DeleteSession removes a session token (logout, or a lazily-noticed
+// expiry in GetSessionUser).
+func (s *Store) DeleteSession(token string) error {
+	_, err := s.db.Exec(`DELETE FROM sessions WHERE token = ?`, token)
+	if err != nil {
+		return fmt.Errorf("store: delete session: %w", err)
+	}
+	return nil
 }
 
 var ErrNotFound = fmt.Errorf("not found")

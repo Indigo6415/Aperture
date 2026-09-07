@@ -34,7 +34,7 @@ export interface Run {
   finishedAt?: string
 }
 
-export type NodeStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled'
+export type NodeStatus = 'pending' | 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled'
 
 export interface RunEvent {
   type: 'finding' | 'status' | 'progress' | 'done'
@@ -51,7 +51,7 @@ export interface RunEvent {
 
 // --- Domain scans (recon checks + the scanner tabs each scan runs) ---
 
-export type CheckKind = 'dns' | 'tls' | 'http' | 'subdomains' | 'whois' | 'takeover'
+export type CheckKind = 'dns' | 'tls' | 'http' | 'subdomains' | 'whois' | 'takeover' | 'dnsdumpster'
 export type CheckStatus = 'running' | 'done' | 'error'
 
 export interface Check {
@@ -66,7 +66,7 @@ export interface Check {
 
 // ScanKind identifies one of the independent scanners a scan runs -- mirrors
 // internal/store.ScanKind.
-export type ScanKind = 'content-discovery' | 'subdomain-bruteforce' | 'vhost-bruteforce' | 'port-scan' | 'vuln-scan'
+export type ScanKind = 'content-discovery' | 'subdomain-bruteforce' | 'vhost-bruteforce' | 'port-scan' | 'vuln-scan' | 'service-profile'
 
 export interface ScanRun {
   kind: ScanKind
@@ -120,6 +120,9 @@ export interface ScanEvent {
   kind?: ScanKind
   flowId?: string
   runId?: string
+  // Set only on a "scanRun" event for a scanner with a per-target concept
+  // (content discovery) -- see store.ScanRun.Targets/RunEvent.Targets.
+  targets?: string[]
 }
 
 // ScanRunStartResult is the response shape for every endpoint that starts
@@ -156,4 +159,14 @@ export interface WordlistCatalogEntry {
   name: string
   description: string
   url: string
+}
+
+// --- Auth & settings ---
+
+export interface AuthUser {
+  email: string
+}
+
+export interface SettingsInfo {
+  dnsdumpsterApiKeySet: boolean
 }

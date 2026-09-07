@@ -60,31 +60,44 @@ func NewServer(st *store.Store, eng *engine.Engine, uiFS fs.FS, wordlistsDir str
 		screenshotSem: make(chan struct{}, maxConcurrentScreenshots),
 	}
 
-	s.mux.HandleFunc("GET /api/tools", s.handleListTools)
+	// Login (and its own probe, handleMe, and logout) are the only
+	// /api routes reachable without a session -- every other one below is
+	// wrapped in requireAuth. Logout doesn't need a *valid* session (it
+	// just deletes whatever cookie is presented, if any), so it's left
+	// unwrapped too rather than 401ing a client whose session already
+	// expired but who's just trying to clear its cookie.
+	s.mux.HandleFunc("POST /api/auth/login", s.handleLogin)
+	s.mux.HandleFunc("POST /api/auth/logout", s.handleLogout)
+	s.mux.HandleFunc("GET /api/auth/me", s.requireAuth(s.handleMe))
 
-	s.mux.HandleFunc("POST /api/scan", s.handleStartScan)
-	s.mux.HandleFunc("GET /api/scans", s.handleListScans)
-	s.mux.HandleFunc("GET /api/scans/{id}", s.handleGetScan)
-	s.mux.HandleFunc("GET /api/scans/{id}/runs", s.handleListScanRuns)
-	s.mux.HandleFunc("POST /api/scans/{id}/content-discovery", s.handleScanContentDiscovery)
-	s.mux.HandleFunc("POST /api/scans/{id}/restart", s.handleRestartScan)
-	s.mux.HandleFunc("POST /api/scans/{id}/runs/{kind}/restart", s.handleRestartScanRun)
-	s.mux.HandleFunc("POST /api/scans/{id}/cancel", s.handleCancelScan)
-	s.mux.HandleFunc("GET /api/scans/{id}/report", s.handleScanReport)
-	s.mux.HandleFunc("GET /api/scans/{id}/screenshots", s.handleListScreenshots)
-	s.mux.HandleFunc("GET /api/scans/{id}/screenshots/{hostname}", s.handleGetScreenshot)
-	s.mux.HandleFunc("GET /ws/scans/{id}", s.handleWatchScan)
+	s.mux.HandleFunc("GET /api/tools", s.requireAuth(s.handleListTools))
 
-	s.mux.HandleFunc("GET /api/wordlists", s.handleListWordlists)
-	s.mux.HandleFunc("GET /api/wordlists/catalog", s.handleWordlistCatalog)
-	s.mux.HandleFunc("POST /api/wordlists/download", s.handleDownloadWordlist)
-	s.mux.HandleFunc("DELETE /api/wordlists/{name}", s.handleDeleteWordlist)
-	s.mux.HandleFunc("PATCH /api/wordlists/{name}/categories", s.handleSetWordlistCategories)
-	s.mux.HandleFunc("POST /api/wordlists/{name}/duplicate", s.handleDuplicateWordlist)
+	s.mux.HandleFunc("GET /api/settings", s.requireAuth(s.handleGetSettings))
+	s.mux.HandleFunc("PUT /api/settings/dnsdumpster-key", s.requireAuth(s.handleSetDNSDumpsterKey))
 
-	s.mux.HandleFunc("GET /api/runs/{id}", s.handleGetRun)
-	s.mux.HandleFunc("GET /api/runs/{id}/findings", s.handleListFindings)
-	s.mux.HandleFunc("GET /ws/runs/{id}", s.handleWatchRun)
+	s.mux.HandleFunc("POST /api/scan", s.requireAuth(s.handleStartScan))
+	s.mux.HandleFunc("GET /api/scans", s.requireAuth(s.handleListScans))
+	s.mux.HandleFunc("GET /api/scans/{id}", s.requireAuth(s.handleGetScan))
+	s.mux.HandleFunc("GET /api/scans/{id}/runs", s.requireAuth(s.handleListScanRuns))
+	s.mux.HandleFunc("POST /api/scans/{id}/content-discovery", s.requireAuth(s.handleScanContentDiscovery))
+	s.mux.HandleFunc("POST /api/scans/{id}/restart", s.requireAuth(s.handleRestartScan))
+	s.mux.HandleFunc("POST /api/scans/{id}/runs/{kind}/restart", s.requireAuth(s.handleRestartScanRun))
+	s.mux.HandleFunc("POST /api/scans/{id}/cancel", s.requireAuth(s.handleCancelScan))
+	s.mux.HandleFunc("GET /api/scans/{id}/report", s.requireAuth(s.handleScanReport))
+	s.mux.HandleFunc("GET /api/scans/{id}/screenshots", s.requireAuth(s.handleListScreenshots))
+	s.mux.HandleFunc("GET /api/scans/{id}/screenshots/{hostname}", s.requireAuth(s.handleGetScreenshot))
+	s.mux.HandleFunc("GET /ws/scans/{id}", s.requireAuth(s.handleWatchScan))
+
+	s.mux.HandleFunc("GET /api/wordlists", s.requireAuth(s.handleListWordlists))
+	s.mux.HandleFunc("GET /api/wordlists/catalog", s.requireAuth(s.handleWordlistCatalog))
+	s.mux.HandleFunc("POST /api/wordlists/download", s.requireAuth(s.handleDownloadWordlist))
+	s.mux.HandleFunc("DELETE /api/wordlists/{name}", s.requireAuth(s.handleDeleteWordlist))
+	s.mux.HandleFunc("PATCH /api/wordlists/{name}/categories", s.requireAuth(s.handleSetWordlistCategories))
+	s.mux.HandleFunc("POST /api/wordlists/{name}/duplicate", s.requireAuth(s.handleDuplicateWordlist))
+
+	s.mux.HandleFunc("GET /api/runs/{id}", s.requireAuth(s.handleGetRun))
+	s.mux.HandleFunc("GET /api/runs/{id}/findings", s.requireAuth(s.handleListFindings))
+	s.mux.HandleFunc("GET /ws/runs/{id}", s.requireAuth(s.handleWatchRun))
 
 	if uiFS != nil {
 		s.mux.Handle("/", spaHandler(uiFS))

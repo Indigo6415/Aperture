@@ -75,6 +75,7 @@ export function FacetFilterBar<T>({
   dimensions,
   onChange,
   restrictStatusByDefault = false,
+  orientation = 'row',
 }: {
   items: T[]
   dimensions: FacetDimension<T>[]
@@ -83,6 +84,11 @@ export function FacetFilterBar<T>({
   // matching only 200 and hides its own button grid, until the user checks
   // "show everything." See SHOW_EVERYTHING_STORAGE_KEY above.
   restrictStatusByDefault?: boolean
+  // 'column' stacks every dimension's input full-width down a narrow
+  // sidebar instead of wrapping them across a row -- used by the Content
+  // Discovery tab, which puts this bar to the right of its results table
+  // rather than above it.
+  orientation?: 'row' | 'column'
 }) {
   const [included, setIncluded] = useState<Record<string, Set<FacetValue>>>({})
   const [excluded, setExcluded] = useState<Record<string, Set<FacetValue>>>({})
@@ -270,10 +276,12 @@ export function FacetFilterBar<T>({
   const inputFacets = visible.filter((f) => f.dim.key !== 'statusCode')
   const statusFacets = visible.filter((f) => f.dim.key === 'statusCode')
 
+  const column = orientation === 'column'
+
   return (
-    <div className="border-b border-neutral-800">
+    <div className={column ? '' : 'border-b border-neutral-800'}>
       {inputFacets.length > 0 && (
-        <div className="grid grid-cols-2 gap-x-6 gap-y-2 px-3 py-2 sm:grid-cols-4">
+        <div className={column ? 'flex flex-col gap-3 p-3' : 'grid grid-cols-2 gap-x-6 gap-y-2 px-3 py-2 sm:grid-cols-4'}>
           {inputFacets.map(({ dim, suggestions, keptCounts, byString, warnValues, isNumeric }) => {
             const includeSet = included[dim.key] ?? new Set<FacetValue>()
             const excludeSet = excluded[dim.key] ?? new Set<FacetValue>()
@@ -355,40 +363,60 @@ export function FacetFilterBar<T>({
       )}
       {statusFacets.map(({ dim, suggestions, keptCounts }) => {
         const includeSet = included[dim.key] ?? new Set<FacetValue>()
+        // While forced, the button grid is replaced with a plain note --
+        // it'd otherwise look interactive while every click does nothing,
+        // since forceStatusOnly overrides it anyway.
+        const buttons = forceStatusOnly ? (
+          <span className="font-mono text-xs text-neutral-600">Showing 200 only</span>
+        ) : (
+          suggestions.map((v) => {
+            const active = includeSet.has(v)
+            const count = keptCounts.get(v) ?? 0
+            return (
+              <button
+                key={v}
+                onClick={() => (active ? removeInclude(dim.key, v) : setInclude(dim.key, v))}
+                title={`${count} result${count === 1 ? '' : 's'}`}
+                className={`rounded border px-2.5 py-1.5 font-mono text-xs transition-colors ${
+                  active ? 'border-sky-500 bg-sky-950/40 text-sky-300' : 'border-neutral-700 bg-neutral-900 hover:border-sky-600'
+                }`}
+                style={!active && dim.colorFor ? { color: dim.colorFor(v) } : undefined}
+              >
+                {v}
+                <span className="ml-1 text-neutral-500">{count}</span>
+              </button>
+            )
+          })
+        )
+        const label = <span className="text-[10px] font-semibold uppercase tracking-wide text-neutral-500">{dim.label}</span>
+        const showEverythingToggle = restrictStatusByDefault && (
+          <label className="flex items-center gap-1.5 text-xs text-neutral-400">
+            <input type="checkbox" checked={showEverything} onChange={toggleShowEverything} className="accent-sky-500" />
+            Show everything
+          </label>
+        )
+        const borderCls = inputFacets.length > 0 ? 'border-t border-neutral-900' : ''
+        // Column mode groups the label/toggle onto their own row and the
+        // button grid onto another -- flattening them all into one
+        // flex-wrap row (like the row-mode layout below) would put every
+        // individual status button on its own line the moment the
+        // container itself goes flex-col.
+        if (column) {
+          return (
+            <div key={dim.key} className={`flex flex-col gap-1.5 px-3 py-2 ${borderCls}`}>
+              <div className="flex flex-wrap items-center gap-2">
+                {label}
+                {showEverythingToggle}
+              </div>
+              <div className="flex flex-wrap gap-1.5">{buttons}</div>
+            </div>
+          )
+        }
         return (
-          <div key={dim.key} className={`flex flex-wrap items-center gap-1.5 px-3 py-2 ${inputFacets.length > 0 ? 'border-t border-neutral-900' : ''}`}>
-            <span className="text-[10px] font-semibold uppercase tracking-wide text-neutral-500">{dim.label}</span>
-            {restrictStatusByDefault && (
-              <label className="flex items-center gap-1.5 text-xs text-neutral-400">
-                <input type="checkbox" checked={showEverything} onChange={toggleShowEverything} className="accent-sky-500" />
-                Show everything
-              </label>
-            )}
-            {/* While forced, the button grid below is replaced with a plain
-                note -- it'd otherwise look interactive while every click
-                does nothing, since forceStatusOnly overrides it anyway. */}
-            {forceStatusOnly ? (
-              <span className="font-mono text-xs text-neutral-600">Showing 200 only</span>
-            ) : (
-              suggestions.map((v) => {
-                const active = includeSet.has(v)
-                const count = keptCounts.get(v) ?? 0
-                return (
-                  <button
-                    key={v}
-                    onClick={() => (active ? removeInclude(dim.key, v) : setInclude(dim.key, v))}
-                    title={`${count} result${count === 1 ? '' : 's'}`}
-                    className={`rounded border px-2.5 py-1.5 font-mono text-xs transition-colors ${
-                      active ? 'border-sky-500 bg-sky-950/40 text-sky-300' : 'border-neutral-700 bg-neutral-900 hover:border-sky-600'
-                    }`}
-                    style={!active && dim.colorFor ? { color: dim.colorFor(v) } : undefined}
-                  >
-                    {v}
-                    <span className="ml-1 text-neutral-500">{count}</span>
-                  </button>
-                )
-              })
-            )}
+          <div key={dim.key} className={`flex flex-wrap items-center gap-1.5 px-3 py-2 ${borderCls}`}>
+            {label}
+            {showEverythingToggle}
+            {buttons}
           </div>
         )
       })}

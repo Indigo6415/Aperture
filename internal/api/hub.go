@@ -33,6 +33,13 @@ type RunEvent struct {
 	Kind   string `json:"kind,omitempty"`
 	FlowID string `json:"flowId,omitempty"`
 	RunID  string `json:"runId,omitempty"`
+	// Targets is set only on a "scanRun" event for a scanner with a
+	// per-target concept (content discovery) -- the same list stored on
+	// the run (store.ScanRun.Targets), in the order used to build that
+	// run's flow nodes (ffuf-<i>/feroxbuster-<i> for targets[i]), so a
+	// client can group per-node progress into one bar per target without
+	// fetching the flow itself.
+	Targets []string `json:"targets,omitempty"`
 }
 
 // hub fans out RunEvents to any number of WebSocket subscribers per run.

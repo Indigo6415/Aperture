@@ -2,24 +2,78 @@ package adapters
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/url"
 	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Indigo6415/Aperture/internal/model"
 	"github.com/Indigo6415/Aperture/internal/wordlists"
 )
 
-// progressEvery is how many parsed result lines pass between progress
-// callbacks, so a fast-running ffuf doesn't flood the hub with one event
-// per request.
-const progressEvery = 25
+// ffufProgressLine matches ffuf's live stderr progress line, e.g.:
+//
+//	:: Progress: [1234/5000] :: Job [1/1] :: 87 req/sec :: Duration: [0:00:12] :: Errors: 0 ::
+//
+// This is ffuf's own count of completed requests, independent of how many
+// of them pass its match/filter/autocalibration rules -- unlike counting
+// emitted stdout result lines (matches only), it doesn't stall near zero
+// when -mc is narrow or -ac is filtering out nearly everything, which is
+// exactly how subdomain/vhost bruteforce are configured (see
+// buildSubdomainBruteforceFlow/buildVHostBruteforceFlow).
+var ffufProgressLine = regexp.MustCompile(`::\s*Progress:\s*\[(\d+)/(\d+)\]`)
+
+// watchFfufProgress reads ffuf's stderr for the progress line above. ffuf
+// redraws that line in place with a bare '\r' (no trailing '\n') rather
+// than appending a new one each time, so this can't use bufio.ScanLines
+// directly -- that would buffer the entire run's worth of redraws as one
+// unterminated "line" until stderr closes. splitLinesOrCR treats '\r' as
+// a line ending too, so each redraw is scanned as it arrives.
+//
+// Always drains stderr to completion (even with progress == nil) --
+// ffuf's stderr pipe otherwise fills and blocks the subprocess once its
+// OS buffer is full, since nothing else is reading it.
+func watchFfufProgress(stderr io.Reader, progress Progress) {
+	scanner := bufio.NewScanner(stderr)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	scanner.Split(splitLinesOrCR)
+	for scanner.Scan() {
+		if progress == nil {
+			continue
+		}
+		m := ffufProgressLine.FindStringSubmatch(scanner.Text())
+		if m == nil {
+			continue
+		}
+		done, _ := strconv.Atoi(m[1])
+		total, _ := strconv.Atoi(m[2])
+		progress(done, total)
+	}
+}
+
+// splitLinesOrCR is bufio.ScanLines extended to also split on a bare
+// '\r' -- ffuf (and most CLI progress bars) redraw their status line with
+// '\r' alone, never '\n', so the default split never terminates it.
+func splitLinesOrCR(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	if atEOF && len(data) == 0 {
+		return 0, nil, nil
+	}
+	if i := bytes.IndexAny(data, "\r\n"); i >= 0 {
+		return i + 1, data[:i], nil
+	}
+	if atEOF {
+		return len(data), data, nil
+	}
+	return 0, nil, nil
+}
 
 func init() {
 	register(&FFufAdapter{})
@@ -150,6 +204,10 @@ func (a *FFufAdapter) Run(ctx context.Context, config json.RawMessage, meta RunM
 	if err != nil {
 		return fmt.Errorf("ffuf: stdout pipe: %w", err)
 	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("ffuf: stderr pipe: %w", err)
+	}
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("ffuf: start: %w (is ffuf installed and on PATH?)", err)
 	}
@@ -160,10 +218,19 @@ func (a *FFufAdapter) Run(ctx context.Context, config json.RawMessage, meta RunM
 	}
 
 	if progress != nil {
+		// Seeded with the wordlist-derived estimate so callers see a real
+		// total immediately; watchFfufProgress below corrects it (usually
+		// within the first second) with ffuf's own exact count.
 		progress(0, total)
 	}
 
-	done := 0
+	var progressWG sync.WaitGroup
+	progressWG.Add(1)
+	go func() {
+		defer progressWG.Done()
+		watchFfufProgress(stderr, progress)
+	}()
+
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
@@ -193,18 +260,16 @@ func (a *FFufAdapter) Run(ctx context.Context, config json.RawMessage, meta RunM
 			RunID:         meta.RunID,
 			Timestamp:     time.Now(),
 		})
-		done++
-		if progress != nil && done%progressEvery == 0 {
-			progress(done, total)
-		}
 	}
+	scanErr := scanner.Err()
 
+	// Both pipes must be fully drained before Wait -- otherwise a full
+	// stderr buffer (progress redraws are frequent) could deadlock the
+	// subprocess against Wait closing the pipes out from under it.
+	progressWG.Wait()
 	waitErr := cmd.Wait()
-	if scanErr := scanner.Err(); scanErr != nil {
+	if scanErr != nil {
 		return fmt.Errorf("ffuf: reading output: %w", scanErr)
-	}
-	if progress != nil {
-		progress(done, total)
 	}
 	if waitErr != nil {
 		if ctx.Err() != nil {

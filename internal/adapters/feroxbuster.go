@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Indigo6415/Aperture/internal/model"
+	"github.com/Indigo6415/Aperture/internal/wordlists"
 )
 
 func init() {
@@ -50,7 +51,8 @@ type feroxResponse struct {
 }
 
 // feroxProgressEvery is how many parsed response lines pass between
-// progress callbacks (see progressEvery in ffuf.go for why this exists).
+// progress callbacks, so a fast-running feroxbuster doesn't flood the hub
+// with one event per request.
 const feroxProgressEvery = 10
 
 func (a *FeroxbusterAdapter) Run(ctx context.Context, config json.RawMessage, meta RunMeta, emit Emit, progress Progress) error {
@@ -72,7 +74,9 @@ func (a *FeroxbusterAdapter) Run(ctx context.Context, config json.RawMessage, me
 		return err
 	}
 
-	args := []string{"-u", cfg.URL, "-w", cfg.Wordlist, "--json", "--silent"}
+	// --no-state prevents feroxbuster from writing a state file to disk on
+	// every run, which otherwise accumulates and clogs up the file system.
+	args := []string{"-u", cfg.URL, "-w", cfg.Wordlist, "--json", "--silent", "--no-state"}
 	if cfg.Method != "" {
 		args = append(args, "-m", cfg.Method)
 	}
@@ -108,11 +112,37 @@ func (a *FeroxbusterAdapter) Run(ctx context.Context, config json.RawMessage, me
 		return fmt.Errorf("feroxbuster: start: %w (is feroxbuster installed and on PATH?)", err)
 	}
 
-	if progress != nil {
-		// Recursion means the total request count is unknowable upfront --
-		// total 0 tells callers to render this as indeterminate progress.
-		progress(0, 0)
+	// baseTotal is the same wordlist-derived request-count estimate ffuf
+	// uses (see its "total" comment) -- feroxbuster's default status-code
+	// filter is "all", so nearly every completed request produces a
+	// "response" JSON line, and this estimate holds until recursion into a
+	// found directory adds another wordlist's worth of requests on top.
+	// 0 means the wordlist couldn't be counted, same as ffuf's fallback.
+	baseTotal := 0
+	if lines, err := wordlists.CountLines(cfg.Wordlist); err == nil {
+		multiplier := 1
+		if len(cfg.Extensions) > 0 {
+			multiplier += len(cfg.Extensions)
+		}
+		baseTotal = lines * multiplier
 	}
+
+	// reportProgress grows the reported total to match done once recursion
+	// pushes actual progress past baseTotal, so the bar keeps advancing
+	// sensibly instead of overflowing past 100% -- but only when baseTotal
+	// is known; baseTotal == 0 stays indeterminate throughout.
+	reportProgress := func(done int) {
+		if progress == nil {
+			return
+		}
+		total := baseTotal
+		if total > 0 && done > total {
+			total = done
+		}
+		progress(done, total)
+	}
+
+	reportProgress(0)
 
 	done := 0
 	scanner := bufio.NewScanner(stdout)
@@ -146,8 +176,8 @@ func (a *FeroxbusterAdapter) Run(ctx context.Context, config json.RawMessage, me
 			Timestamp:     time.Now(),
 		})
 		done++
-		if progress != nil && done%feroxProgressEvery == 0 {
-			progress(done, 0)
+		if done%feroxProgressEvery == 0 {
+			reportProgress(done)
 		}
 	}
 
@@ -155,9 +185,7 @@ func (a *FeroxbusterAdapter) Run(ctx context.Context, config json.RawMessage, me
 	if scanErr := scanner.Err(); scanErr != nil {
 		return fmt.Errorf("feroxbuster: reading output: %w", scanErr)
 	}
-	if progress != nil {
-		progress(done, 0)
-	}
+	reportProgress(done)
 	if waitErr != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()

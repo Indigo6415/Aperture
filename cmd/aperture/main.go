@@ -23,8 +23,17 @@ import (
 	"github.com/Indigo6415/Aperture/internal/wordlists"
 )
 
+// defaultUserEmail/defaultUserPassword seed a single test login on a fresh
+// install (see EnsureDefaultUser) so there's always something to sign in
+// with out of the box -- change or delete it via a later "manage users"
+// feature once one exists; for now it's the only account creation path.
+const (
+	defaultUserEmail    = "user"
+	defaultUserPassword = "user"
+)
+
 func main() {
-	addr := flag.String("addr", "127.0.0.1:8080", "address to listen on")
+	addr := flag.String("addr", "127.0.0.1:8337", "address to listen on")
 	dbPath := flag.String("db", defaultDBPath(), "path to the SQLite database file")
 	open := flag.Bool("open", true, "open the UI in your default browser on start")
 	flag.Parse()
@@ -34,6 +43,13 @@ func main() {
 		log.Fatalf("aperture: %v", err)
 	}
 	defer st.Close()
+
+	// Seeds a single test login on first run only -- see EnsureDefaultUser,
+	// which no-ops once any account exists so this never recreates a login
+	// someone has since changed or deleted.
+	if err := st.EnsureDefaultUser(defaultUserEmail, defaultUserPassword); err != nil {
+		log.Fatalf("aperture: %v", err)
+	}
 
 	wordlistsDir := defaultWordlistsDir()
 	if err := wordlists.EnsureDefault(wordlistsDir); err != nil {

@@ -1,4 +1,5 @@
 import type {
+  AuthUser,
   Finding,
   Run,
   RunEvent,
@@ -10,11 +11,23 @@ import type {
   ScanRunStartResult,
   ScanSummary,
   ScreenshotMeta,
+  SettingsInfo,
   ToolInfo,
   WordlistCatalogEntry,
   WordlistCategory,
   WordlistInfo,
 } from './types'
+
+// ApiError carries the HTTP status alongside the usual message so callers
+// (App's initial auth probe, in particular) can tell "not signed in" (401)
+// apart from every other failure without parsing response text.
+export class ApiError extends Error {
+  status: number
+  constructor(status: number, message: string) {
+    super(message)
+    this.status = status
+  }
+}
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
@@ -23,7 +36,7 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   })
   if (!res.ok) {
     const body = await res.text()
-    throw new Error(`${res.status} ${res.statusText}: ${body}`)
+    throw new ApiError(res.status, `${res.status} ${res.statusText}: ${body}`)
   }
   if (res.status === 204) return undefined as T
   return res.json() as Promise<T>
@@ -37,6 +50,15 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 export const screenshotPreviewEnabled = false
 
 export const api = {
+  login: (email: string, password: string) =>
+    req<AuthUser>('/api/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) }),
+  logout: () => req<void>('/api/auth/logout', { method: 'POST' }),
+  me: () => req<AuthUser>('/api/auth/me'),
+
+  getSettings: () => req<SettingsInfo>('/api/settings'),
+  setDNSDumpsterKey: (apiKey: string) =>
+    req<SettingsInfo>('/api/settings/dnsdumpster-key', { method: 'PUT', body: JSON.stringify({ apiKey }) }),
+
   listTools: () => req<ToolInfo[]>('/api/tools'),
 
   getRun: (runId: string) => req<Run>(`/api/runs/${runId}`),

@@ -65,7 +65,12 @@ type Flow struct {
 type NodeStatus string
 
 const (
-	StatusPending   NodeStatus = "pending"
+	StatusPending NodeStatus = "pending"
+	// StatusQueued is a source node (ffuf/feroxbuster/nmap/nuclei) waiting
+	// on maxConcurrentSourceNodes for a free slot -- distinct from
+	// StatusRunning so the UI can tell "not actually scanning yet" apart
+	// from "scanning, hasn't reported progress yet."
+	StatusQueued    NodeStatus = "queued"
 	StatusRunning   NodeStatus = "running"
 	StatusSucceeded NodeStatus = "succeeded"
 	StatusFailed    NodeStatus = "failed"

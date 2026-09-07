@@ -1,14 +1,16 @@
 import { useEffect, useRef, useState } from 'react'
 import { api, screenshotPreviewEnabled, watchRun, watchScan } from '../api'
-import type { Check, CheckKind, Finding, RunStatus, Scan, ScanKind, ScanRun } from '../types'
+import type { Check, CheckKind, Finding, NodeStatus, RunStatus, Scan, ScanKind, ScanRun } from '../types'
 import { STATUS_META } from '../statusMeta'
 import { statusHexColor } from '../statusColor'
 import { extensionOf, hostnameOf } from '../url'
 import { isDangerousExtension } from '../extensions'
+import { estimateEtaSeconds } from '../eta'
 import { useScanGraph } from '../useScanGraph'
 import { FacetFilterBar, type FacetDimension } from './FacetFilterBar'
 import { ResultsTable, Thumbnail } from './ResultsTable'
 import { ProgressBar } from './ProgressBar'
+import { TargetProgressPanel, type TargetProgress } from './TargetProgressPanel'
 import { SummaryCard } from './SummaryCard'
 import { GraphCanvas } from './GraphCanvas'
 import { PortsTable } from './PortsTable'
@@ -21,6 +23,7 @@ const CHECK_LABELS: Record<CheckKind, string> = {
   subdomains: 'Subdomains',
   whois: 'WHOIS',
   takeover: 'Takeover',
+  dnsdumpster: 'DNSDumpster',
 }
 
 const STATUS_DOT: Record<Check['status'] | 'pending', string> = {
@@ -34,7 +37,7 @@ function keyFor(domain: string, kind: CheckKind): string {
   return `${domain}::${kind}`
 }
 
-type Tab = 'overview' | 'subdomains' | 'vhosts' | 'content-discovery' | 'ports' | 'vulnerabilities'
+type Tab = 'overview' | 'subdomains' | 'vhosts' | 'content-discovery' | 'ports' | 'services' | 'vulnerabilities'
 
 const TABS: { id: Tab; label: string }[] = [
   { id: 'overview', label: 'Overview' },
@@ -42,6 +45,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: 'vhosts', label: 'Virtual Hosts' },
   { id: 'content-discovery', label: 'Content Discovery' },
   { id: 'ports', label: 'Ports' },
+  { id: 'services', label: 'Service Profile' },
   { id: 'vulnerabilities', label: 'Vulnerabilities' },
 ]
 
@@ -60,6 +64,15 @@ export function ScanView({ scanId, onOpenGraph }: { scanId: string; onOpenGraph:
   // can have several source nodes (one ffuf+feroxbuster pair per target)
   // each reporting their own progress.
   const [runProgress, setRunProgress] = useState<Record<string, { done: number; total: number }>>({})
+  // Per-node lifecycle state, same key scheme as runProgress -- lets the
+  // Content Discovery tab tell a target still queued behind
+  // maxConcurrentSourceNodes apart from one actually scanning with 0
+  // progress reported yet.
+  const [nodeStatus, setNodeStatus] = useState<Record<string, NodeStatus>>({})
+  // Wall-clock time a node first went 'running', used to derive an ETA
+  // from its done/total rate so far -- a plain ref (not state) since it's
+  // read at render time, not something that should itself trigger one.
+  const nodeStartedAtRef = useRef<Record<string, number>>({})
   const [tab, setTab] = useState<Tab>('overview')
   const [restartingScan, setRestartingScan] = useState(false)
   const [cancellingScan, setCancellingScan] = useState(false)
@@ -79,7 +92,17 @@ export function ScanView({ scanId, onOpenGraph }: { scanId: string; onOpenGraph:
         setRunFindings((prev) => ({ ...prev, [runId]: [...(prev[runId] ?? []), finding] }))
       } else if (ev.type === 'progress' && ev.nodeId) {
         const key = `${runId}:${ev.nodeId}`
+        // A reconnect (page reload mid-run) never replays the 'status'
+        // event that would normally stamp this -- progress ticks keep
+        // streaming regardless, so treat the first one this tab sees as a
+        // (slightly late) start reference rather than leaving ETA stuck
+        // at "unknown" for the rest of the run.
+        if (!nodeStartedAtRef.current[key]) nodeStartedAtRef.current[key] = Date.now()
         setRunProgress((prev) => ({ ...prev, [key]: { done: ev.done ?? 0, total: ev.total ?? 0 } }))
+      } else if (ev.type === 'status' && ev.nodeId && ev.status) {
+        const key = `${runId}:${ev.nodeId}`
+        if (ev.status === 'running' && !nodeStartedAtRef.current[key]) nodeStartedAtRef.current[key] = Date.now()
+        setNodeStatus((prev) => ({ ...prev, [key]: ev.status! }))
       } else if (ev.type === 'done') {
         setRunStatus((prev) => ({
           ...prev,
@@ -97,6 +120,8 @@ export function ScanView({ scanId, onOpenGraph }: { scanId: string; onOpenGraph:
     setRunFindings({})
     setRunStatus({})
     setRunProgress({})
+    setNodeStatus({})
+    nodeStartedAtRef.current = {}
     setTab('overview')
     Object.values(stopRunWatches.current).forEach((stop) => stop())
     stopRunWatches.current = {}
@@ -121,7 +146,14 @@ export function ScanView({ scanId, onOpenGraph }: { scanId: string; onOpenGraph:
         const check = ev.check
         setChecks((prev) => ({ ...prev, [keyFor(check.domain, check.kind)]: check }))
       } else if (ev.type === 'scanRun' && ev.kind && ev.flowId && ev.runId) {
-        const run: ScanRun = { kind: ev.kind, flowId: ev.flowId, runId: ev.runId, status: 'running', createdAt: new Date().toISOString() }
+        const run: ScanRun = {
+          kind: ev.kind,
+          flowId: ev.flowId,
+          runId: ev.runId,
+          status: 'running',
+          targets: ev.targets,
+          createdAt: new Date().toISOString(),
+        }
         setScanRuns((prev) => [...prev, run])
         watchTheRun(ev.runId)
       }
@@ -182,6 +214,69 @@ export function ScanView({ scanId, onOpenGraph }: { scanId: string; onOpenGraph:
     return { done, total: indeterminate ? 0 : total }
   }
 
+  // nodeStatusFallback covers a node this browser tab never saw a "status"
+  // event for -- most commonly a fresh page load reconnecting mid-run or
+  // after a run has already finished, since node status is pure live
+  // pub/sub (nothing persists it server-side the way findings/run status
+  // are). Progress events aren't persisted either, but they keep streaming
+  // for as long as the node is genuinely still running, so a live
+  // progress entry is trusted over the run's own (possibly stale) status
+  // first; short of that, a run that isn't 'running' anymore means every
+  // one of its nodes reached some final state, so its own status is a
+  // reasonable stand-in even though it can't say *which* final state a
+  // specific node landed in (e.g. one node failing when the run itself
+  // reads "failed").
+  const nodeStatusFallback = (key: string, runStatus: RunStatus): NodeStatus => {
+    if (nodeStatus[key]) return nodeStatus[key]
+    if (runProgress[key]) return 'running'
+    return runStatus === 'running' ? 'pending' : runStatus
+  }
+
+  // contentDiscoveryTargets builds one row per target host across every
+  // content-discovery run this scan has started (the initial apex-only
+  // run, plus any later "scan selected subdomains" runs) -- ffuf-<i> and
+  // feroxbuster-<i> both cover run.targets[i] (buildContentDiscoveryFlow
+  // builds both in that same index order), so their progress and status
+  // combine into one row per target instead of kindProgress's single
+  // aggregate, which any one feroxbuster node (total always initially
+  // unbounded due to recursion) used to force permanently indeterminate.
+  const contentDiscoveryTargets = (): TargetProgress[] => {
+    const rows: TargetProgress[] = []
+    for (const run of runsOfKind('content-discovery')) {
+      const targets = run.targets ?? []
+      const runStatus = statusOf(run)
+      for (let i = 0; i < targets.length; i++) {
+        const ffufKey = `${run.runId}:ffuf-${i}`
+        const feroxKey = `${run.runId}:feroxbuster-${i}`
+        const ffufStatus = nodeStatusFallback(ffufKey, runStatus)
+        const feroxStatus = nodeStatusFallback(feroxKey, runStatus)
+        const ffufP = runProgress[ffufKey]
+        const feroxP = runProgress[feroxKey]
+
+        let status: TargetProgress['status'] = 'pending'
+        if (ffufStatus === 'failed' || feroxStatus === 'failed') status = 'failed'
+        else if (ffufStatus === 'running' || feroxStatus === 'running') status = 'running'
+        else if (ffufStatus === 'succeeded' && feroxStatus === 'succeeded') status = 'succeeded'
+        else if (ffufStatus === 'cancelled' || feroxStatus === 'cancelled') status = 'cancelled'
+        else if (ffufStatus === 'queued' || feroxStatus === 'queued') status = 'queued'
+
+        const done = (ffufP?.done ?? 0) + (feroxP?.done ?? 0)
+        // Sum only the totals that are actually known -- treating an
+        // unknown one (0) as a real value would silently shrink the
+        // combined total instead of marking it indeterminate.
+        const knownTotals = [ffufP, feroxP].filter((p): p is { done: number; total: number } => !!p && p.total > 0)
+        const total = knownTotals.reduce((sum, p) => sum + p.total, 0)
+
+        const starts = [nodeStartedAtRef.current[ffufKey], nodeStartedAtRef.current[feroxKey]].filter((t): t is number => t !== undefined)
+        const startedAt = starts.length > 0 ? Math.min(...starts) : null
+        const etaSeconds = estimateEtaSeconds(done, total, startedAt)
+
+        rows.push({ key: `${run.runId}:${i}`, target: targets[i], status, done, total, etaSeconds })
+      }
+    }
+    return rows
+  }
+
   const restartScan = async () => {
     setRestartingScan(true)
     setRestartError('')
@@ -230,12 +325,18 @@ export function ScanView({ scanId, onOpenGraph }: { scanId: string; onOpenGraph:
   }
 
   const apexChecks: CheckKind[] = ['dns', 'tls', 'http', 'whois']
+  // dnsdumpster only gets a card once it's actually run -- unlike the four
+  // above, it's entirely optional (skipped whenever no API key is
+  // configured, see Settings), so showing it unconditionally would leave a
+  // permanently "Queued…" card for every scan that never has one.
+  if (checks[keyFor(scan.domain, 'dnsdumpster')]) apexChecks.push('dnsdumpster')
   const subdomainsCheck = checks[keyFor(scan.domain, 'subdomains')]
   const passiveSubdomains = (subdomainsCheck?.data?.subdomains as string[] | undefined) ?? []
   const subdomainRows = buildSubdomainRows(scan.domain, passiveSubdomains, checks, findingsOfKind('subdomain-bruteforce'))
   const vhostFindings = findingsOfKind('vhost-bruteforce')
   const contentFindings = findingsOfKind('content-discovery')
   const portFindings = findingsOfKind('port-scan')
+  const serviceFindings = findingsOfKind('service-profile')
   const vulnFindings = findingsOfKind('vuln-scan')
   const apexDNSDone = checks[keyFor(scan.domain, 'dns')]?.status === 'done'
   const hasVHostRun = runsOfKind('vhost-bruteforce').length > 0
@@ -264,6 +365,7 @@ export function ScanView({ scanId, onOpenGraph }: { scanId: string; onOpenGraph:
     .sort((a, b) => b.pages - a.pages || a.hostname.localeCompare(b.hostname))
 
   const hasPortScanRun = runsOfKind('port-scan').length > 0
+  const hasServiceProfileRun = runsOfKind('service-profile').length > 0
   const hasVulnScanRun = runsOfKind('vuln-scan').length > 0
 
   const counts: Record<Tab, number | null> = {
@@ -272,6 +374,7 @@ export function ScanView({ scanId, onOpenGraph }: { scanId: string; onOpenGraph:
     vhosts: vhostFindings.length,
     'content-discovery': contentFindings.length,
     ports: portFindings.length,
+    services: serviceFindings.length,
     vulnerabilities: vulnFindings.length,
   }
   const dots: Record<Tab, string> = {
@@ -280,6 +383,7 @@ export function ScanView({ scanId, onOpenGraph }: { scanId: string; onOpenGraph:
     vhosts: hasVHostRun ? STATUS_META[kindStatus('vhost-bruteforce')].dot : STATUS_DOT.pending,
     'content-discovery': STATUS_META[kindStatus('content-discovery')].dot,
     ports: hasPortScanRun ? STATUS_META[kindStatus('port-scan')].dot : STATUS_DOT.pending,
+    services: hasServiceProfileRun ? STATUS_META[kindStatus('service-profile')].dot : STATUS_DOT.pending,
     vulnerabilities: hasVulnScanRun ? STATUS_META[kindStatus('vuln-scan')].dot : STATUS_DOT.pending,
   }
 
@@ -291,7 +395,14 @@ export function ScanView({ scanId, onOpenGraph }: { scanId: string; onOpenGraph:
     const c = checks[keyFor(scan.domain, k)]
     return !c || c.status === 'running'
   })
-  const scannerKinds: ScanKind[] = ['content-discovery', 'subdomain-bruteforce', 'vhost-bruteforce', 'port-scan', 'vuln-scan']
+  const scannerKinds: ScanKind[] = [
+    'content-discovery',
+    'subdomain-bruteforce',
+    'vhost-bruteforce',
+    'port-scan',
+    'service-profile',
+    'vuln-scan',
+  ]
   const scanRunning = reconRunning || scannerKinds.some((k) => kindStatus(k) === 'running')
 
   return (
@@ -503,9 +614,15 @@ export function ScanView({ scanId, onOpenGraph }: { scanId: string; onOpenGraph:
           </div>
 
           <div className={`flex h-full flex-col ${tab === 'content-discovery' ? '' : 'hidden'}`}>
-            <ScannerToolbar scanId={scanId} kind="content-discovery" label="Restart (apex)" progress={kindProgress('content-discovery')} />
+            {/* No aggregate progress bar here -- kindProgress collapses every
+                target into one bar and one feroxbuster node's unbounded
+                total (see contentDiscoveryTargets above it) is enough to
+                make the whole thing indeterminate. The per-target panel
+                below replaces it. */}
+            <ScannerToolbar scanId={scanId} kind="content-discovery" label="Restart (apex)" progress={null} />
+            <TargetProgressPanel targets={contentDiscoveryTargets()} />
             <div className="flex-1 overflow-hidden">
-              <ResultsTable findings={contentFindings} scanId={scanId} />
+              <ResultsTable findings={contentFindings} scanId={scanId} facetPlacement="right" />
             </div>
           </div>
 
@@ -521,6 +638,26 @@ export function ScanView({ scanId, onOpenGraph }: { scanId: string; onOpenGraph:
                 </div>
                 <div className="flex-1 overflow-hidden">
                   <PortsTable findings={portFindings} />
+                </div>
+              </>
+            )}
+          </div>
+
+          <div className={`flex h-full flex-col ${tab === 'services' ? '' : 'hidden'}`}>
+            {!hasServiceProfileRun && (
+              <p className="px-3 py-6 text-center text-xs text-neutral-600">
+                Runs automatically once the port scan finds open ports — see the Ports tab.
+              </p>
+            )}
+            {hasServiceProfileRun && (
+              <>
+                <div className="flex items-center gap-3 border-b border-neutral-800 px-3 py-2">
+                  {kindProgress('service-profile') && (
+                    <ProgressBar done={kindProgress('service-profile')!.done} total={kindProgress('service-profile')!.total} />
+                  )}
+                </div>
+                <div className="flex-1 overflow-hidden">
+                  <PortsTable findings={serviceFindings} showVersion />
                 </div>
               </>
             )}
@@ -655,6 +792,18 @@ function CheckSummary({ kind, data }: { kind: CheckKind; data: Record<string, un
         <div className="space-y-0.5 text-xs text-neutral-300">
           <p className="truncate">{(data.registrar as string) || 'unknown registrar'}</p>
           <p className="text-neutral-500">{(data.expiresAt as string)?.slice(0, 10) || ''}</p>
+        </div>
+      )
+    }
+    case 'dnsdumpster': {
+      const subdomains = (data.subdomains as string[]) ?? []
+      const ns = (data.ns as unknown[]) ?? []
+      return (
+        <div className="space-y-0.5 text-xs text-neutral-300">
+          <p>{(data.totalARecords as number) ?? 0} A records</p>
+          <p className="text-neutral-500">
+            {subdomains.length} hostname{subdomains.length === 1 ? '' : 's'} · {ns.length} nameserver{ns.length === 1 ? '' : 's'}
+          </p>
         </div>
       )
     }

@@ -64,7 +64,18 @@ function rowKey(f: Finding): string {
   return `${f.sourceNodeId}:${f.id}`
 }
 
-export function ResultsTable({ findings, scanId }: { findings: Finding[]; scanId?: string }) {
+export function ResultsTable({
+  findings,
+  scanId,
+  facetPlacement = 'top',
+}: {
+  findings: Finding[]
+  scanId?: string
+  // 'right' puts the FacetFilterBar in a sidebar next to the table instead
+  // of a row above it -- used by the Content Discovery tab, which also
+  // wants room above the table for its per-target progress panel.
+  facetPlacement?: 'top' | 'right'
+}) {
   // The Preview column only makes sense while the screenshot preview
   // feature is enabled -- otherwise every thumbnail would just be a
   // permanent placeholder for images the backend never captures.
@@ -98,9 +109,18 @@ export function ResultsTable({ findings, scanId }: { findings: Finding[]; scanId
     }
   }
 
-  return (
-    <div className="flex h-full flex-col">
-      <FacetFilterBar items={findings} dimensions={FINDING_DIMENSIONS} onChange={setFaceted} restrictStatusByDefault />
+  const facetBar = (
+    <FacetFilterBar
+      items={findings}
+      dimensions={FINDING_DIMENSIONS}
+      onChange={setFaceted}
+      restrictStatusByDefault
+      orientation={facetPlacement === 'right' ? 'column' : 'row'}
+    />
+  )
+
+  const body = (
+    <>
       <div className="flex items-center gap-2 border-b border-neutral-800 px-3 py-2">
         <input
           className="w-64 rounded border border-neutral-700 bg-neutral-800 px-2 py-1 text-sm text-neutral-100 outline-none focus:border-sky-500"
@@ -194,6 +214,22 @@ export function ResultsTable({ findings, scanId }: { findings: Finding[]; scanId
           </tbody>
         </table>
       </div>
+    </>
+  )
+
+  if (facetPlacement === 'right') {
+    return (
+      <div className="flex h-full overflow-hidden">
+        <div className="flex min-w-0 flex-1 flex-col overflow-hidden">{body}</div>
+        <div className="w-72 shrink-0 overflow-y-auto border-l border-neutral-800">{facetBar}</div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex h-full flex-col">
+      {facetBar}
+      {body}
     </div>
   )
 }

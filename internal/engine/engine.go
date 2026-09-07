@@ -107,20 +107,29 @@ func (e *Engine) Execute(ctx context.Context, flow Flow, runID string, onResult 
 			defer wg.Done()
 			defer close(produced[n.ID])
 
-			onStatus(n.ID, StatusRunning, "")
 			emit := func(f model.Finding) { onResult(n.ID, f) }
 			progress := func(done, total int) { onProgress(n.ID, done, total) }
-			err := e.runNode(ctx, n, runID, incoming[n.ID], edgeCh, produced[n.ID], emit, progress)
+			nodeStatus := func(status NodeStatus, message string) { onStatus(n.ID, status, message) }
+			// A source node (ffuf/feroxbuster/nmap/nuclei) may sit behind
+			// maxConcurrentSourceNodes for a while -- report it as queued,
+			// not running, until runNode actually acquires a slot and
+			// starts the subprocess. Everything else has no such gate.
+			if n.Kind.IsSource() {
+				nodeStatus(StatusQueued, "")
+			} else {
+				nodeStatus(StatusRunning, "")
+			}
+			err := e.runNode(ctx, n, runID, incoming[n.ID], edgeCh, produced[n.ID], emit, progress, nodeStatus)
 			if err != nil && ctx.Err() != nil {
-				onStatus(n.ID, StatusCancelled, "")
+				nodeStatus(StatusCancelled, "")
 				return
 			}
 			if err != nil {
-				onStatus(n.ID, StatusFailed, err.Error())
+				nodeStatus(StatusFailed, err.Error())
 				errCh <- fmt.Errorf("node %s (%s): %w", n.ID, n.Kind, err)
 				return
 			}
-			onStatus(n.ID, StatusSucceeded, "")
+			nodeStatus(StatusSucceeded, "")
 		}()
 	}
 
@@ -140,7 +149,7 @@ func (e *Engine) Execute(ctx context.Context, flow Flow, runID string, onResult 
 	return firstErr
 }
 
-func (e *Engine) runNode(ctx context.Context, n Node, runID string, in []Edge, edgeCh map[string]chan model.Finding, out chan<- model.Finding, emit func(model.Finding), progress func(done, total int)) error {
+func (e *Engine) runNode(ctx context.Context, n Node, runID string, in []Edge, edgeCh map[string]chan model.Finding, out chan<- model.Finding, emit func(model.Finding), progress func(done, total int), onStatus func(NodeStatus, string)) error {
 	inputs := make([]<-chan model.Finding, len(in))
 	for i, ed := range in {
 		inputs[i] = edgeCh[ed.ID]
@@ -160,6 +169,11 @@ func (e *Engine) runNode(ctx context.Context, n Node, runID string, in []Edge, e
 			return ctx.Err()
 		}
 		defer func() { <-e.sourceSem }()
+		// Only now has a slot actually been claimed and the subprocess is
+		// about to start -- flip from queued to running here rather than
+		// before this select, so the UI can distinguish "waiting for a
+		// free slot" from "actively scanning."
+		onStatus(StatusRunning, "")
 		return adapter.Run(ctx, n.Config, adapters.RunMeta{RunID: runID, NodeID: n.ID}, func(f model.Finding) {
 			_ = sendAndEmit(ctx, out, f, emit)
 		}, adapters.Progress(progress))

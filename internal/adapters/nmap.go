@@ -21,15 +21,24 @@ func init() {
 // scanning has no natural fit in model.Finding (which is HTTP-response
 // shaped), so an open port is emitted as a Finding whose URL is a
 // "<proto>://<host>:<port>/" pseudo-URL, ContentType carries the detected
-// service name, and Tags carries [state, proto] -- enough for the frontend's
+// service name, Tags carries [state, proto], and -- only when ServiceDetect
+// found something -- Headers carries "version". Enough for the frontend's
 // dedicated ports table to render without needing a second result type
 // threaded through the whole engine/store/hub pipeline.
 type NmapConfig struct {
-	Target    string   `json:"target"`                   // host or IP to scan
-	Ports     string   `json:"ports,omitempty"`          // nmap -p value; empty means nmap's default (top 1000)
-	FastScan  bool     `json:"fastScan,omitempty"`       // nmap -F: scan fewer ports, faster
-	Timeout   int      `json:"timeoutSeconds,omitempty"` // per-host timeout, seconds (nmap --host-timeout)
-	ExtraArgs []string `json:"extraArgs,omitempty"`
+	Target   string `json:"target"`             // host or IP to scan
+	Ports    string `json:"ports,omitempty"`    // nmap -p value; empty means nmap's default (top 1000)
+	FastScan bool   `json:"fastScan,omitempty"` // nmap -F: scan fewer ports, faster
+	// ServiceDetect enables nmap -sV (service/version detection): probing
+	// each open port to identify the actual product and version behind it,
+	// not just the port-number-based guess a plain scan reports. It's much
+	// slower per port, which is why it's opt-in and (see
+	// buildServiceProfileFlow in api/handlers_scan.go) only ever pointed at
+	// ports a prior plain scan already found open, instead of being the
+	// default for every port scan.
+	ServiceDetect bool     `json:"serviceDetect,omitempty"`
+	Timeout       int      `json:"timeoutSeconds,omitempty"` // per-host timeout, seconds (nmap --host-timeout)
+	ExtraArgs     []string `json:"extraArgs,omitempty"`
 }
 
 type NmapAdapter struct{}
@@ -53,6 +62,9 @@ func (a *NmapAdapter) Run(ctx context.Context, config json.RawMessage, meta RunM
 	args := []string{"-Pn", "--open", "-oG", "-"}
 	if cfg.FastScan {
 		args = append(args, "-F")
+	}
+	if cfg.ServiceDetect {
+		args = append(args, "-sV")
 	}
 	if cfg.Ports != "" {
 		args = append(args, "-p", cfg.Ports)
@@ -134,8 +146,13 @@ func parseNmapGrepLine(line string) (host, ports string, ok bool) {
 
 // parseNmapPorts turns a -oG "Ports:" field's comma-separated entries into
 // one Finding per open port. Each entry's slash-separated fields are
-// port/state/protocol/owner/service/rpc/version (trailing fields may be
-// empty but are always present).
+// port/state/protocol/owner/service/rpc/version/ (that final slash is a
+// terminator, not an 8th field -- splitting always yields a trailing empty
+// string). version is only ever populated when the run used -sV (see
+// NmapConfig.ServiceDetect) -- a plain scan leaves it blank, so the Finding
+// below gets a nil Headers map rather than one holding an empty string; when
+// it is populated, nmap has already folded any extra info (OS, build,
+// hostname, ...) into it, e.g. "Apache httpd 2.4.41 ((Ubuntu))".
 func parseNmapPorts(host, ports string, meta RunMeta) []model.Finding {
 	var out []model.Finding
 	for _, entry := range strings.Split(ports, ", ") {
@@ -151,11 +168,16 @@ func parseNmapPorts(host, ports string, meta RunMeta) []model.Finding {
 		if service == "" {
 			service = "unknown"
 		}
+		var headers map[string]string
+		if len(f) > 6 && f[6] != "" {
+			headers = map[string]string{"version": f[6]}
+		}
 		out = append(out, model.Finding{
 			ID:           newFindingID(),
 			URL:          fmt.Sprintf("%s://%s:%s/", protocol, host, port),
 			ContentType:  service,
 			Method:       "PORT",
+			Headers:      headers,
 			Tags:         []string{"open", protocol},
 			SourceTool:   "nmap",
 			SourceNodeID: meta.NodeID,

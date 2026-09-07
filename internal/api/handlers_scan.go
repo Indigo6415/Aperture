@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -23,6 +24,13 @@ import (
 // nuclei template against all of them would take far longer than the scan
 // itself; capping keeps the follow-up scan proportionate.
 const nucleiMaxTargets = 300
+
+// servicesProfileMaxPorts caps how many of a port-scan run's open ports get
+// handed to the auto-kicked service-profile (nmap -sV) run -- version
+// probing is much slower per port than a plain scan, so an unbounded list
+// (e.g. a host with hundreds of open ports) would make that follow-up scan
+// take far longer than the port scan itself.
+const servicesProfileMaxPorts = 100
 
 type startScanRequest struct {
 	Domain  string             `json:"domain"`
@@ -154,7 +162,22 @@ func (s *Server) runScan(scanID, domain string) {
 		s.hub.publish(scanID, RunEvent{Type: "check", Check: &c})
 	}
 
+	// DNSDumpster needs a per-installation API key recon.Scan itself has no
+	// access to (it comes from a store-backed setting, not anything the
+	// recon package knows about) -- run it alongside Scan's own five checks
+	// instead of as one of them, skipping it entirely if no key is
+	// configured rather than emitting a check that can only ever fail.
+	var ddWG sync.WaitGroup
+	if apiKey, ok, err := s.store.GetSetting(settingDNSDumpsterKey); err == nil && ok && apiKey != "" {
+		ddWG.Add(1)
+		go func() {
+			defer ddWG.Done()
+			onCheck(recon.CheckDNSDumpster(ctx, domain, apiKey))
+		}()
+	}
+
 	scheme, _ := recon.Scan(ctx, domain, onCheck)
+	ddWG.Wait()
 	if err := s.store.SetScanScheme(scanID, scheme); err != nil {
 		s.hub.publish(scanID, RunEvent{Type: "done", Message: "warning: failed to persist scheme: " + err.Error()})
 	}
@@ -235,7 +258,7 @@ func (s *Server) startScanRun(scanID string, kind store.ScanKind, flow engine.Fl
 	if err := s.store.CreateScanRun(scanID, kind, flow.ID, runID, targets); err != nil {
 		s.hub.publish(scanID, RunEvent{Type: "done", Message: "warning: failed to link scan run: " + err.Error()})
 	}
-	s.hub.publish(scanID, RunEvent{Type: "scanRun", Kind: string(kind), FlowID: flow.ID, RunID: runID})
+	s.hub.publish(scanID, RunEvent{Type: "scanRun", Kind: string(kind), FlowID: flow.ID, RunID: runID, Targets: targets})
 	// Each scanner runs independently and concurrently; the caller's own
 	// event stream doesn't wait on it.
 	go s.executeRun(flow, runID)
@@ -361,6 +384,25 @@ func (s *Server) buildPortScanFlow(domain, ip string) engine.Flow {
 	}
 }
 
+// buildServiceProfileFlow runs nmap -sV against just the ports a prior port
+// scan already found open, to identify the actual product/version behind
+// each one instead of just the port-number-based service guess. Kept
+// separate from buildPortScanFlow (rather than always passing -sV) since
+// version probing is much slower per port -- see maybeChainServiceProfile
+// in handlers.go, which builds this once a port-scan run's open ports are
+// known instead of guessing a port list upfront.
+func (s *Server) buildServiceProfileFlow(domain, ip string, ports []string) engine.Flow {
+	cfg, _ := json.Marshal(adapters.NmapConfig{Target: ip, Ports: strings.Join(ports, ","), ServiceDetect: true})
+	return engine.Flow{
+		Name: "Service profile: " + domain,
+		Nodes: []engine.Node{
+			{ID: "nmap", Kind: engine.KindNmap, Label: "nmap -sV", Config: cfg, Position: &engine.Position{X: 40, Y: 40}},
+			{ID: "table", Kind: engine.KindTable, Label: "results", Position: &engine.Position{X: 340, Y: 40}},
+		},
+		Edges: []engine.Edge{{ID: "e-nmap-table", From: "nmap", To: "table"}},
+	}
+}
+
 // buildVulnScanFlow runs nuclei against a set of already-discovered URLs
 // (see maybeChainVulnScan) to flag known CVEs/misconfigurations on top of
 // the raw status/size data those URLs were found with.
@@ -419,6 +461,62 @@ func (s *Server) maybeChainVulnScan(runID string) {
 	flow := s.buildVulnScanFlow(sc.Domain, newURLs)
 	if _, err := s.startScanRun(ref.ScanID, store.ScanKindVulnScan, flow, newURLs); err != nil {
 		s.hub.publish(ref.ScanID, RunEvent{Type: "done", Message: "failed to start vuln-scan run: " + err.Error()})
+	}
+}
+
+// maybeChainServiceProfile is called (from executeRun in handlers.go) every
+// time a run finishes successfully, mirroring maybeChainVulnScan below it.
+// If it was a port-scan run, the ports it found open become the -p list for
+// an auto-kicked service-profile (nmap -sV) run against the same host --
+// capped at nucleiMaxTargets' companion here (servicesProfileMaxPorts)
+// since a scan of the full 1000-port default range would otherwise probe
+// every one of them for version info, which is what -sV is precisely too
+// slow to do broadly. Any other run kind, or a port scan with nothing
+// open, is a no-op.
+func (s *Server) maybeChainServiceProfile(runID string) {
+	ref, err := s.store.GetScanRunByRunID(runID)
+	if err != nil || ref.Kind != store.ScanKindPortScan {
+		return
+	}
+	findings, err := s.store.ListFindings(runID, "table")
+	if err != nil || len(findings) == 0 {
+		return
+	}
+
+	var host string
+	seen := map[string]bool{}
+	var ports []string
+	for _, f := range findings {
+		u, err := url.Parse(f.URL)
+		if err != nil || u.Port() == "" {
+			continue
+		}
+		host = u.Hostname()
+		if seen[u.Port()] {
+			continue
+		}
+		seen[u.Port()] = true
+		ports = append(ports, u.Port())
+		if len(ports) >= servicesProfileMaxPorts {
+			break
+		}
+	}
+	if host == "" || len(ports) == 0 {
+		return
+	}
+
+	newPortTargets, err := s.newTargets(ref.ScanID, store.ScanKindServiceProfile, []string{host})
+	if err != nil || len(newPortTargets) == 0 {
+		return
+	}
+
+	sc, err := s.store.GetScan(ref.ScanID)
+	if err != nil {
+		return
+	}
+	flow := s.buildServiceProfileFlow(sc.Domain, host, ports)
+	if _, err := s.startScanRun(ref.ScanID, store.ScanKindServiceProfile, flow, []string{host}); err != nil {
+		s.hub.publish(ref.ScanID, RunEvent{Type: "done", Message: "failed to start service-profile run: " + err.Error()})
 	}
 }
 

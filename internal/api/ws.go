@@ -6,9 +6,11 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// upgrader allows any origin: Aperture is a single-operator local tool
-// with no auth, and the frontend dev server runs on a different port than
-// the backend, so a same-origin check would break local development.
+// upgrader allows any origin: the frontend dev server runs on a different
+// port than the backend, so a same-origin check would break local
+// development. Access itself is still gated -- both handlers below sit
+// behind requireAuth in server.go, same as every other /api and /ws route,
+// so an upgrade request without a valid session cookie never reaches here.
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
