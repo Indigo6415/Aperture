@@ -1,12 +1,14 @@
 # Aperture
 
 A recon/enumeration suite with a web UI: enter a domain and it runs DNS/TLS/
-HTTP/WHOIS recon, subdomain discovery (passive crt.sh + active
-[ffuf](https://github.com/ffuf/ffuf) bruteforce), virtual-host bruteforce, and
-content discovery ([ffuf](https://github.com/ffuf/ffuf) +
-[feroxbuster](https://github.com/epi052/feroxbuster)) as independent scanners
-you can filter and drill into — shipped as a single static Go binary with the
-frontend embedded.
+HTTP/WHOIS recon, subdomain discovery (passive crt.sh + DNSDumpster, each
+candidate verified live via two independent DNS resolution paths, plus
+active [ffuf](https://github.com/ffuf/ffuf) bruteforce), virtual-host
+bruteforce, content discovery ([ffuf](https://github.com/ffuf/ffuf) +
+[feroxbuster](https://github.com/epi052/feroxbuster)), and web
+technology/CVE fingerprinting as independent scanners you can filter and
+drill into — shipped as a single static Go binary with the frontend
+embedded.
 
 ## Install
 
@@ -60,9 +62,11 @@ cd web && npm run dev                        # terminal 2, http://localhost:5173
 
 - `cmd/aperture` — CLI entrypoint
 - `internal/model` — the common `Finding` data model every adapter normalizes into
-- `internal/adapters` — subprocess wrappers around ffuf/feroxbuster
+- `internal/adapters` — subprocess wrappers around ffuf/feroxbuster/nuclei (a native `webfuzz` fuzzer/bruteforcer also lives here, kept registered but unused by any auto-generated flow)
 - `internal/engine` — DAG flow executor (filter/merge/table/export nodes + adapters), driving the auto-generated per-scanner flows
-- `internal/recon` — fast stdlib-only DNS/TLS/HTTP/WHOIS + passive (crt.sh) subdomain checks
+- `internal/recon` — fast stdlib-only DNS/TLS/HTTP/WHOIS checks, passive (crt.sh + DNSDumpster) subdomain discovery with two-path liveness verification, and web technology fingerprinting
+- `internal/cve` — live NVD CVE lookups for fingerprinted technology versions
+- `internal/techfp` — the curated web technology fingerprint signature set
 - `internal/store` — SQLite persistence (scans, scanner runs, findings)
 - `internal/api` — REST + WebSocket server
 - `internal/webui` — embeds the built frontend (`internal/webui/dist`) into the binary

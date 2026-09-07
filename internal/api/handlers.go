@@ -68,11 +68,6 @@ func (s *Server) executeRun(flow engine.Flow, runID string) {
 		// an auto-kicked vuln-scan against its hits -- see maybeChainVulnScan
 		// (handlers_scan.go), which no-ops for every other scanner kind.
 		s.maybeChainVulnScan(runID)
-		// Likewise, a port-scan run finishing is the trigger for an
-		// auto-kicked service-profile (nmap -sV) run against the ports it
-		// found open -- see maybeChainServiceProfile, which no-ops for
-		// every other scanner kind.
-		s.maybeChainServiceProfile(runID)
 	}
 }
 

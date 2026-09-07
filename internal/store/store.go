@@ -149,6 +149,21 @@ CREATE TABLE IF NOT EXISTS settings (
 	value TEXT NOT NULL
 );
 
+-- Caches NVD lookups (see internal/cve) keyed by the fingerprinted
+-- product+version, so repeat scans against common software (nginx,
+-- WordPress, jQuery, ...) don't re-hit NVD's rate-limited API every time,
+-- and old lookups still work offline. fetched_at backs the caller's own TTL
+-- check (see cveCacheTTL in api/handlers_scan.go) -- CVEs for a given
+-- product/version can still gain new entries over time, so this isn't
+-- cached forever.
+CREATE TABLE IF NOT EXISTS cve_cache (
+	product TEXT NOT NULL,
+	version TEXT NOT NULL,
+	data TEXT NOT NULL,
+	fetched_at DATETIME NOT NULL,
+	PRIMARY KEY (product, version)
+);
+
 CREATE TABLE IF NOT EXISTS users (
 	id TEXT PRIMARY KEY,
 	email TEXT NOT NULL UNIQUE,
@@ -430,9 +445,7 @@ const (
 	ScanKindContentDiscovery    ScanKind = "content-discovery"
 	ScanKindSubdomainBruteforce ScanKind = "subdomain-bruteforce"
 	ScanKindVHostBruteforce     ScanKind = "vhost-bruteforce"
-	ScanKindPortScan            ScanKind = "port-scan"
 	ScanKindVulnScan            ScanKind = "vuln-scan"
-	ScanKindServiceProfile      ScanKind = "service-profile"
 )
 
 // ScanRun is one scanner run belonging to a scan. A scan can own several --
@@ -571,6 +584,43 @@ func (s *Store) CoveredTargets(scanID string, kind ScanKind) (map[string]bool, e
 		}
 	}
 	return covered, rows.Err()
+}
+
+// TargetRunning reports whether target is currently covered by a running
+// scan_runs row of kind for this scan -- used for a per-target restart
+// (content discovery's per-subdomain "Restart scan" action) instead of
+// KindRunning's whole-kind check, so restarting one target doesn't get
+// blocked by (or itself block) a different target's run of the same kind.
+func (s *Store) TargetRunning(scanID string, kind ScanKind, target string) (bool, error) {
+	rows, err := s.db.Query(`
+		SELECT sr.targets FROM scan_runs sr JOIN runs r ON r.id = sr.run_id
+		WHERE sr.scan_id = ? AND sr.kind = ? AND r.status = 'running'
+	`, scanID, kind)
+	if err != nil {
+		return false, fmt.Errorf("store: target running: %w", err)
+	}
+	defer rows.Close()
+
+	needle := strings.ToLower(target)
+	for rows.Next() {
+		var targets sql.NullString
+		if err := rows.Scan(&targets); err != nil {
+			return false, fmt.Errorf("store: target running row: %w", err)
+		}
+		if !targets.Valid || targets.String == "" || targets.String == "null" {
+			continue
+		}
+		var list []string
+		if err := json.Unmarshal([]byte(targets.String), &list); err != nil {
+			continue
+		}
+		for _, t := range list {
+			if strings.ToLower(t) == needle {
+				return true, rows.Err()
+			}
+		}
+	}
+	return false, rows.Err()
 }
 
 // --- Scan aggregates (for the dashboard) ---
@@ -833,6 +883,35 @@ func (s *Store) GetSetting(key string) (value string, ok bool, err error) {
 		return "", false, fmt.Errorf("store: get setting: %w", err)
 	}
 	return value, true, nil
+}
+
+// --- CVE cache ---
+
+// GetCVECache returns a cached NVD lookup's raw JSON and when it was
+// fetched, and whether one exists at all. Callers decide whether fetchedAt
+// is still fresh enough to use (see cveCacheTTL in api/handlers_scan.go)
+// rather than this layer enforcing any particular TTL.
+func (s *Store) GetCVECache(product, version string) (data string, fetchedAt time.Time, ok bool, err error) {
+	err = s.db.QueryRow(`SELECT data, fetched_at FROM cve_cache WHERE product = ? AND version = ?`, product, version).Scan(&data, &fetchedAt)
+	if err == sql.ErrNoRows {
+		return "", time.Time{}, false, nil
+	}
+	if err != nil {
+		return "", time.Time{}, false, fmt.Errorf("store: get cve cache: %w", err)
+	}
+	return data, fetchedAt, true, nil
+}
+
+// SetCVECache upserts one product+version's raw NVD lookup result.
+func (s *Store) SetCVECache(product, version, data string) error {
+	_, err := s.db.Exec(`
+		INSERT INTO cve_cache (product, version, data, fetched_at) VALUES (?, ?, ?, ?)
+		ON CONFLICT(product, version) DO UPDATE SET data=excluded.data, fetched_at=excluded.fetched_at
+	`, product, version, data, time.Now())
+	if err != nil {
+		return fmt.Errorf("store: set cve cache: %w", err)
+	}
+	return nil
 }
 
 // --- Users & sessions ---

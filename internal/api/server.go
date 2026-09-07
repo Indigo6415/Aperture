@@ -38,10 +38,20 @@ type Server struct {
 	// per discovered subdomain unbounded would be its own resource-exhaustion
 	// bug.
 	screenshotSem chan struct{}
+
+	// techSem bounds how many technology-fingerprint -> CVE lookups
+	// (lookupTechCVEs in handlers_scan.go) run concurrently across the whole
+	// server -- each one may call out to the rate-limited NVD API, so
+	// fanning one out per discovered host unbounded would just make every
+	// one of them queue behind NVD's own rate limit anyway.
+	techSem chan struct{}
 }
 
 // maxConcurrentScreenshots is screenshotSem's capacity.
 const maxConcurrentScreenshots = 4
+
+// maxConcurrentTechLookups is techSem's capacity.
+const maxConcurrentTechLookups = 4
 
 // NewServer wires up all routes. uiFS is the embedded, built frontend; pass
 // nil when running against a separate frontend dev server. wordlistsDir is
@@ -58,6 +68,7 @@ func NewServer(st *store.Store, eng *engine.Engine, uiFS fs.FS, wordlistsDir str
 		scanCancels:   map[string]context.CancelFunc{},
 		runCancels:    map[string]context.CancelFunc{},
 		screenshotSem: make(chan struct{}, maxConcurrentScreenshots),
+		techSem:       make(chan struct{}, maxConcurrentTechLookups),
 	}
 
 	// Login (and its own probe, handleMe, and logout) are the only
@@ -74,6 +85,7 @@ func NewServer(st *store.Store, eng *engine.Engine, uiFS fs.FS, wordlistsDir str
 
 	s.mux.HandleFunc("GET /api/settings", s.requireAuth(s.handleGetSettings))
 	s.mux.HandleFunc("PUT /api/settings/dnsdumpster-key", s.requireAuth(s.handleSetDNSDumpsterKey))
+	s.mux.HandleFunc("PUT /api/settings/nvd-key", s.requireAuth(s.handleSetNVDKey))
 
 	s.mux.HandleFunc("POST /api/scan", s.requireAuth(s.handleStartScan))
 	s.mux.HandleFunc("GET /api/scans", s.requireAuth(s.handleListScans))

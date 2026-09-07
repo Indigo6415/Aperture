@@ -6,12 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Indigo6415/Aperture/internal/adapters"
+	"github.com/Indigo6415/Aperture/internal/cve"
 	"github.com/Indigo6415/Aperture/internal/engine"
 	"github.com/Indigo6415/Aperture/internal/recon"
 	"github.com/Indigo6415/Aperture/internal/store"
@@ -25,12 +26,12 @@ import (
 // itself; capping keeps the follow-up scan proportionate.
 const nucleiMaxTargets = 300
 
-// servicesProfileMaxPorts caps how many of a port-scan run's open ports get
-// handed to the auto-kicked service-profile (nmap -sV) run -- version
-// probing is much slower per port than a plain scan, so an unbounded list
-// (e.g. a host with hundreds of open ports) would make that follow-up scan
-// take far longer than the port scan itself.
-const servicesProfileMaxPorts = 100
+// cveCacheTTL is how long a cached NVD lookup (see store.GetCVECache) is
+// trusted before lookupTechCVEs re-fetches it -- long enough that a scan
+// re-run minutes/hours later against the same stack doesn't re-hit NVD at
+// all, short enough that a product/version doesn't go too long without
+// picking up newly-published CVEs.
+const cveCacheTTL = 7 * 24 * time.Hour
 
 type startScanRequest struct {
 	Domain  string             `json:"domain"`
@@ -40,8 +41,8 @@ type startScanRequest struct {
 // handleStartScan is the entry point for the dashboard's single domain
 // input: it creates a scan record and immediately returns, then runs the
 // recon checks and every auto-generated scanner (content discovery,
-// subdomain bruteforce, vhost bruteforce, port scan) in the background,
-// streamed to the client over GET /ws/scans/{id}.
+// subdomain bruteforce, vhost bruteforce) in the background, streamed to
+// the client over GET /ws/scans/{id}.
 func (s *Server) handleStartScan(w http.ResponseWriter, r *http.Request) {
 	var req startScanRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -108,19 +109,21 @@ func (s *Server) newTargets(scanID string, kind store.ScanKind, requested []stri
 }
 
 // runScan drives one domain scan end to end: it streams each recon.Check as
-// it completes, then -- once the apex HTTP check has revealed which scheme
-// the domain responds on -- kicks off every auto-generated scanner, each its
-// own flow+run so the frontend can watch/display them as independent
-// scanner tabs: content discovery (ffuf+feroxbuster against the apex
-// domain), subdomain bruteforce (ffuf against FUZZ.<domain>, complementing
-// recon.Scan's passive crt.sh discovery), virtual-host bruteforce (ffuf
+// it completes (including, per completed HTTP check, a best-effort
+// technology-fingerprint -> CVE lookup, see lookupTechCVEs), then -- once
+// the apex HTTP check has revealed which scheme the domain responds on --
+// kicks off every auto-generated scanner, each its own flow+run so the
+// frontend can watch/display them as independent scanner tabs: content
+// discovery (ffuf+feroxbuster against the apex domain), subdomain
+// bruteforce (ffuf against FUZZ.<domain>, complementing recon.Scan's
+// passive crt.sh/DNSDumpster discovery), and virtual-host bruteforce (ffuf
 // against the apex IP with a fuzzed Host header, skipped if the apex has no
-// A record), and port scan (nmap against the apex IP). Every scanner is
-// skipped if it's already running or has already completed against the
-// same target (see newTargets/store.KindRunning) -- this function backs
-// both a brand new scan and "Restart scan", and a restart shouldn't spawn a
-// redundant second copy of work already done or in flight. All of them
-// reuse the existing engine/adapters/store/hub machinery unchanged.
+// A record). Every scanner is skipped if it's already running or has
+// already completed against the same target (see
+// newTargets/store.KindRunning) -- this function backs both a brand new
+// scan and "Restart scan", and a restart shouldn't spawn a redundant second
+// copy of work already done or in flight. All of them reuse the existing
+// engine/adapters/store/hub machinery unchanged.
 func (s *Server) runScan(scanID, domain string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	s.trackScanCancel(scanID, cancel)
@@ -129,10 +132,10 @@ func (s *Server) runScan(scanID, domain string) {
 		cancel()
 	}()
 
-	// The apex A record (needed to target vhost bruteforce/port scan) is
-	// buried inside whichever Check carries the DNS data; capture it as
-	// checks stream by rather than re-resolving it separately. Guarded by mu
-	// since onCheck fires concurrently from several goroutines.
+	// The apex A record (needed to target vhost bruteforce) is buried inside
+	// whichever Check carries the DNS data; capture it as checks stream by
+	// rather than re-resolving it separately. Guarded by mu since onCheck
+	// fires concurrently from several goroutines.
 	var mu sync.Mutex
 	var apexA []string
 	onCheck := func(c recon.Check) {
@@ -152,6 +155,7 @@ func (s *Server) runScan(scanID, domain string) {
 			if finalURL, ok := c.Data["finalUrl"].(string); ok && finalURL != "" {
 				go s.captureScreenshot(scanID, c.Domain, finalURL)
 			}
+			go s.lookupTechCVEs(ctx, scanID, c.Domain, c.Data)
 		}
 		if err := s.store.SaveCheck(scanID, c); err != nil {
 			// The check is still delivered live below even if persisting it
@@ -164,20 +168,15 @@ func (s *Server) runScan(scanID, domain string) {
 
 	// DNSDumpster needs a per-installation API key recon.Scan itself has no
 	// access to (it comes from a store-backed setting, not anything the
-	// recon package knows about) -- run it alongside Scan's own five checks
-	// instead of as one of them, skipping it entirely if no key is
-	// configured rather than emitting a check that can only ever fail.
-	var ddWG sync.WaitGroup
-	if apiKey, ok, err := s.store.GetSetting(settingDNSDumpsterKey); err == nil && ok && apiKey != "" {
-		ddWG.Add(1)
-		go func() {
-			defer ddWG.Done()
-			onCheck(recon.CheckDNSDumpster(ctx, domain, apiKey))
-		}()
+	// recon package knows about) -- fetched here and passed in; an empty key
+	// makes Scan skip that check entirely rather than emit one that can only
+	// ever fail.
+	dnsdumpsterKey, _, err := s.store.GetSetting(settingDNSDumpsterKey)
+	if err != nil {
+		s.hub.publish(scanID, RunEvent{Type: "done", Message: "warning: failed to load DNSDumpster key: " + err.Error()})
 	}
 
-	scheme, _ := recon.Scan(ctx, domain, onCheck)
-	ddWG.Wait()
+	scheme, _ := recon.Scan(ctx, domain, dnsdumpsterKey, onCheck)
 	if err := s.store.SetScanScheme(scanID, scheme); err != nil {
 		s.hub.publish(scanID, RunEvent{Type: "done", Message: "warning: failed to persist scheme: " + err.Error()})
 	}
@@ -219,9 +218,6 @@ func (s *Server) runScan(scanID, domain string) {
 			if vhTargets, err := s.newTargets(scanID, store.ScanKindVHostBruteforce, []string{apexA[0]}); err == nil && len(vhTargets) > 0 {
 				scanners = append(scanners, scanner{store.ScanKindVHostBruteforce, s.buildVHostBruteforceFlow(domain, scheme, apexA[0], opts), vhTargets})
 			}
-		}
-		if psTargets, err := s.newTargets(scanID, store.ScanKindPortScan, []string{apexA[0]}); err == nil && len(psTargets) > 0 {
-			scanners = append(scanners, scanner{store.ScanKindPortScan, s.buildPortScanFlow(domain, apexA[0]), psTargets})
 		}
 	}
 
@@ -330,8 +326,9 @@ func (s *Server) buildContentDiscoveryFlow(domain, scheme string, targets []stri
 
 // buildSubdomainBruteforceFlow actively bruteforces subdomains by fuzzing
 // the hostname itself (scheme://FUZZ.domain/) with ffuf, complementing the
-// passive crt.sh discovery recon.Scan already does. Autocalibration filters
-// out a wildcard-DNS catch-all answering every hostname identically.
+// passive crt.sh/DNSDumpster discovery recon.Scan already does.
+// Autocalibration filters out a wildcard-DNS catch-all answering every
+// hostname identically.
 func (s *Server) buildSubdomainBruteforceFlow(domain, scheme string, opts engine.ScanOptions) engine.Flow {
 	wordlistPath := s.resolveWordlist(opts, wordlists.CategorySubdomains, wordlists.SubdomainsDefaultName)
 	cfg, _ := json.Marshal(adapters.FFufConfig{
@@ -366,40 +363,6 @@ func (s *Server) buildVHostBruteforceFlow(domain, scheme, ip string, opts engine
 			{ID: "table", Kind: engine.KindTable, Label: "results", Position: &engine.Position{X: 340, Y: 40}},
 		},
 		Edges: []engine.Edge{{ID: "e-ffuf-table", From: "ffuf", To: "table"}},
-	}
-}
-
-// buildPortScanFlow runs nmap against the apex domain's IP as another
-// auto-kicked scanner, extending recon beyond HTTP(S) to raw open
-// ports/services.
-func (s *Server) buildPortScanFlow(domain, ip string) engine.Flow {
-	cfg, _ := json.Marshal(adapters.NmapConfig{Target: ip})
-	return engine.Flow{
-		Name: "Port scan: " + domain,
-		Nodes: []engine.Node{
-			{ID: "nmap", Kind: engine.KindNmap, Label: "nmap", Config: cfg, Position: &engine.Position{X: 40, Y: 40}},
-			{ID: "table", Kind: engine.KindTable, Label: "results", Position: &engine.Position{X: 340, Y: 40}},
-		},
-		Edges: []engine.Edge{{ID: "e-nmap-table", From: "nmap", To: "table"}},
-	}
-}
-
-// buildServiceProfileFlow runs nmap -sV against just the ports a prior port
-// scan already found open, to identify the actual product/version behind
-// each one instead of just the port-number-based service guess. Kept
-// separate from buildPortScanFlow (rather than always passing -sV) since
-// version probing is much slower per port -- see maybeChainServiceProfile
-// in handlers.go, which builds this once a port-scan run's open ports are
-// known instead of guessing a port list upfront.
-func (s *Server) buildServiceProfileFlow(domain, ip string, ports []string) engine.Flow {
-	cfg, _ := json.Marshal(adapters.NmapConfig{Target: ip, Ports: strings.Join(ports, ","), ServiceDetect: true})
-	return engine.Flow{
-		Name: "Service profile: " + domain,
-		Nodes: []engine.Node{
-			{ID: "nmap", Kind: engine.KindNmap, Label: "nmap -sV", Config: cfg, Position: &engine.Position{X: 40, Y: 40}},
-			{ID: "table", Kind: engine.KindTable, Label: "results", Position: &engine.Position{X: 340, Y: 40}},
-		},
-		Edges: []engine.Edge{{ID: "e-nmap-table", From: "nmap", To: "table"}},
 	}
 }
 
@@ -464,60 +427,83 @@ func (s *Server) maybeChainVulnScan(runID string) {
 	}
 }
 
-// maybeChainServiceProfile is called (from executeRun in handlers.go) every
-// time a run finishes successfully, mirroring maybeChainVulnScan below it.
-// If it was a port-scan run, the ports it found open become the -p list for
-// an auto-kicked service-profile (nmap -sV) run against the same host --
-// capped at nucleiMaxTargets' companion here (servicesProfileMaxPorts)
-// since a scan of the full 1000-port default range would otherwise probe
-// every one of them for version info, which is what -sV is precisely too
-// slow to do broadly. Any other run kind, or a port scan with nothing
-// open, is a no-op.
-func (s *Server) maybeChainServiceProfile(runID string) {
-	ref, err := s.store.GetScanRunByRunID(runID)
-	if err != nil || ref.Kind != store.ScanKindPortScan {
-		return
-	}
-	findings, err := s.store.ListFindings(runID, "table")
-	if err != nil || len(findings) == 0 {
+// techCVEResult is one fingerprinted technology's version plus whatever
+// CVEs were found for it -- the shape lookupTechCVEs assembles per host and
+// publishes as a "technologies" Check (see recon.Check; this isn't a
+// recon.CheckKind constant since the recon package has no store/NVD access
+// of its own, same reasoning as CheckDNSDumpster's doc comment).
+type techCVEResult struct {
+	Name     string    `json:"name"`
+	Category string    `json:"category"`
+	Version  string    `json:"version,omitempty"`
+	CVEs     []cve.CVE `json:"cves,omitempty"`
+}
+
+// lookupTechCVEs replaces the old nmap -sV "service profile" feature: given
+// one host's completed HTTP check data (which already carries
+// techfp-detected technologies, see recon/http.go), it looks up CVEs for
+// every technology with a known version -- cached in SQLite
+// (store.GetCVECache/SetCVECache, see cveCacheTTL) so repeat scans against
+// common software don't re-hit NVD -- and publishes the aggregate as a
+// "technologies" Check, the same way recon's own checks stream to the
+// client. s.techSem bounds how many of these run at once across the whole
+// server; called in the background (best-effort) from runScan's onCheck so
+// a slow/rate-limited NVD lookup never holds up the rest of recon.
+func (s *Server) lookupTechCVEs(ctx context.Context, scanID, hostname string, httpData map[string]any) {
+	raw, ok := httpData["technologies"].([]map[string]any)
+	if !ok || len(raw) == 0 {
 		return
 	}
 
-	var host string
-	seen := map[string]bool{}
-	var ports []string
-	for _, f := range findings {
-		u, err := url.Parse(f.URL)
-		if err != nil || u.Port() == "" {
-			continue
+	s.techSem <- struct{}{}
+	defer func() { <-s.techSem }()
+
+	nvdKey, _, _ := s.store.GetSetting(settingNVDAPIKey)
+
+	results := make([]techCVEResult, 0, len(raw))
+	for _, t := range raw {
+		name, _ := t["name"].(string)
+		category, _ := t["category"].(string)
+		version, _ := t["version"].(string)
+		r := techCVEResult{Name: name, Category: category, Version: version}
+		if version != "" {
+			r.CVEs = s.cvesFor(ctx, name, version, nvdKey)
 		}
-		host = u.Hostname()
-		if seen[u.Port()] {
-			continue
-		}
-		seen[u.Port()] = true
-		ports = append(ports, u.Port())
-		if len(ports) >= servicesProfileMaxPorts {
-			break
-		}
-	}
-	if host == "" || len(ports) == 0 {
-		return
+		results = append(results, r)
 	}
 
-	newPortTargets, err := s.newTargets(ref.ScanID, store.ScanKindServiceProfile, []string{host})
-	if err != nil || len(newPortTargets) == 0 {
+	c := recon.Check{
+		Domain: hostname, Kind: "technologies", Status: recon.StatusDone,
+		StartedAt: time.Now(), FinishedAt: time.Now(),
+		Data: map[string]any{"technologies": results},
+	}
+	if err := s.store.SaveCheck(scanID, c); err != nil {
 		return
 	}
+	s.hub.publish(scanID, RunEvent{Type: "check", Check: &c})
+}
 
-	sc, err := s.store.GetScan(ref.ScanID)
+// cvesFor returns product+version's CVEs, using the SQLite cache when
+// there's a fresh-enough (within cveCacheTTL) entry and falling back to a
+// live NVD lookup otherwise. A lookup failure (network error, rate limit
+// exhausted, ...) just yields no CVEs for this technology rather than
+// failing the whole check -- best-effort, same as screenshot capture.
+func (s *Server) cvesFor(ctx context.Context, product, version, nvdKey string) []cve.CVE {
+	if cached, fetchedAt, ok, err := s.store.GetCVECache(product, version); err == nil && ok && time.Since(fetchedAt) < cveCacheTTL {
+		var cves []cve.CVE
+		if json.Unmarshal([]byte(cached), &cves) == nil {
+			return cves
+		}
+	}
+
+	cves, err := cve.Lookup(ctx, product, version, nvdKey)
 	if err != nil {
-		return
+		return nil
 	}
-	flow := s.buildServiceProfileFlow(sc.Domain, host, ports)
-	if _, err := s.startScanRun(ref.ScanID, store.ScanKindServiceProfile, flow, []string{host}); err != nil {
-		s.hub.publish(ref.ScanID, RunEvent{Type: "done", Message: "failed to start service-profile run: " + err.Error()})
+	if data, err := json.Marshal(cves); err == nil {
+		_ = s.store.SetCVECache(product, version, string(data))
 	}
+	return cves
 }
 
 type contentDiscoveryRequest struct {
@@ -647,19 +633,18 @@ func (s *Server) handleRestartScanRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, fmt.Errorf("scan: scheme not resolved yet, try again once recon finishes"))
 		return
 	}
-	if running, err := s.store.KindRunning(scanID, kind); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	} else if running {
-		writeError(w, http.StatusConflict, fmt.Errorf("scan: %s is already running", kind))
-		return
-	}
 
 	opts := scanOptionsOf(sc)
 	var flow engine.Flow
 	var targets []string
 	switch kind {
 	case store.ScanKindContentDiscovery:
+		// Content discovery has a per-target concept (one ffuf+feroxbuster
+		// pair per host), so "restart" here is scoped to just the requested
+		// target(s) -- checked via TargetRunning rather than the blanket
+		// KindRunning below, so restarting one subdomain's scan (e.g. from
+		// its progress row's right-click menu) isn't blocked by, or itself
+		// blocks, a different subdomain's still-running scan.
 		var req restartScanRunRequest
 		if r.ContentLength > 0 {
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -671,11 +656,34 @@ func (s *Server) handleRestartScanRun(w http.ResponseWriter, r *http.Request) {
 		if len(targets) == 0 {
 			targets = []string{sc.Domain}
 		}
+		for _, t := range targets {
+			if running, err := s.store.TargetRunning(scanID, kind, t); err != nil {
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			} else if running {
+				writeError(w, http.StatusConflict, fmt.Errorf("scan: content discovery is already running for %s", t))
+				return
+			}
+		}
 		flow = s.buildContentDiscoveryFlow(sc.Domain, sc.Scheme, targets, opts)
 	case store.ScanKindSubdomainBruteforce:
+		if running, err := s.store.KindRunning(scanID, kind); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		} else if running {
+			writeError(w, http.StatusConflict, fmt.Errorf("scan: %s is already running", kind))
+			return
+		}
 		targets = []string{sc.Domain}
 		flow = s.buildSubdomainBruteforceFlow(sc.Domain, sc.Scheme, opts)
 	case store.ScanKindVHostBruteforce:
+		if running, err := s.store.KindRunning(scanID, kind); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		} else if running {
+			writeError(w, http.StatusConflict, fmt.Errorf("scan: %s is already running", kind))
+			return
+		}
 		checks, err := s.store.ListChecks(scanID)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)

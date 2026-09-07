@@ -51,8 +51,38 @@ export interface RunEvent {
 
 // --- Domain scans (recon checks + the scanner tabs each scan runs) ---
 
-export type CheckKind = 'dns' | 'tls' | 'http' | 'subdomains' | 'whois' | 'takeover' | 'dnsdumpster'
+export type CheckKind =
+  | 'dns'
+  | 'tls'
+  | 'http'
+  | 'subdomains'
+  | 'subdomains-verified'
+  | 'whois'
+  | 'takeover'
+  | 'dnsdumpster'
+  | 'technologies'
 export type CheckStatus = 'running' | 'done' | 'error'
+
+// CVE mirrors internal/cve.CVE -- one NVD record for a fingerprinted
+// technology's version (see TechDetection below).
+export interface CVE {
+  id: string
+  description: string
+  severity: string
+  score: number
+  published: string
+  references?: string[]
+}
+
+// TechDetection mirrors internal/api's techCVEResult -- one fingerprinted
+// technology plus whatever CVEs were found for its detected version. Carried
+// on a "technologies" Check's data.technologies array.
+export interface TechDetection {
+  name: string
+  category: string
+  version?: string
+  cves?: CVE[]
+}
 
 export interface Check {
   domain: string
@@ -66,7 +96,7 @@ export interface Check {
 
 // ScanKind identifies one of the independent scanners a scan runs -- mirrors
 // internal/store.ScanKind.
-export type ScanKind = 'content-discovery' | 'subdomain-bruteforce' | 'vhost-bruteforce' | 'port-scan' | 'vuln-scan' | 'service-profile'
+export type ScanKind = 'content-discovery' | 'subdomain-bruteforce' | 'vhost-bruteforce' | 'vuln-scan'
 
 export interface ScanRun {
   kind: ScanKind
@@ -169,4 +199,5 @@ export interface AuthUser {
 
 export interface SettingsInfo {
   dnsdumpsterApiKeySet: boolean
+  nvdApiKeySet: boolean
 }

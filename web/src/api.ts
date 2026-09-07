@@ -58,6 +58,8 @@ export const api = {
   getSettings: () => req<SettingsInfo>('/api/settings'),
   setDNSDumpsterKey: (apiKey: string) =>
     req<SettingsInfo>('/api/settings/dnsdumpster-key', { method: 'PUT', body: JSON.stringify({ apiKey }) }),
+  setNVDKey: (apiKey: string) =>
+    req<SettingsInfo>('/api/settings/nvd-key', { method: 'PUT', body: JSON.stringify({ apiKey }) }),
 
   listTools: () => req<ToolInfo[]>('/api/tools'),
 

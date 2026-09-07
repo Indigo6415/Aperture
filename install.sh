@@ -3,8 +3,8 @@
 # Aperture installer for macOS/Linux.
 #
 # Installs -- or reinstalls/upgrades, if already present -- every
-# dependency Aperture needs (Go, Node.js, ffuf, feroxbuster, nmap, nuclei,
-# and, best-effort, a headless-Chrome-compatible browser for screenshots/PDF
+# dependency Aperture needs (Go, Node.js, ffuf, feroxbuster, nuclei, and,
+# best-effort, a headless-Chrome-compatible browser for screenshots/PDF
 # report export), then builds the frontend and the aperture binary from
 # this checkout and installs everything into one directory on PATH.
 #
@@ -160,22 +160,6 @@ install_feroxbuster() {
   ok "feroxbuster $("$INSTALL_DIR/feroxbuster" -V) installed to $INSTALL_DIR/feroxbuster"
 }
 
-install_nmap() {
-  info "Checking nmap..."
-  # Unlike ffuf/feroxbuster (fetched as pinned binaries), nmap comes from
-  # the system package manager -- skip reinstalling over whatever version
-  # is already there rather than fighting a distro's own package state.
-  if command -v nmap &>/dev/null; then
-    ok "nmap $(nmap --version | head -n1 | awk '{print $NF}') already installed"
-    return
-  fi
-  if ! pkg_install "nmap" "nmap" "nmap" "nmap" "nmap" "nmap"; then
-    fail "nmap is required for the port-scan scanner. Automatic install did not succeed -- install it manually from https://nmap.org/download.html and re-run this script."
-  fi
-  command -v nmap &>/dev/null || fail "nmap installation appears to have failed."
-  ok "nmap $(nmap --version | head -n1 | awk '{print $NF}') installed"
-}
-
 install_nuclei() {
   info "Installing nuclei (latest) via go install..."
   # Same rationale as install_ffuf: `go install ...@latest` always re-fetches
@@ -272,7 +256,6 @@ ensure_go
 ensure_node
 install_ffuf
 install_feroxbuster
-install_nmap
 install_nuclei
 install_headless_browser
 build_frontend
@@ -296,7 +279,6 @@ printf '  go          %s\n' "$(go version | awk '{print $3}')"
 printf '  node        %s\n' "$(node -v)"
 printf '  ffuf        %s\n' "$("$INSTALL_DIR/ffuf" -V 2>&1 | head -n1)"
 printf '  feroxbuster %s\n' "$("$INSTALL_DIR/feroxbuster" -V)"
-printf '  nmap        %s\n' "$(nmap --version | head -n1)"
 printf '  nuclei      %s\n' "$("$INSTALL_DIR/nuclei" -version 2>&1 | head -n1)"
 printf '  browser     %s\n' "${FOUND_BROWSER:-none found -- screenshots/PDF report export unavailable}"
 printf '  aperture    %s\n' "$INSTALL_DIR/aperture"

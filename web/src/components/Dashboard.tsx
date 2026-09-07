@@ -3,6 +3,8 @@ import { api } from '../api'
 import type { ScanOptionsPreset, ScanSummary } from '../types'
 import { statusHexColor } from '../statusColor'
 import { SummaryCard } from './SummaryCard'
+import { copyToClipboard, useContextMenu } from '../contextMenu'
+import { showToast } from '../toast'
 
 // PRESETS backs the "aggressive"/"stealth" shorthand for per-scan tuning --
 // mirrors internal/engine.presetDefaults so the description shown here
@@ -26,6 +28,7 @@ type StatusFilter = 'all' | 'running' | 'done'
 // the "you only have to enter a domain" entry point the rest of the app's
 // tools (scanner tabs, wordlists) support rather than gate.
 export function Dashboard({ onOpen }: { onOpen: (scanId: string) => void }) {
+  const { openMenu } = useContextMenu()
   const [domain, setDomain] = useState('')
   const [starting, setStarting] = useState(false)
   const [error, setError] = useState('')
@@ -80,6 +83,24 @@ export function Dashboard({ onOpen }: { onOpen: (scanId: string) => void }) {
       return true
     })
   }, [scans, filterText, statusFilter])
+
+  const restartScan = async (s: ScanSummary) => {
+    try {
+      await api.restartScan(s.id)
+      showToast(`Restarting scan for ${s.domain}`, 'success')
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : String(err), 'error')
+    }
+  }
+
+  const cancelScan = async (s: ScanSummary) => {
+    try {
+      await api.cancelScan(s.id)
+      showToast(`Cancelled scan for ${s.domain}`, 'success')
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : String(err), 'error')
+    }
+  }
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -240,6 +261,15 @@ export function Dashboard({ onOpen }: { onOpen: (scanId: string) => void }) {
               <div
                 key={s.id}
                 onClick={() => onOpen(s.id)}
+                onContextMenu={(e) => {
+                  e.stopPropagation()
+                  openMenu(e, [
+                    { label: 'Open scan', onSelect: () => onOpen(s.id) },
+                    { label: s.running ? 'Cancel scan' : 'Restart scan', onSelect: () => (s.running ? cancelScan(s) : restartScan(s)), danger: s.running },
+                    'separator',
+                    { label: 'Copy domain', onSelect: () => copyToClipboard(s.domain, 'Copied domain') },
+                  ])
+                }}
                 className="flex cursor-pointer items-center justify-between gap-4 px-4 py-3 hover:bg-neutral-900"
               >
                 <div className="min-w-0 flex-1">

@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +29,12 @@ const (
 	// possible dangling-CNAME takeover (see fanOutSubdomains) -- a clean
 	// subdomain gets no takeover Check at all, rather than one saying so.
 	KindTakeover CheckKind = "takeover"
+	// KindSubdomainsVerified is emitted once crt.sh's and (if configured)
+	// DNSDumpster's candidate subdomains have been merged and each
+	// independently confirmed live via two separate DNS resolution paths
+	// (see verifySubdomains) -- this, not KindSubdomains, is the list
+	// fanOutSubdomains actually scans further.
+	KindSubdomainsVerified CheckKind = "subdomains-verified"
 )
 
 // Status is the lifecycle state of one Check.
@@ -109,18 +116,25 @@ func runCheck(ctx context.Context, domain string, kind CheckKind, timeout time.D
 	return c
 }
 
-// Scan runs the five apex-domain checks concurrently, invoking onCheck as
-// each one completes (not batched, so slow checks like WHOIS never hold up
-// fast ones like DNS), then fans the discovered scheme + subdomains out to
-// bounded per-subdomain DNS/TLS/HTTP checks. It returns the HTTP scheme that
+// Scan runs the five apex-domain checks concurrently -- plus, when
+// dnsdumpsterAPIKey is non-empty, a DNSDumpster lookup alongside them as a
+// sixth -- invoking onCheck as each one completes (not batched, so slow
+// checks like WHOIS never hold up fast ones like DNS). Once every check has
+// finished, crt.sh's and DNSDumpster's candidate subdomains are merged and
+// each is independently verified live (see verifySubdomains) before being
+// fanned out to bounded per-subdomain DNS/TLS/HTTP checks -- a stale
+// certificate-transparency or DNSDumpster entry that no longer resolves
+// anywhere never reaches further scanning. It returns the HTTP scheme that
 // worked for the apex domain ("https" or "http", defaulting to "https" if
-// neither responded) and the deduped subdomain list, so the caller can build
-// a content-discovery flow against the right scheme without re-probing.
-func Scan(ctx context.Context, domain string, onCheck func(Check)) (scheme string, subdomains []string) {
+// neither responded) and the verified subdomain list, so the caller can
+// build a content-discovery flow against the right scheme without
+// re-probing.
+func Scan(ctx context.Context, domain, dnsdumpsterAPIKey string, onCheck func(Check)) (scheme string, verified []string) {
 	scheme = "https"
 
 	var wg sync.WaitGroup
-	var mu sync.Mutex // guards scheme/subdomains, written from two different goroutines below
+	var mu sync.Mutex // guards scheme/crtshNames/dnsdumpsterNames, written from several goroutines below
+	var crtshNames, dnsdumpsterNames []string
 	kinds := []CheckKind{KindDNS, KindTLS, KindHTTP, KindSubdomains, KindWHOIS}
 	for _, kind := range kinds {
 		kind := kind
@@ -145,7 +159,7 @@ func Scan(ctx context.Context, domain string, onCheck func(Check)) (scheme strin
 			case KindSubdomains:
 				check, found := checkSubdomains(ctx, domain)
 				mu.Lock()
-				subdomains = found
+				crtshNames = found
 				mu.Unlock()
 				onCheck(check)
 			case KindWHOIS:
@@ -153,15 +167,72 @@ func Scan(ctx context.Context, domain string, onCheck func(Check)) (scheme strin
 			}
 		}()
 	}
+	if dnsdumpsterAPIKey != "" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			check := CheckDNSDumpster(ctx, domain, dnsdumpsterAPIKey)
+			if check.Status == StatusDone {
+				if raw, ok := check.Data["subdomains"].([]string); ok {
+					mu.Lock()
+					dnsdumpsterNames = raw
+					mu.Unlock()
+				}
+			}
+			onCheck(check)
+		}()
+	}
 	wg.Wait()
 
-	mu.Lock()
-	found := subdomains[:min(len(subdomains), subdomainCap)]
-	mu.Unlock()
-	if len(found) > 0 {
-		fanOutSubdomains(ctx, found, onCheck)
+	candidates := mergeSubdomains(crtshNames, dnsdumpsterNames, domain)
+	if len(candidates) > subdomainCap {
+		candidates = candidates[:subdomainCap]
 	}
-	return scheme, subdomains
+
+	verified = verifySubdomains(ctx, candidates)
+	onCheck(Check{
+		Domain: domain, Kind: KindSubdomainsVerified, Status: StatusDone,
+		StartedAt: time.Now(), FinishedAt: time.Now(),
+		Data: map[string]any{"subdomains": verified, "count": len(verified), "candidateCount": len(candidates)},
+	})
+
+	if len(verified) > 0 {
+		fanOutSubdomains(ctx, verified, onCheck)
+	}
+	return scheme, verified
+}
+
+// mergeSubdomains unions crt.sh's and DNSDumpster's candidate lists into
+// one deduped (case-insensitive), apex-excluded, sorted slice -- both
+// sources already dedup/lowercase/exclude-apex individually, this just
+// dedupes the union of the two. isSubdomainOf additionally discards any
+// candidate that isn't actually a subdomain of domain: crt.sh's "%.domain"
+// search and DNSDumpster's lookup can both surface names from unrelated
+// SAN certs/records (e.g. domain=example.com turning up
+// sub.example2.com), and those have no business being scanned as if they
+// belonged to this target.
+func mergeSubdomains(a, b []string, domain string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, list := range [][]string{a, b} {
+		for _, name := range list {
+			name = strings.ToLower(strings.TrimSpace(name))
+			if name == "" || name == domain || seen[name] || !isSubdomainOf(name, domain) {
+				continue
+			}
+			seen[name] = true
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// isSubdomainOf reports whether name is domain itself or a proper subdomain
+// of it (name ends in "."+domain) -- e.g. domain=example.com keeps
+// sub.example.com but discards sub2.example2.com.
+func isSubdomainOf(name, domain string) bool {
+	return name == domain || strings.HasSuffix(name, "."+domain)
 }
 
 // fanOutSubdomains re-runs DNS/TLS/HTTP (not the apex-only WHOIS/crt.sh

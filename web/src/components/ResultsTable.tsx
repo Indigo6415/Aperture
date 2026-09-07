@@ -5,6 +5,7 @@ import { extensionOf, hostnameOf } from '../url'
 import { isDangerousExtension } from '../extensions'
 import { api, screenshotPreviewEnabled } from '../api'
 import { FacetFilterBar, type FacetDimension } from './FacetFilterBar'
+import { copyToClipboard, useContextMenu } from '../contextMenu'
 
 type SortKey = 'url' | 'statusCode' | 'extension' | 'contentLength' | 'words' | 'lines' | 'sourceTool'
 
@@ -80,6 +81,7 @@ export function ResultsTable({
   // feature is enabled -- otherwise every thumbnail would just be a
   // permanent placeholder for images the backend never captures.
   const showPreview = Boolean(scanId) && screenshotPreviewEnabled
+  const { openMenu } = useContextMenu()
   const [faceted, setFaceted] = useState<Finding[]>(findings)
   const [search, setSearch] = useState('')
   const [sortKey, setSortKey] = useState<SortKey>('statusCode')
@@ -161,6 +163,15 @@ export function ResultsTable({
                 <Fragment key={key}>
                   <tr
                     onClick={() => setExpanded(isExpanded ? null : key)}
+                    onContextMenu={(e) => {
+                      e.stopPropagation()
+                      openMenu(e, [
+                        { label: 'Copy URL', onSelect: () => copyToClipboard(f.url, 'Copied URL') },
+                        { label: 'Open in new tab', onSelect: () => window.open(f.url, '_blank', 'noopener,noreferrer') },
+                        'separator',
+                        { label: isExpanded ? 'Collapse details' : 'Expand details', onSelect: () => setExpanded(isExpanded ? null : key) },
+                      ])
+                    }}
                     className={`cursor-pointer border-b border-neutral-900 hover:bg-neutral-900/60 ${dangerous ? 'bg-red-950/20' : ''} ${isExpanded ? 'bg-neutral-900/80' : ''}`}
                   >
                     {scanId && screenshotPreviewEnabled && (

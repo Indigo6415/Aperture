@@ -13,17 +13,21 @@ import { ProgressBar } from './ProgressBar'
 import { TargetProgressPanel, type TargetProgress } from './TargetProgressPanel'
 import { SummaryCard } from './SummaryCard'
 import { GraphCanvas } from './GraphCanvas'
-import { PortsTable } from './PortsTable'
+import { TechTable } from './TechTable'
 import { VulnTable } from './VulnTable'
+import { copyToClipboard, useContextMenu } from '../contextMenu'
+import { showToast } from '../toast'
 
 const CHECK_LABELS: Record<CheckKind, string> = {
   dns: 'DNS',
   tls: 'TLS',
   http: 'HTTP',
   subdomains: 'Subdomains',
+  'subdomains-verified': 'Verified subdomains',
   whois: 'WHOIS',
   takeover: 'Takeover',
   dnsdumpster: 'DNSDumpster',
+  technologies: 'Technologies',
 }
 
 const STATUS_DOT: Record<Check['status'] | 'pending', string> = {
@@ -37,15 +41,14 @@ function keyFor(domain: string, kind: CheckKind): string {
   return `${domain}::${kind}`
 }
 
-type Tab = 'overview' | 'subdomains' | 'vhosts' | 'content-discovery' | 'ports' | 'services' | 'vulnerabilities'
+type Tab = 'overview' | 'subdomains' | 'vhosts' | 'content-discovery' | 'technologies' | 'vulnerabilities'
 
 const TABS: { id: Tab; label: string }[] = [
   { id: 'overview', label: 'Overview' },
   { id: 'subdomains', label: 'Subdomains' },
   { id: 'vhosts', label: 'Virtual Hosts' },
   { id: 'content-discovery', label: 'Content Discovery' },
-  { id: 'ports', label: 'Ports' },
-  { id: 'services', label: 'Service Profile' },
+  { id: 'technologies', label: 'Technologies' },
   { id: 'vulnerabilities', label: 'Vulnerabilities' },
 ]
 
@@ -330,13 +333,19 @@ export function ScanView({ scanId, onOpenGraph }: { scanId: string; onOpenGraph:
   // configured, see Settings), so showing it unconditionally would leave a
   // permanently "Queued…" card for every scan that never has one.
   if (checks[keyFor(scan.domain, 'dnsdumpster')]) apexChecks.push('dnsdumpster')
+  // subdomainsCheck is crt.sh's own raw lookup (still/error/done, used for
+  // the Overview status line below); the Subdomains tab's passive-discovery
+  // column instead sources the *verified* list -- crt.sh + DNSDumpster
+  // candidates, each independently confirmed live (see
+  // recon.verifySubdomains) -- so a stale certificate-transparency entry
+  // that no longer resolves anywhere doesn't show up as if it were live.
   const subdomainsCheck = checks[keyFor(scan.domain, 'subdomains')]
-  const passiveSubdomains = (subdomainsCheck?.data?.subdomains as string[] | undefined) ?? []
+  const verifiedCheck = checks[keyFor(scan.domain, 'subdomains-verified')]
+  const passiveSubdomains = (verifiedCheck?.data?.subdomains as string[] | undefined) ?? []
+  const candidateCount = (verifiedCheck?.data?.candidateCount as number | undefined) ?? passiveSubdomains.length
   const subdomainRows = buildSubdomainRows(scan.domain, passiveSubdomains, checks, findingsOfKind('subdomain-bruteforce'))
   const vhostFindings = findingsOfKind('vhost-bruteforce')
   const contentFindings = findingsOfKind('content-discovery')
-  const portFindings = findingsOfKind('port-scan')
-  const serviceFindings = findingsOfKind('service-profile')
   const vulnFindings = findingsOfKind('vuln-scan')
   const apexDNSDone = checks[keyFor(scan.domain, 'dns')]?.status === 'done'
   const hasVHostRun = runsOfKind('vhost-bruteforce').length > 0
@@ -364,17 +373,25 @@ export function ScanView({ scanId, onOpenGraph }: { scanId: string; onOpenGraph:
     .map((r) => ({ ...r, pages: pageCountByHost.get(r.hostname) ?? 0 }))
     .sort((a, b) => b.pages - a.pages || a.hostname.localeCompare(b.hostname))
 
-  const hasPortScanRun = runsOfKind('port-scan').length > 0
-  const hasServiceProfileRun = runsOfKind('service-profile').length > 0
   const hasVulnScanRun = runsOfKind('vuln-scan').length > 0
+  // technologiesCount/technologiesRunning derive from every host's
+  // "technologies" check (lookupTechCVEs, api/handlers_scan.go) rather than
+  // a scanner run -- there's no dedicated scanner for this anymore, it rides
+  // along on the HTTP recon check for the apex + every verified subdomain.
+  const technologyChecks = Object.values(checks).filter((c) => c.kind === 'technologies')
+  const technologiesCount = technologyChecks.reduce((sum, c) => sum + ((c.data?.technologies as unknown[] | undefined)?.length ?? 0), 0)
+  // A rough "still working" proxy, not an exact one -- technologies checks
+  // are best-effort background lookups (see lookupTechCVEs) with no run of
+  // their own to track, so this just watches the apex HTTP check they ride
+  // in on rather than every subdomain's.
+  const technologiesRunning = checks[keyFor(scan.domain, 'http')]?.status !== 'done'
 
   const counts: Record<Tab, number | null> = {
     overview: null,
     subdomains: subdomainRows.length,
     vhosts: vhostFindings.length,
     'content-discovery': contentFindings.length,
-    ports: portFindings.length,
-    services: serviceFindings.length,
+    technologies: technologiesCount,
     vulnerabilities: vulnFindings.length,
   }
   const dots: Record<Tab, string> = {
@@ -382,8 +399,7 @@ export function ScanView({ scanId, onOpenGraph }: { scanId: string; onOpenGraph:
     subdomains: STATUS_META[kindStatus('subdomain-bruteforce')].dot,
     vhosts: hasVHostRun ? STATUS_META[kindStatus('vhost-bruteforce')].dot : STATUS_DOT.pending,
     'content-discovery': STATUS_META[kindStatus('content-discovery')].dot,
-    ports: hasPortScanRun ? STATUS_META[kindStatus('port-scan')].dot : STATUS_DOT.pending,
-    services: hasServiceProfileRun ? STATUS_META[kindStatus('service-profile')].dot : STATUS_DOT.pending,
+    technologies: technologiesRunning ? STATUS_DOT.running : technologyChecks.length > 0 ? STATUS_DOT.done : STATUS_DOT.pending,
     vulnerabilities: hasVulnScanRun ? STATUS_META[kindStatus('vuln-scan')].dot : STATUS_DOT.pending,
   }
 
@@ -395,14 +411,7 @@ export function ScanView({ scanId, onOpenGraph }: { scanId: string; onOpenGraph:
     const c = checks[keyFor(scan.domain, k)]
     return !c || c.status === 'running'
   })
-  const scannerKinds: ScanKind[] = [
-    'content-discovery',
-    'subdomain-bruteforce',
-    'vhost-bruteforce',
-    'port-scan',
-    'service-profile',
-    'vuln-scan',
-  ]
+  const scannerKinds: ScanKind[] = ['content-discovery', 'subdomain-bruteforce', 'vhost-bruteforce', 'vuln-scan']
   const scanRunning = reconRunning || scannerKinds.some((k) => kindStatus(k) === 'running')
 
   return (
@@ -487,11 +496,11 @@ export function ScanView({ scanId, onOpenGraph }: { scanId: string; onOpenGraph:
                 ))}
               </div>
               <p className="text-xs text-neutral-500">
-                {subdomainsCheck?.status === 'done'
-                  ? `${passiveSubdomains.length} subdomain${passiveSubdomains.length === 1 ? '' : 's'} found via certificate transparency`
+                {verifiedCheck?.status === 'done'
+                  ? `${passiveSubdomains.length} of ${candidateCount} candidate subdomain${candidateCount === 1 ? '' : 's'} (crt.sh + DNSDumpster) verified live`
                   : subdomainsCheck?.status === 'error'
                     ? `Certificate-transparency lookup failed: ${subdomainsCheck.error}`
-                    : 'Looking up subdomains via certificate transparency…'}{' '}
+                    : 'Looking up and verifying subdomains…'}{' '}
                 — see the Subdomains tab for the full picture, including active bruteforce results.
               </p>
 
@@ -594,7 +603,9 @@ export function ScanView({ scanId, onOpenGraph }: { scanId: string; onOpenGraph:
             <SubdomainsTab
               scanId={scanId}
               domain={scan.domain}
+              scheme={scan.scheme}
               rows={subdomainRows}
+              candidateCount={candidateCount}
               runStatus={kindStatus('subdomain-bruteforce')}
               progress={kindProgress('subdomain-bruteforce')}
             />
@@ -617,50 +628,24 @@ export function ScanView({ scanId, onOpenGraph }: { scanId: string; onOpenGraph:
             {/* No aggregate progress bar here -- kindProgress collapses every
                 target into one bar and one feroxbuster node's unbounded
                 total (see contentDiscoveryTargets above it) is enough to
-                make the whole thing indeterminate. The per-target panel
+                make the whole thing indeterminate. The per-target sidebar
                 below replaces it. */}
             <ScannerToolbar scanId={scanId} kind="content-discovery" label="Restart (apex)" progress={null} />
-            <TargetProgressPanel targets={contentDiscoveryTargets()} />
-            <div className="flex-1 overflow-hidden">
-              <ResultsTable findings={contentFindings} scanId={scanId} facetPlacement="right" />
+            <div className="flex flex-1 overflow-hidden">
+              <TargetProgressPanel targets={contentDiscoveryTargets()} scanId={scanId} />
+              <div className="flex-1 overflow-hidden">
+                <ResultsTable findings={contentFindings} scanId={scanId} facetPlacement="right" />
+              </div>
             </div>
           </div>
 
-          <div className={`flex h-full flex-col ${tab === 'ports' ? '' : 'hidden'}`}>
-            {!hasPortScanRun && apexDNSDone && (
-              <p className="px-3 py-6 text-center text-xs text-neutral-600">No IPv4 address found for the apex domain — port scan was skipped.</p>
-            )}
-            {!hasPortScanRun && !apexDNSDone && <p className="px-3 py-6 text-center text-xs text-neutral-600">Waiting for DNS resolution…</p>}
-            {hasPortScanRun && (
-              <>
-                <div className="flex items-center gap-3 border-b border-neutral-800 px-3 py-2">
-                  {kindProgress('port-scan') && <ProgressBar done={kindProgress('port-scan')!.done} total={kindProgress('port-scan')!.total} />}
-                </div>
-                <div className="flex-1 overflow-hidden">
-                  <PortsTable findings={portFindings} />
-                </div>
-              </>
-            )}
-          </div>
-
-          <div className={`flex h-full flex-col ${tab === 'services' ? '' : 'hidden'}`}>
-            {!hasServiceProfileRun && (
+          <div className={`flex h-full flex-col ${tab === 'technologies' ? '' : 'hidden'}`}>
+            {technologyChecks.length === 0 && (
               <p className="px-3 py-6 text-center text-xs text-neutral-600">
-                Runs automatically once the port scan finds open ports — see the Ports tab.
+                {technologiesRunning ? 'Fingerprinting the web stack and checking for known CVEs…' : 'Nothing fingerprinted yet.'}
               </p>
             )}
-            {hasServiceProfileRun && (
-              <>
-                <div className="flex items-center gap-3 border-b border-neutral-800 px-3 py-2">
-                  {kindProgress('service-profile') && (
-                    <ProgressBar done={kindProgress('service-profile')!.done} total={kindProgress('service-profile')!.total} />
-                  )}
-                </div>
-                <div className="flex-1 overflow-hidden">
-                  <PortsTable findings={serviceFindings} showVersion />
-                </div>
-              </>
-            )}
+            {technologyChecks.length > 0 && <TechTable checks={checks} />}
           </div>
 
           <div className={`flex h-full flex-col ${tab === 'vulnerabilities' ? '' : 'hidden'}`}>
@@ -827,11 +812,11 @@ interface SubdomainRow {
   takeoverProvider?: string
 }
 
-// buildSubdomainRows merges crt.sh's passive discovery (subdomain names +
-// their per-subdomain DNS/TLS/HTTP recon check, which only carries a status
-// code) with ffuf's active bruteforce (full status/size/words/lines, since
-// those are ordinary content-discovery-shaped Findings) into one row per
-// hostname.
+// buildSubdomainRows merges passive discovery (verified crt.sh +
+// DNSDumpster subdomain names, plus their per-subdomain DNS/TLS/HTTP recon
+// check, which only carries a status code) with ffuf's active bruteforce
+// (full status/size/words/lines, since those are ordinary
+// content-discovery-shaped Findings) into one row per hostname.
 function buildSubdomainRows(
   apexDomain: string,
   passive: string[],
@@ -882,20 +867,34 @@ const SUBDOMAIN_DIMENSIONS: FacetDimension<SubdomainRow>[] = [
 function SubdomainsTab({
   scanId,
   domain,
+  scheme,
   rows,
+  candidateCount,
   runStatus,
   progress,
 }: {
   scanId: string
   domain: string
+  scheme?: string
   rows: SubdomainRow[]
+  candidateCount: number
   runStatus: RunStatus
   progress: { done: number; total: number } | null
 }) {
+  const { openMenu } = useContextMenu()
   const [kept, setKept] = useState<SubdomainRow[]>(rows)
   const [starting, setStarting] = useState(false)
   const [startMessage, setStartMessage] = useState('')
   const [restarting, setRestarting] = useState(false)
+
+  const restartOne = async (hostname: string) => {
+    try {
+      const res = await api.restartScanRun(scanId, 'content-discovery', [hostname])
+      showToast(res.skipped ? (res.message ?? 'Nothing new to scan') : `Started content discovery for ${hostname}`, res.skipped ? 'info' : 'success')
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : String(err), 'error')
+    }
+  }
 
   const scanSelected = async () => {
     setStarting(true)
@@ -944,6 +943,11 @@ function SubdomainsTab({
           {restarting ? 'Restarting…' : 'Restart bruteforce'}
         </button>
         {progress && <ProgressBar done={progress.done} total={progress.total} />}
+        {candidateCount > 0 && (
+          <span className="text-xs text-neutral-600" title="Candidates from crt.sh + DNSDumpster confirmed live via two independent DNS resolution paths">
+            {rows.filter((r) => r.passive).length} verified of {candidateCount} candidate{candidateCount === 1 ? '' : 's'}
+          </span>
+        )}
         <span className="text-xs text-neutral-500">
           {kept.length} of {rows.length} subdomain{rows.length === 1 ? '' : 's'} selected
         </span>
@@ -976,7 +980,21 @@ function SubdomainsTab({
           </thead>
           <tbody>
             {kept.map((r) => (
-              <tr key={r.hostname} className={`border-b border-neutral-900 hover:bg-neutral-900/60 ${r.takeoverProvider ? 'bg-red-950/20' : ''}`}>
+              <tr
+                key={r.hostname}
+                onContextMenu={(e) => {
+                  e.stopPropagation()
+                  const url = `${scheme || 'https'}://${r.hostname}/`
+                  openMenu(e, [
+                    { label: 'Scan / restart this subdomain', onSelect: () => restartOne(r.hostname) },
+                    'separator',
+                    { label: 'Copy hostname', onSelect: () => copyToClipboard(r.hostname, 'Copied hostname') },
+                    { label: 'Copy URL', onSelect: () => copyToClipboard(url, 'Copied URL') },
+                    { label: 'Open in new tab', onSelect: () => window.open(url, '_blank', 'noopener,noreferrer') },
+                  ])
+                }}
+                className={`border-b border-neutral-900 hover:bg-neutral-900/60 ${r.takeoverProvider ? 'bg-red-950/20' : ''}`}
+              >
                 {screenshotPreviewEnabled && (
                   <td className="px-3 py-1.5">
                     <Thumbnail scanId={scanId} hostname={r.hostname} />

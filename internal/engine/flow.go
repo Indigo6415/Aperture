@@ -12,6 +12,11 @@ import "encoding/json"
 type NodeKind string
 
 const (
+	// KindWebFuzz is Aperture's native fuzzer/directory-buster
+	// (internal/adapters/webfuzz.go) -- registered like every other source
+	// kind below, but not used by any auto-generated flow, which still
+	// build their ffuf/feroxbuster node pairs the way they always have.
+	KindWebFuzz     NodeKind = "webfuzz"
 	KindFFuf        NodeKind = "ffuf"
 	KindFeroxbuster NodeKind = "feroxbuster"
 	KindNmap        NodeKind = "nmap"
@@ -25,7 +30,7 @@ const (
 // IsSource reports whether a node kind is a scan node (no inputs, wraps an
 // external tool via the adapters package) as opposed to a filter/merge/sink.
 func (k NodeKind) IsSource() bool {
-	return k == KindFFuf || k == KindFeroxbuster || k == KindNmap || k == KindNuclei
+	return k == KindWebFuzz || k == KindFFuf || k == KindFeroxbuster || k == KindNmap || k == KindNuclei
 }
 
 // Position is purely UI metadata (canvas layout) round-tripped through the

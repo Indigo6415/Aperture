@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+
+	"github.com/Indigo6415/Aperture/internal/techfp"
 )
 
 var titleRe = regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`)
@@ -24,7 +26,8 @@ const maxBodyPeek = 64 * 1024
 //
 // Data shape: {"scheme": string, "finalUrl": string, "statusCode": int,
 // "server": string, "title": string, "headers": map[string]string,
-// "redirects": []string, "cloudflare": bool, "bodySnippet": string}
+// "redirects": []string, "cloudflare": bool, "bodySnippet": string,
+// "technologies": []{"name","category","version"}}
 //
 // bodySnippet is the same bytes already read to look for <title> (see
 // maxBodyPeek) -- surfaced here too so a subdomain takeover check
@@ -79,16 +82,25 @@ func fetchOnce(ctx context.Context, scheme, domain string) (map[string]any, erro
 		headers[k] = resp.Header.Get(k)
 	}
 
+	detections := techfp.Detect(headers, string(body), resp.Request.URL.String())
+	technologies := make([]map[string]any, 0, len(detections))
+	for _, d := range detections {
+		technologies = append(technologies, map[string]any{
+			"name": d.Name, "category": string(d.Category), "version": d.Version,
+		})
+	}
+
 	return map[string]any{
-		"scheme":      scheme,
-		"finalUrl":    resp.Request.URL.String(),
-		"statusCode":  resp.StatusCode,
-		"server":      resp.Header.Get("Server"),
-		"title":       title,
-		"headers":     headers,
-		"redirects":   redirects,
-		"cloudflare":  isCloudflare(headers),
-		"bodySnippet": string(body),
+		"scheme":       scheme,
+		"finalUrl":     resp.Request.URL.String(),
+		"statusCode":   resp.StatusCode,
+		"server":       resp.Header.Get("Server"),
+		"title":        title,
+		"headers":      headers,
+		"redirects":    redirects,
+		"cloudflare":   isCloudflare(headers),
+		"bodySnippet":  string(body),
+		"technologies": technologies,
 	}, nil
 }
 
