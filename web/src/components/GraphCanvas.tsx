@@ -219,11 +219,13 @@ function ScreenshotTooltip({ scanId, hostname, x, y }: { scanId: string; hostnam
 function radiusFor(type: GraphNodeType): number {
   if (type === 'website') return 14
   if (type === 'subdomain') return 9
+  if (type === 'technology') return 6
   return 5
 }
 
 function colorFor(n: GraphNode): string {
   if (n.type === 'page') return n.statusCode ? statusHexColor(n.statusCode) : '#71717a'
   if (n.type === 'website') return '#38bdf8'
+  if (n.type === 'technology') return '#fbbf24'
   return '#a78bfa'
 }

@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { SimulationNodeDatum, SimulationLinkDatum } from 'd3-force'
 import { api, watchRun, watchScan } from './api'
-import type { Check, Finding, RunStatus, ScanKind } from './types'
+import type { Check, CVE, Finding, RunStatus, ScanKind, TechDetection } from './types'
 import { hostnameOf, extensionOf } from './url'
 import { isDangerousExtension } from './extensions'
 
-export type GraphNodeType = 'website' | 'subdomain' | 'page'
+export type GraphNodeType = 'website' | 'subdomain' | 'page' | 'technology'
 
 export interface GraphNode extends SimulationNodeDatum {
   id: string
@@ -14,12 +14,97 @@ export interface GraphNode extends SimulationNodeDatum {
   statusCode?: number
   extension?: string
   dangerous?: boolean
+  // Set only on 'technology' nodes -- category/cves back the Estate
+  // Hierarchy view's technology panel, and host lets it (and any future
+  // consumer) find the owning host without walking edges.
+  host?: string
+  category?: string
+  cves?: CVE[]
 }
 
 export type GraphEdge = SimulationLinkDatum<GraphNode> & { id: string }
 
+// PageGroup is one bucketed row of the Estate Hierarchy view's page-group
+// panel: either a path pattern (e.g. "/wp-content/*") with how many pages
+// matched it, or -- for dangerous?:true rows -- one specific exposed file,
+// kept unmerged so it renders in the warning treatment instead of vanishing
+// into a bucket.
+export interface PageGroup {
+  key: string
+  label: string
+  count: number
+  statusCode: number
+  dangerous: boolean
+}
+
+const MAX_PAGE_GROUPS = 9
+
 const websiteId = (scanId: string) => `scan:${scanId}`
 const hostId = (scanId: string, hostname: string) => `host:${scanId}:${hostname}`
+const techNodeId = (scanId: string, hostname: string, techName: string) => `tech:${scanId}:${hostname}:${techName}`
+
+// pathPatternOf collapses a URL path down to its first segment, the same
+// granularity a directory-bruteforce result is actually shaped by (e.g.
+// every "/wp-content/uploads/2024/03/x.jpg" hit is one WordPress uploads
+// tree, not 40 distinct pages worth a row each).
+function pathPatternOf(pathname: string): string {
+  const segments = pathname.split('/').filter(Boolean)
+  if (segments.length === 0) return '/ (root)'
+  if (segments.length === 1) return '/' + segments[0]
+  return '/' + segments[0] + '/*'
+}
+
+// bucketPageGroups turns one host's raw content-discovery findings into the
+// page-group panel's rows: dangerous-extension 200 hits stay one row each
+// (never merged into a pattern bucket, since each is individually worth
+// looking at), everything else buckets by pathPatternOf. Capped at
+// MAX_PAGE_GROUPS total, largest first -- see estate hierarchy README's
+// "Layout" section for why (3,000 pages on one host would otherwise blow
+// the panel out).
+function bucketPageGroups(findings: Finding[]): PageGroup[] {
+  const dangerous: PageGroup[] = []
+  const patterns = new Map<string, { count: number; statusCodes: Map<number, number> }>()
+
+  for (const f of findings) {
+    let pathname = '/'
+    try {
+      pathname = new URL(f.url).pathname
+    } catch {
+      // fall back to '/' -- an unparseable URL still needs a bucket
+    }
+    if (f.statusCode === 200 && isDangerousExtension(extensionOf(f.url))) {
+      dangerous.push({ key: `d:${f.url}`, label: pathname, count: 1, statusCode: 200, dangerous: true })
+      continue
+    }
+    const pattern = pathPatternOf(pathname)
+    const entry = patterns.get(pattern) ?? { count: 0, statusCodes: new Map<number, number>() }
+    entry.count++
+    entry.statusCodes.set(f.statusCode, (entry.statusCodes.get(f.statusCode) ?? 0) + 1)
+    patterns.set(pattern, entry)
+  }
+
+  const patternRows: PageGroup[] = [...patterns.entries()].map(([pattern, { count, statusCodes }]) => {
+    // The row's status code is whichever one most of the bucket's findings
+    // actually had -- a bucket is rarely 100% one status, but this is the
+    // one number the row has room to show.
+    let statusCode = 200
+    let bestCount = -1
+    for (const [code, n] of statusCodes) {
+      if (n > bestCount) {
+        bestCount = n
+        statusCode = code
+      }
+    }
+    return { key: `p:${pattern}`, label: pattern, count, statusCode, dangerous: false }
+  })
+
+  // Dangerous rows are guaranteed a slot (up to the cap itself) since
+  // they're the reason this panel has a warning treatment at all; pattern
+  // buckets fill whatever room is left, largest first.
+  const dangerousRows = dangerous.slice(0, MAX_PAGE_GROUPS)
+  const topPatterns = patternRows.sort((a, b) => b.count - a.count).slice(0, MAX_PAGE_GROUPS - dangerousRows.length)
+  return [...dangerousRows, ...topPatterns].sort((a, b) => b.count - a.count)
+}
 
 // useScanGraph builds a live node/edge graph for exactly one scan --
 // one website node for the apex domain, one subdomain node per hostname
@@ -32,9 +117,18 @@ const hostId = (scanId: string, hostname: string) => `host:${scanId}:${hostname}
 export function useScanGraph(
   scanId: string,
   domain: string,
-): { nodes: GraphNode[]; edges: GraphEdge[]; progress: { done: number; total: number } | null } {
+): {
+  nodes: GraphNode[]
+  edges: GraphEdge[]
+  progress: { done: number; total: number } | null
+  pageGroupsByHost: Map<string, PageGroup[]>
+} {
   const nodesRef = useRef(new Map<string, GraphNode>())
   const edgesRef = useRef(new Map<string, GraphEdge>())
+  // Raw content-discovery findings per hostname, kept alongside nodesRef
+  // purely to feed bucketPageGroups above -- the page GraphNodes themselves
+  // don't carry enough (no hostname, no raw path) to re-bucket from.
+  const findingsRef = useRef(new Map<string, Finding[]>())
   const stopFns = useRef(new Map<string, () => void>())
   // Progress/status per run, tracked alongside nodes/edges above so the
   // overall "how's this scan doing" bar (ScanView's header, GraphView's
@@ -58,6 +152,7 @@ export function useScanGraph(
     if (!scanId || !domain) return
     nodesRef.current = new Map()
     edgesRef.current = new Map()
+    findingsRef.current = new Map()
     runStatusRef.current = new Map()
     runProgressRef.current = new Map()
     setVersion((v) => v + 1)
@@ -73,7 +168,31 @@ export function useScanGraph(
     }
 
     const applyCheck = (check: Check) => {
-      if (check.kind !== 'subdomains' || check.status !== 'done') return
+      if (check.status !== 'done') return
+      if (check.kind === 'http') {
+        // Stamps the website/subdomain node's own statusCode (distinct from
+        // a page node's) -- mutated in place like GraphCanvas's d3 x/y are,
+        // since the node object's identity is what callers (and the force
+        // simulation) hold onto.
+        const hostname = check.domain
+        const hostNodeId = hostname === domain ? websiteId(scanId) : ensureSubdomainNode(hostname)
+        const node = nodesRef.current.get(hostNodeId)
+        if (node) node.statusCode = check.data?.statusCode as number | undefined
+        return
+      }
+      if (check.kind === 'technologies') {
+        const hostname = check.domain
+        const hostNodeId = hostname === domain ? websiteId(scanId) : ensureSubdomainNode(hostname)
+        const technologies = (check.data?.technologies as TechDetection[] | undefined) ?? []
+        for (const t of technologies) {
+          const id = techNodeId(scanId, hostname, t.name)
+          nodesRef.current.set(id, { id, type: 'technology', label: t.name, host: hostname, category: t.category, cves: t.cves })
+          const edgeId = `e:${hostNodeId}->${id}`
+          edgesRef.current.set(edgeId, { id: edgeId, source: hostNodeId, target: id })
+        }
+        return
+      }
+      if (check.kind !== 'subdomains') return
       const hostnames = (check.data?.subdomains as string[] | undefined) ?? []
       for (const h of hostnames) ensureSubdomainNode(h)
     }
@@ -101,6 +220,10 @@ export function useScanGraph(
       nodesRef.current.set(pageId, { id: pageId, type: 'page', label, statusCode: f.statusCode, extension, dangerous: isDangerousExtension(extension) })
       const edgeId = `e:${hostNodeId}->${pageId}`
       edgesRef.current.set(edgeId, { id: edgeId, source: hostNodeId, target: pageId })
+
+      const list = findingsRef.current.get(hostname) ?? []
+      list.push(f)
+      findingsRef.current.set(hostname, list)
     }
 
     const startWatchingRun = (kind: ScanKind, runId: string) => {
@@ -200,5 +323,15 @@ export function useScanGraph(
     return { done, total: indeterminate ? 0 : total }
   }, [version])
 
-  return { nodes, edges, progress }
+  // pageGroupsByHost re-buckets every host's findingsRef entry whenever the
+  // graph changes -- see bucketPageGroups above. Cheap enough to recompute
+  // wholesale on each bump rather than tracking per-host dirtiness.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const pageGroupsByHost = useMemo(() => {
+    const result = new Map<string, PageGroup[]>()
+    for (const [hostname, findings] of findingsRef.current) result.set(hostname, bucketPageGroups(findings))
+    return result
+  }, [version])
+
+  return { nodes, edges, progress, pageGroupsByHost }
 }
