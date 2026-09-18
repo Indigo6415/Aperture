@@ -27,8 +27,8 @@ import (
 // of them pass its match/filter/autocalibration rules -- unlike counting
 // emitted stdout result lines (matches only), it doesn't stall near zero
 // when -mc is narrow or -ac is filtering out nearly everything, which is
-// exactly how subdomain/vhost bruteforce are configured (see
-// buildSubdomainBruteforceFlow/buildVHostBruteforceFlow).
+// exactly how subdomain/vhost enumeration are configured (see
+// api.buildToolFlow's ToolFFufSubdomain/ToolFFufVHost branches).
 var ffufProgressLine = regexp.MustCompile(`::\s*Progress:\s*\[(\d+)/(\d+)\]`)
 
 // watchFfufProgress reads ffuf's stderr for the progress line above. ffuf

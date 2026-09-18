@@ -1,9 +1,7 @@
 import type { Check, TechDetection } from '../types'
 
 // SEVERITY_ORDER/SEVERITY_COLOR mirror NVD's own CVSS severity vocabulary
-// (critical/high/medium/low/unknown) -- same palette VulnTable.tsx uses for
-// nuclei's severity vocabulary, kept as its own copy here since the two
-// tables render unrelated data shapes.
+// (critical/high/medium/low/unknown).
 const SEVERITY_ORDER = ['critical', 'high', 'medium', 'low', 'unknown']
 const SEVERITY_COLOR: Record<string, string> = {
   critical: '#f87171',

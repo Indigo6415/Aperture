@@ -18,34 +18,37 @@ func newID() string {
 	return hex.EncodeToString(b)
 }
 
-// executeRun drives one flow to completion, streaming findings/status over
-// the run's hub channel and persisting the final status. Called for every
-// scanner a scan starts (content discovery, subdomain bruteforce, vhost
-// bruteforce) -- see runScan and handleScanContentDiscovery in
-// handlers_scan.go, which build the flow and create the run row before
-// calling this.
-func (s *Server) executeRun(flow engine.Flow, runID string) {
+// executeToolJob drives one flow to completion, streaming findings/status
+// over the job's hub channel and persisting the final status on both the
+// run row (FinishRun, unchanged from before) and the job row (FinishJob,
+// so ListCaseJobs' status reads correctly even without its LEFT JOIN).
+// Called for every engine-backed job (feroxbuster/ffuf-subdomain/
+// ffuf-vhost) -- see handleStartJob in handlers_jobs.go, which builds the
+// flow and creates the job+run rows before calling this. Cancellation and
+// event delivery are keyed by jobID, not runID, so the client only ever
+// needs to know one ID per job.
+func (s *Server) executeToolJob(flow engine.Flow, jobID, runID string) {
 	ctx, cancel := context.WithCancel(context.Background())
-	s.trackRunCancel(runID, cancel)
+	s.trackJobCancel(jobID, cancel)
 	defer func() {
-		s.untrackRunCancel(runID)
+		s.untrackJobCancel(jobID)
 		cancel()
 	}()
 
 	onResult := func(nodeID string, f model.Finding) {
 		f.RunID = runID
 		if err := s.store.SaveFinding(runID, nodeID, f); err != nil {
-			// The run continues even if a single write fails; the finding
+			// The job continues even if a single write fails; the finding
 			// is still delivered live over the websocket.
-			s.hub.publish(runID, RunEvent{Type: "status", NodeID: nodeID, Status: engine.StatusRunning, Message: "warning: failed to persist finding: " + err.Error()})
+			s.hub.publish(jobID, RunEvent{Type: "status", NodeID: nodeID, Status: engine.StatusRunning, Message: "warning: failed to persist finding: " + err.Error()})
 		}
-		s.hub.publish(runID, RunEvent{Type: "finding", NodeID: nodeID, Finding: &f})
+		s.hub.publish(jobID, RunEvent{Type: "finding", NodeID: nodeID, Finding: &f})
 	}
 	onStatus := func(nodeID string, status engine.NodeStatus, message string) {
-		s.hub.publish(runID, RunEvent{Type: "status", NodeID: nodeID, Status: status, Message: message})
+		s.hub.publish(jobID, RunEvent{Type: "status", NodeID: nodeID, Status: status, Message: message})
 	}
 	onProgress := func(nodeID string, done, total int) {
-		s.hub.publish(runID, RunEvent{Type: "progress", NodeID: nodeID, Done: done, Total: total})
+		s.hub.publish(jobID, RunEvent{Type: "progress", NodeID: nodeID, Done: done, Total: total})
 	}
 
 	err := s.engine.Execute(ctx, flow, runID, onResult, onStatus, onProgress)
@@ -61,14 +64,8 @@ func (s *Server) executeRun(flow engine.Flow, runID string) {
 		}
 	}
 	_ = s.store.FinishRun(runID, final, errMsg)
-	s.hub.publish(runID, RunEvent{Type: "done", Status: engine.NodeStatus(final), Message: errMsg})
-
-	if final == store.RunSucceeded {
-		// A content-discovery run finishing successfully is the trigger for
-		// an auto-kicked vuln-scan against its hits -- see maybeChainVulnScan
-		// (handlers_scan.go), which no-ops for every other scanner kind.
-		s.maybeChainVulnScan(runID)
-	}
+	_ = s.store.FinishJob(jobID, final, errMsg)
+	s.hub.publish(jobID, RunEvent{Type: "done", Status: engine.NodeStatus(final), Message: errMsg})
 }
 
 func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {

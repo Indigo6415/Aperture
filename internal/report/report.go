@@ -1,12 +1,12 @@
-// Package report bundles one scan's recon checks and scanner findings into
-// a downloadable report -- JSON (a direct data dump), HTML (a rendered
-// summary a person can read in a browser), and PDF (the same HTML, printed
-// headlessly by whichever Chrome/Chromium binary internal/adapters already
-// knows how to find for screenshots). This is what wires engine.KindExport's
-// underlying idea -- collecting a run's results and writing them out in a
-// chosen format -- to an actual UI action, extended to cover a whole scan
-// (every scanner run + every recon check) rather than one flow's export
-// node.
+// Package report bundles one case's targets, identify checks, and job
+// findings into a downloadable report -- JSON (a direct data dump), HTML (a
+// rendered summary a person can read in a browser), and PDF (the same HTML,
+// printed headlessly by whichever Chrome/Chromium binary internal/adapters
+// already knows how to find for screenshots). This is what wires
+// engine.KindExport's underlying idea -- collecting a run's results and
+// writing them out in a chosen format -- to an actual UI action, extended
+// to cover a whole case (every job + every identify check) rather than one
+// flow's export node.
 package report
 
 import (
@@ -26,41 +26,49 @@ import (
 	"github.com/Indigo6415/Aperture/internal/store"
 )
 
-// Report is everything gathered about one scan, in the shape both the JSON
+// Report is everything gathered about one case, in the shape both the JSON
 // and HTML/PDF renderers work from.
 type Report struct {
-	Scan        store.Scan                 `json:"scan"`
+	Case        store.Case                 `json:"case"`
+	Targets     []store.Target             `json:"targets"`
 	GeneratedAt time.Time                  `json:"generatedAt"`
 	Checks      []recon.Check              `json:"checks"`
-	ScanRuns    []store.ScanRun            `json:"scanRuns"`
-	Findings    map[string][]model.Finding `json:"findings"` // keyed by ScanRun.RunID
+	Jobs        []store.Job                `json:"jobs"`
+	Findings    map[string][]model.Finding `json:"findings"` // keyed by Job.RunID (absent for identify jobs)
 }
 
-// Build gathers everything store knows about scanID into a Report.
-func Build(st *store.Store, scanID string) (Report, error) {
-	sc, err := st.GetScan(scanID)
+// Build gathers everything store knows about caseID into a Report.
+func Build(st *store.Store, caseID string) (Report, error) {
+	c, err := st.GetCase(caseID)
 	if err != nil {
-		return Report{}, fmt.Errorf("report: get scan: %w", err)
+		return Report{}, fmt.Errorf("report: get case: %w", err)
 	}
-	checks, err := st.ListChecks(scanID)
+	targets, err := st.ListTargets(caseID)
+	if err != nil {
+		return Report{}, fmt.Errorf("report: list targets: %w", err)
+	}
+	checks, err := st.ListCaseChecks(caseID)
 	if err != nil {
 		return Report{}, fmt.Errorf("report: list checks: %w", err)
 	}
-	runs, err := st.ListScanRuns(scanID)
+	jobs, err := st.ListCaseJobs(caseID)
 	if err != nil {
-		return Report{}, fmt.Errorf("report: list scan runs: %w", err)
+		return Report{}, fmt.Errorf("report: list jobs: %w", err)
 	}
 
-	findings := make(map[string][]model.Finding, len(runs))
-	for _, run := range runs {
-		fs, err := st.ListFindings(run.RunID, "table")
-		if err != nil {
-			return Report{}, fmt.Errorf("report: list findings for run %s: %w", run.RunID, err)
+	findings := make(map[string][]model.Finding, len(jobs))
+	for _, job := range jobs {
+		if job.RunID == "" {
+			continue
 		}
-		findings[run.RunID] = fs
+		fs, err := st.ListFindings(job.RunID, "table")
+		if err != nil {
+			return Report{}, fmt.Errorf("report: list findings for job %s: %w", job.ID, err)
+		}
+		findings[job.RunID] = fs
 	}
 
-	return Report{Scan: sc, GeneratedAt: time.Now(), Checks: checks, ScanRuns: runs, Findings: findings}, nil
+	return Report{Case: c, Targets: targets, GeneratedAt: time.Now(), Checks: checks, Jobs: jobs, Findings: findings}, nil
 }
 
 // RenderJSON marshals the report as indented JSON.
@@ -82,42 +90,47 @@ func (r Report) findingCount() int {
 	return n
 }
 
-// checksByDomain groups checks by domain, apex first then alphabetically,
-// so the HTML report reads as one block per host instead of one flat list
-// interleaving apex and subdomain checks.
-func (r Report) checksByDomain() []domainChecks {
-	byDomain := map[string][]recon.Check{}
+// checksByTarget groups checks by target, in the case's target creation
+// order (falling back to alphabetical for a target with checks but no
+// corresponding Targets row, e.g. one from a deleted target), so the HTML
+// report reads as one block per target instead of one flat list.
+func (r Report) checksByTarget() []targetChecks {
+	byTarget := map[string][]recon.Check{}
 	for _, c := range r.Checks {
-		byDomain[c.Domain] = append(byDomain[c.Domain], c)
+		byTarget[c.Domain] = append(byTarget[c.Domain], c)
 	}
-	domains := make([]string, 0, len(byDomain))
-	for d := range byDomain {
-		domains = append(domains, d)
+	order := make([]string, 0, len(r.Targets))
+	seen := map[string]bool{}
+	for _, t := range r.Targets {
+		if _, ok := byTarget[t.Value]; ok && !seen[t.Value] {
+			order = append(order, t.Value)
+			seen[t.Value] = true
+		}
 	}
-	sort.Slice(domains, func(i, j int) bool {
-		if domains[i] == r.Scan.Domain {
-			return true
+	var rest []string
+	for target := range byTarget {
+		if !seen[target] {
+			rest = append(rest, target)
 		}
-		if domains[j] == r.Scan.Domain {
-			return false
-		}
-		return domains[i] < domains[j]
-	})
-	out := make([]domainChecks, 0, len(domains))
-	for _, d := range domains {
-		out = append(out, domainChecks{Domain: d, Checks: byDomain[d]})
+	}
+	sort.Strings(rest)
+	order = append(order, rest...)
+
+	out := make([]targetChecks, 0, len(order))
+	for _, target := range order {
+		out = append(out, targetChecks{Target: target, Checks: byTarget[target]})
 	}
 	return out
 }
 
-type domainChecks struct {
-	Domain string
+type targetChecks struct {
+	Target string
 	Checks []recon.Check
 }
 
 var reportTemplate = template.Must(template.New("report").Funcs(template.FuncMap{
 	"findingCount": func(r Report) int { return r.findingCount() },
-	"domains":      func(r Report) []domainChecks { return r.checksByDomain() },
+	"targets":      func(r Report) []targetChecks { return r.checksByTarget() },
 }).Parse(reportHTML))
 
 // RenderHTML executes the report template into a standalone HTML page (no

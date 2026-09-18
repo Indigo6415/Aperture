@@ -8,32 +8,24 @@ import (
 
 // upgrader allows any origin: the frontend dev server runs on a different
 // port than the backend, so a same-origin check would break local
-// development. Access itself is still gated -- both handlers below sit
-// behind requireAuth in server.go, same as every other /api and /ws route,
-// so an upgrade request without a valid session cookie never reaches here.
+// development. Access itself is still gated -- handleWatchJob sits behind
+// requireAuth in server.go, same as every other /api and /ws route, so an
+// upgrade request without a valid session cookie never reaches here.
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
-// handleWatchRun streams RunEvents for one flow run to a WebSocket client
-// in real time. Findings that arrived before the client connected are not
-// replayed here; the client fetches those via GET /api/runs/{id}/findings.
-func (s *Server) handleWatchRun(w http.ResponseWriter, r *http.Request) {
+// handleWatchJob streams RunEvents for one job (whatever its tool) to a
+// WebSocket client in real time. Events that arrived before the client
+// connected are not replayed here; the client fetches those via REST --
+// GET /api/jobs/{id} plus, for an engine-backed job, GET /api/runs/{runId}/
+// findings, or GET /api/cases/{id}/checks for an identify job.
+func (s *Server) handleWatchJob(w http.ResponseWriter, r *http.Request) {
 	s.watch(w, r, r.PathValue("id"))
 }
 
-// handleWatchScan streams RunEvents for one domain scan (recon checks) to a
-// WebSocket client in real time. Checks that completed before the client
-// connected are not replayed here; the client fetches those via
-// GET /api/scans/{id}.
-func (s *Server) handleWatchScan(w http.ResponseWriter, r *http.Request) {
-	s.watch(w, r, r.PathValue("id"))
-}
-
-// watch is the shared subscribe-and-relay loop behind both
-// handleWatchRun and handleWatchScan: the hub is keyed by an arbitrary
-// string ID (a runID or a scanID), so both watchers need identical plumbing
-// and differ only in which ID they subscribe to.
+// watch is the subscribe-and-relay loop behind handleWatchJob: the hub is
+// keyed by an arbitrary string ID (a jobID).
 func (s *Server) watch(w http.ResponseWriter, r *http.Request, id string) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {

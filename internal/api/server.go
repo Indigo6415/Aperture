@@ -25,12 +25,11 @@ type Server struct {
 	mux          *http.ServeMux
 	wordlistsDir string
 
-	// cancelMu guards scanCancels/runCancels, populated while a scan's recon
-	// phase (scanCancels) or a scanner run (runCancels) is in flight so
-	// handleCancelScan can stop them on demand -- see cancel.go.
-	cancelMu    sync.Mutex
-	scanCancels map[string]context.CancelFunc
-	runCancels  map[string]context.CancelFunc
+	// cancelMu guards jobCancels, populated while a job (engine-backed or
+	// identify) is in flight so handleCancelJob can stop it on demand --
+	// see cancel.go.
+	cancelMu   sync.Mutex
+	jobCancels map[string]context.CancelFunc
 
 	// screenshotSem bounds how many headless-Chrome screenshot captures run
 	// concurrently across the whole server (see captureScreenshot in
@@ -40,7 +39,7 @@ type Server struct {
 	screenshotSem chan struct{}
 
 	// techSem bounds how many technology-fingerprint -> CVE lookups
-	// (lookupTechCVEs in handlers_scan.go) run concurrently across the whole
+	// (lookupTechCVEs in identify.go) run concurrently across the whole
 	// server -- each one may call out to the rate-limited NVD API, so
 	// fanning one out per discovered host unbounded would just make every
 	// one of them queue behind NVD's own rate limit anyway.
@@ -65,8 +64,7 @@ func NewServer(st *store.Store, eng *engine.Engine, uiFS fs.FS, wordlistsDir str
 		hub:           newHub(),
 		mux:           http.NewServeMux(),
 		wordlistsDir:  wordlistsDir,
-		scanCancels:   map[string]context.CancelFunc{},
-		runCancels:    map[string]context.CancelFunc{},
+		jobCancels:    map[string]context.CancelFunc{},
 		screenshotSem: make(chan struct{}, maxConcurrentScreenshots),
 		techSem:       make(chan struct{}, maxConcurrentTechLookups),
 	}
@@ -87,18 +85,25 @@ func NewServer(st *store.Store, eng *engine.Engine, uiFS fs.FS, wordlistsDir str
 	s.mux.HandleFunc("PUT /api/settings/dnsdumpster-key", s.requireAuth(s.handleSetDNSDumpsterKey))
 	s.mux.HandleFunc("PUT /api/settings/nvd-key", s.requireAuth(s.handleSetNVDKey))
 
-	s.mux.HandleFunc("POST /api/scan", s.requireAuth(s.handleStartScan))
-	s.mux.HandleFunc("GET /api/scans", s.requireAuth(s.handleListScans))
-	s.mux.HandleFunc("GET /api/scans/{id}", s.requireAuth(s.handleGetScan))
-	s.mux.HandleFunc("GET /api/scans/{id}/runs", s.requireAuth(s.handleListScanRuns))
-	s.mux.HandleFunc("POST /api/scans/{id}/content-discovery", s.requireAuth(s.handleScanContentDiscovery))
-	s.mux.HandleFunc("POST /api/scans/{id}/restart", s.requireAuth(s.handleRestartScan))
-	s.mux.HandleFunc("POST /api/scans/{id}/runs/{kind}/restart", s.requireAuth(s.handleRestartScanRun))
-	s.mux.HandleFunc("POST /api/scans/{id}/cancel", s.requireAuth(s.handleCancelScan))
-	s.mux.HandleFunc("GET /api/scans/{id}/report", s.requireAuth(s.handleScanReport))
-	s.mux.HandleFunc("GET /api/scans/{id}/screenshots", s.requireAuth(s.handleListScreenshots))
-	s.mux.HandleFunc("GET /api/scans/{id}/screenshots/{hostname}", s.requireAuth(s.handleGetScreenshot))
-	s.mux.HandleFunc("GET /ws/scans/{id}", s.requireAuth(s.handleWatchScan))
+	s.mux.HandleFunc("POST /api/cases", s.requireAuth(s.handleStartCase))
+	s.mux.HandleFunc("GET /api/cases", s.requireAuth(s.handleListCases))
+	s.mux.HandleFunc("GET /api/cases/{id}", s.requireAuth(s.handleGetCase))
+	s.mux.HandleFunc("DELETE /api/cases/{id}", s.requireAuth(s.handleDeleteCase))
+	s.mux.HandleFunc("GET /api/cases/{id}/checks", s.requireAuth(s.handleListCaseChecks))
+	s.mux.HandleFunc("GET /api/cases/{id}/report", s.requireAuth(s.handleCaseReport))
+	s.mux.HandleFunc("GET /api/cases/{id}/screenshots", s.requireAuth(s.handleListCaseScreenshots))
+	s.mux.HandleFunc("GET /api/cases/{id}/screenshots/{target}", s.requireAuth(s.handleGetCaseScreenshot))
+
+	s.mux.HandleFunc("GET /api/cases/{id}/targets", s.requireAuth(s.handleListTargets))
+	s.mux.HandleFunc("POST /api/cases/{id}/targets", s.requireAuth(s.handleAddTarget))
+	s.mux.HandleFunc("POST /api/cases/{id}/targets/promote", s.requireAuth(s.handlePromoteTargets))
+	s.mux.HandleFunc("DELETE /api/targets/{id}", s.requireAuth(s.handleDeleteTarget))
+
+	s.mux.HandleFunc("GET /api/cases/{id}/jobs", s.requireAuth(s.handleListCaseJobs))
+	s.mux.HandleFunc("POST /api/cases/{id}/jobs", s.requireAuth(s.handleStartJob))
+	s.mux.HandleFunc("GET /api/jobs/{id}", s.requireAuth(s.handleGetJob))
+	s.mux.HandleFunc("POST /api/jobs/{id}/cancel", s.requireAuth(s.handleCancelJob))
+	s.mux.HandleFunc("GET /ws/jobs/{id}", s.requireAuth(s.handleWatchJob))
 
 	s.mux.HandleFunc("GET /api/wordlists", s.requireAuth(s.handleListWordlists))
 	s.mux.HandleFunc("GET /api/wordlists/catalog", s.requireAuth(s.handleWordlistCatalog))
@@ -109,7 +114,8 @@ func NewServer(st *store.Store, eng *engine.Engine, uiFS fs.FS, wordlistsDir str
 
 	s.mux.HandleFunc("GET /api/runs/{id}", s.requireAuth(s.handleGetRun))
 	s.mux.HandleFunc("GET /api/runs/{id}/findings", s.requireAuth(s.handleListFindings))
-	s.mux.HandleFunc("GET /ws/runs/{id}", s.requireAuth(s.handleWatchRun))
+
+	s.mux.HandleFunc("POST /api/jwt/scan", s.requireAuth(s.handleJWTScan))
 
 	if uiFS != nil {
 		s.mux.Handle("/", spaHandler(uiFS))

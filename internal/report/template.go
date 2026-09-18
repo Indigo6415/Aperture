@@ -6,7 +6,7 @@ const reportHTML = `<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
-<title>Aperture scan report: {{.Scan.Domain}}</title>
+<title>Aperture case report: {{.Case.Name}}</title>
 <style>
   body { font-family: -apple-system, Helvetica, Arial, sans-serif; color: #1a1a1a; margin: 2rem; }
   h1 { font-size: 1.4rem; margin-bottom: 0.1rem; }
@@ -23,17 +23,19 @@ const reportHTML = `<!doctype html>
 </style>
 </head>
 <body>
-  <h1>Scan report: {{.Scan.Domain}}</h1>
+  <h1>Case report: {{.Case.Name}}</h1>
+  {{if .Case.Description}}<div class="meta">{{.Case.Description}}</div>{{end}}
   <div class="meta">
-    Scan started {{.Scan.CreatedAt.Format "2006-01-02 15:04:05 MST"}} &middot;
+    Case created {{.Case.CreatedAt.Format "2006-01-02 15:04:05 MST"}} &middot;
     Report generated {{.GeneratedAt.Format "2006-01-02 15:04:05 MST"}} &middot;
-    {{findingCount .}} total finding(s) across {{len .ScanRuns}} scanner run(s)
+    {{len .Targets}} target(s) &middot;
+    {{findingCount .}} total finding(s) across {{len .Jobs}} job(s)
   </div>
 
-  <h2>Recon checks</h2>
-  {{range domains .}}
+  <h2>Identify checks</h2>
+  {{range targets .}}
   <div class="domain-block">
-    <strong>{{.Domain}}</strong>
+    <strong>{{.Target}}</strong>
     {{range .Checks}}
       <div><span class="badge {{if eq (print .Status) "error"}}badge-error{{else}}badge-done{{end}}">{{.Kind}}: {{.Status}}</span>
       {{if .Error}}{{.Error}}{{end}}</div>
@@ -41,13 +43,14 @@ const reportHTML = `<!doctype html>
   </div>
   {{end}}
 
-  <h2>Scanner runs</h2>
+  <h2>Jobs</h2>
   <table>
-    <thead><tr><th>Kind</th><th>Status</th><th>Started</th><th>Findings</th></tr></thead>
+    <thead><tr><th>Tool</th><th>Targets</th><th>Status</th><th>Started</th><th>Findings</th></tr></thead>
     <tbody>
-    {{range .ScanRuns}}
+    {{range .Jobs}}
       <tr>
-        <td>{{.Kind}}</td>
+        <td>{{.Tool}}</td>
+        <td>{{range $i, $t := .Targets}}{{if $i}}, {{end}}{{$t}}{{end}}</td>
         <td>{{.Status}}</td>
         <td>{{.CreatedAt.Format "2006-01-02 15:04:05"}}</td>
         <td>{{len (index $.Findings .RunID)}}</td>
@@ -56,10 +59,10 @@ const reportHTML = `<!doctype html>
     </tbody>
   </table>
 
-  {{range .ScanRuns}}
+  {{range .Jobs}}
   {{$fs := index $.Findings .RunID}}
   {{if $fs}}
-  <h2>{{.Kind}} findings</h2>
+  <h2>{{.Tool}} findings</h2>
   <table>
     <thead><tr><th>Status</th><th>URL</th><th>Size</th><th>Words</th><th>Lines</th><th>Tool</th></tr></thead>
     <tbody>

@@ -62,7 +62,7 @@ function clusterLabel(id: ClusterId, hosts: EstateHostModel[]): string {
 // one useScanGraph subscription it already holds for the retained `graph`
 // mode, instead of HierarchyView opening a second, redundant socket to the
 // same scan.
-export function buildEstateModel(nodes: GraphNode[], edges: GraphEdge[], domain: string): EstateModel {
+export function buildEstateModel(nodes: GraphNode[], edges: GraphEdge[], rootLabel: string): EstateModel {
   const nodeById = new Map(nodes.map((n) => [n.id, n]))
 
   const techByHost = new Map<string, TechDetection[]>()
@@ -96,7 +96,7 @@ export function buildEstateModel(nodes: GraphNode[], edges: GraphEdge[], domain:
 
   const byCluster = new Map<ClusterId, EstateHostModel[]>()
   for (const n of nodes) {
-    if (n.type !== 'subdomain') continue
+    if (n.type !== 'target') continue
     const technologies = techByHost.get(n.label) ?? []
     const exposedFiles = exposedFilesByHost.get(n.label) ?? 0
     const host: EstateHost = { hostname: n.label, technologies, exposedFiles }
@@ -139,12 +139,12 @@ export function buildEstateModel(nodes: GraphNode[], edges: GraphEdge[], domain:
   })
 
   const clusterPages = built.reduce((s, c) => s + c.pageCount, 0)
-  const apexPageCount = (pageCountByHost.get(domain) ?? 0) + clusterPages
+  const apexPageCount = (pageCountByHost.get(rootLabel) ?? 0) + clusterPages
   const apexHostCount = built.reduce((s, c) => s + c.hosts.length, 0)
 
   return {
     clusters: built,
-    apex: { hostname: domain, hostCount: apexHostCount, pageCount: apexPageCount, technologies: techByHost.get(domain) ?? [] },
+    apex: { hostname: rootLabel, hostCount: apexHostCount, pageCount: apexPageCount, technologies: techByHost.get(rootLabel) ?? [] },
   }
 }
 
@@ -153,8 +153,8 @@ export function buildEstateModel(nodes: GraphNode[], edges: GraphEdge[], domain:
 // it. GraphView doesn't use this (it shares one useScanGraph call across
 // both its modes via buildEstateModel directly); kept for any future
 // consumer that wants the hierarchy model on its own.
-export function useEstateModel(scanId: string, domain: string): EstateModel & { pageGroupsByHost: Map<string, PageGroup[]>; progress: { done: number; total: number } | null } {
-  const { nodes, edges, progress, pageGroupsByHost } = useScanGraph(scanId, domain)
-  const model = useMemo(() => buildEstateModel(nodes, edges, domain), [nodes, edges, domain])
+export function useEstateModel(caseId: string, caseLabel: string): EstateModel & { pageGroupsByHost: Map<string, PageGroup[]>; progress: { done: number; total: number } | null } {
+  const { nodes, edges, progress, pageGroupsByHost } = useScanGraph(caseId, caseLabel)
+  const model = useMemo(() => buildEstateModel(nodes, edges, caseLabel), [nodes, edges, caseLabel])
   return { ...model, pageGroupsByHost, progress }
 }

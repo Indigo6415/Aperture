@@ -50,10 +50,27 @@ type feroxResponse struct {
 	Headers       map[string]string `json:"headers"`
 }
 
-// feroxProgressEvery is how many parsed response lines pass between
-// progress callbacks, so a fast-running feroxbuster doesn't flood the hub
-// with one event per request.
-const feroxProgressEvery = 10
+// feroxProgressEvery is how many completed requests pass between progress
+// callbacks, so a fast-running feroxbuster doesn't flood the hub with one
+// event per request.
+const feroxProgressEvery = 25
+
+// feroxNoiseThreshold caps how many times an identical response shape
+// (status/size/words/lines) gets surfaced as a Finding before it's treated
+// as repeated noise -- almost always the same soft-404/error page --
+// rather than a distinct discovery. feroxbuster normally suppresses this
+// itself (its own auto-filter, "wildcard" detection), but that filter is
+// disabled below via --dont-filter so every completed request still
+// produces a "response" JSON line for accurate progress counting (see
+// reportProgress); without a stand-in dedup check here, a large wordlist's
+// uniform 404 page would otherwise flood the findings table with one row
+// per wordlist entry.
+const feroxNoiseThreshold = 3
+
+// feroxSignature identifies a response's shape for the noise check above.
+type feroxSignature struct {
+	status, size, words, lines int
+}
 
 func (a *FeroxbusterAdapter) Run(ctx context.Context, config json.RawMessage, meta RunMeta, emit Emit, progress Progress) error {
 	var cfg FeroxbusterConfig
@@ -76,7 +93,18 @@ func (a *FeroxbusterAdapter) Run(ctx context.Context, config json.RawMessage, me
 
 	// --no-state prevents feroxbuster from writing a state file to disk on
 	// every run, which otherwise accumulates and clogs up the file system.
-	args := []string{"-u", cfg.URL, "-w", cfg.Wordlist, "--json", "--silent", "--no-state"}
+	//
+	// --dont-filter disables feroxbuster's own auto-filter, which normally
+	// stops emitting "response" JSON lines for a repeated response shape
+	// (typically a uniform 404/error page) once it's seen a few times. That
+	// filter is meant to declutter human-facing output, but it also means
+	// "done" below -- counted from response lines -- would stall well
+	// short of the real request count on any target where most missing
+	// paths return an identical page, which is the common case. Passing
+	// --dont-filter trades that filter for feroxNoiseThreshold's cruder
+	// stand-in below, in exchange for "done" always reflecting real,
+	// live request throughput instead of silently going stale mid-scan.
+	args := []string{"-u", cfg.URL, "-w", cfg.Wordlist, "--json", "--silent", "--no-state", "--dont-filter"}
 	if cfg.Method != "" {
 		args = append(args, "-m", cfg.Method)
 	}
@@ -145,6 +173,7 @@ func (a *FeroxbusterAdapter) Run(ctx context.Context, config json.RawMessage, me
 	reportProgress(0)
 
 	done := 0
+	seen := map[feroxSignature]int{}
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
@@ -159,23 +188,32 @@ func (a *FeroxbusterAdapter) Run(ctx context.Context, config json.RawMessage, me
 		if resp.Type != "response" {
 			continue
 		}
-		emit(model.Finding{
-			ID:            newFindingID(),
-			URL:           resp.URL,
-			StatusCode:    resp.Status,
-			ContentLength: resp.ContentLength,
-			Words:         resp.WordCount,
-			Lines:         resp.LineCount,
-			ContentType:   resp.Headers["content-type"],
-			RedirectLoc:   resp.Headers["location"],
-			Method:        resp.Method,
-			Headers:       resp.Headers,
-			SourceTool:    a.Name(),
-			SourceNodeID:  meta.NodeID,
-			RunID:         meta.RunID,
-			Timestamp:     time.Now(),
-		})
+		// Every "response" line is now one completed request (see
+		// --dont-filter above), so this is a true, live count -- but that
+		// also means it includes the repeated soft-404/error-page hits
+		// feroxbuster used to hide; feroxNoiseThreshold below decides
+		// which of those still become a Finding.
 		done++
+		sig := feroxSignature{resp.Status, resp.ContentLength, resp.WordCount, resp.LineCount}
+		seen[sig]++
+		if seen[sig] <= feroxNoiseThreshold {
+			emit(model.Finding{
+				ID:            newFindingID(),
+				URL:           resp.URL,
+				StatusCode:    resp.Status,
+				ContentLength: resp.ContentLength,
+				Words:         resp.WordCount,
+				Lines:         resp.LineCount,
+				ContentType:   resp.Headers["content-type"],
+				RedirectLoc:   resp.Headers["location"],
+				Method:        resp.Method,
+				Headers:       resp.Headers,
+				SourceTool:    a.Name(),
+				SourceNodeID:  meta.NodeID,
+				RunID:         meta.RunID,
+				Timestamp:     time.Now(),
+			})
+		}
 		if done%feroxProgressEvery == 0 {
 			reportProgress(done)
 		}

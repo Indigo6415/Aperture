@@ -9,18 +9,23 @@ const (
 	PresetCustom     = "custom"
 )
 
-// ScanOptions is the per-scan tuning a scan can be started with, instead of
-// only the engine-wide defaults previously baked into buildContentDiscoveryFlow
-// etc.: thread count, per-request timeout, wordlist choice, and a rate
-// limit, plus an "aggressive"/"stealth" preset shorthand for the first
-// three. It's stored as opaque JSON on store.Scan and threaded through
-// every flow-builder in api/handlers_scan.go.
+// ScanOptions is the per-job tuning a job can be launched with: thread
+// count, per-request timeout, wordlist choice, and a rate limit, plus an
+// "aggressive"/"stealth" preset shorthand for the first three. It's stored
+// as opaque JSON on store.Job.Config and threaded through
+// api.buildToolFlow.
 type ScanOptions struct {
 	Preset         string `json:"preset,omitempty"`
 	Threads        int    `json:"threads,omitempty"`
 	TimeoutSeconds int    `json:"timeoutSeconds,omitempty"`
 	RateLimit      int    `json:"rateLimit,omitempty"` // requests/sec across the whole run; 0 = unlimited
 	Wordlist       string `json:"wordlist,omitempty"`  // explicit wordlist filename, overriding the usual category-tag selection
+	// Recursive is feroxbuster only: whether a found directory gets
+	// fuzzed again with the same wordlist. Defaults to false (off) --
+	// recursion multiplies request volume (and scan time) by however many
+	// directories turn up, which is surprising behavior to opt into
+	// silently.
+	Recursive bool `json:"recursive,omitempty"`
 }
 
 // presetDefaults backs each preset's Threads/TimeoutSeconds/RateLimit --

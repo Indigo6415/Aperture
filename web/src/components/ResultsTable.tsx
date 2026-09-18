@@ -6,6 +6,7 @@ import { isDangerousExtension } from '../extensions'
 import { api, screenshotPreviewEnabled } from '../api'
 import { FacetFilterBar, type FacetDimension } from './FacetFilterBar'
 import { copyToClipboard, useContextMenu } from '../contextMenu'
+import { sendToJwtScanner } from '../jwtHandoff'
 
 type SortKey = 'url' | 'statusCode' | 'extension' | 'contentLength' | 'words' | 'lines' | 'sourceTool'
 
@@ -65,28 +66,55 @@ function rowKey(f: Finding): string {
   return `${f.sourceNodeId}:${f.id}`
 }
 
+// defaultTargetValue is what a checked row promotes to when the caller
+// doesn't override it: the finding's hostname, or its full URL if it has
+// none (e.g. a malformed entry) -- good enough for ffuf subdomain/vhost
+// results, where the hostname is the thing worth re-scanning. A caller
+// scanning for re-scannable paths (feroxbuster) overrides this with the
+// full URL instead.
+function defaultTargetValue(f: Finding): string {
+  return hostnameOf(f.url) ?? f.url
+}
+
 export function ResultsTable({
   findings,
-  scanId,
+  caseId,
   facetPlacement = 'top',
+  selectable = false,
+  deriveTargetValue = defaultTargetValue,
+  onPromote,
 }: {
   findings: Finding[]
-  scanId?: string
+  caseId?: string
   // 'right' puts the FacetFilterBar in a sidebar next to the table instead
   // of a row above it -- used by the Content Discovery tab, which also
   // wants room above the table for its per-target progress panel.
   facetPlacement?: 'top' | 'right'
+  // selectable renders a checkbox column plus a "Save selected to case"
+  // toolbar action -- the promote-to-target flow. Off by default so a
+  // caller with no case context (there currently is none, but this keeps
+  // the component safe to reuse without a case) doesn't get a dead button.
+  selectable?: boolean
+  // deriveTargetValue is what a checked row promotes to -- defaults to the
+  // finding's hostname (right for ffuf subdomain/vhost results); a caller
+  // scanning for re-scannable paths (feroxbuster) overrides this to the
+  // full URL.
+  deriveTargetValue?: (f: Finding) => string
+  onPromote?: (values: string[]) => Promise<void> | void
 }) {
   // The Preview column only makes sense while the screenshot preview
   // feature is enabled -- otherwise every thumbnail would just be a
   // permanent placeholder for images the backend never captures.
-  const showPreview = Boolean(scanId) && screenshotPreviewEnabled
+  const showPreview = Boolean(caseId) && screenshotPreviewEnabled
+  const extraCols = (selectable ? 1 : 0) + (showPreview ? 1 : 0)
   const { openMenu } = useContextMenu()
   const [faceted, setFaceted] = useState<Finding[]>(findings)
   const [search, setSearch] = useState('')
   const [sortKey, setSortKey] = useState<SortKey>('statusCode')
   const [sortDir, setSortDir] = useState<1 | -1>(1)
   const [expanded, setExpanded] = useState<string | null>(null)
+  const [checked, setChecked] = useState<Set<string>>(new Set())
+  const [promoting, setPromoting] = useState(false)
 
   const rows = useMemo(() => {
     const needle = search.trim().toLowerCase()
@@ -108,6 +136,37 @@ export function ResultsTable({
     else {
       setSortKey(key)
       setSortDir(1)
+    }
+  }
+
+  const toggleChecked = (key: string) => {
+    setChecked((prev) => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }
+
+  const allVisibleChecked = rows.length > 0 && rows.every((f) => checked.has(rowKey(f)))
+  const toggleAllVisible = () => {
+    setChecked((prev) => {
+      const next = new Set(prev)
+      if (allVisibleChecked) rows.forEach((f) => next.delete(rowKey(f)))
+      else rows.forEach((f) => next.add(rowKey(f)))
+      return next
+    })
+  }
+
+  const promoteSelected = async () => {
+    if (!onPromote || checked.size === 0) return
+    setPromoting(true)
+    try {
+      const values = [...new Set(rows.filter((f) => checked.has(rowKey(f))).map(deriveTargetValue))]
+      await onPromote(values)
+      setChecked(new Set())
+    } finally {
+      setPromoting(false)
     }
   }
 
@@ -133,11 +192,25 @@ export function ResultsTable({
         <span className="text-xs text-neutral-500">
           {rows.length} of {findings.length} finding{findings.length === 1 ? '' : 's'}
         </span>
+        {selectable && (
+          <button
+            onClick={promoteSelected}
+            disabled={promoting || checked.size === 0}
+            className="ml-auto rounded bg-sky-600 px-3 py-1 text-xs font-medium text-white hover:bg-sky-500 disabled:opacity-50"
+          >
+            {promoting ? 'Saving…' : `Save selected to case (${checked.size})`}
+          </button>
+        )}
       </div>
       <div className="flex-1 overflow-auto">
         <table className="w-full text-left text-sm">
           <thead className="sticky top-0 bg-neutral-950">
             <tr>
+              {selectable && (
+                <th className="w-8 border-b border-neutral-800 px-3 py-2">
+                  <input type="checkbox" checked={allVisibleChecked} onChange={toggleAllVisible} className="accent-sky-500" />
+                </th>
+              )}
               {showPreview && (
                 <th className="border-b border-neutral-800 px-3 py-2 text-xs font-medium uppercase tracking-wide text-neutral-500">Preview</th>
               )}
@@ -168,15 +241,21 @@ export function ResultsTable({
                       openMenu(e, [
                         { label: 'Copy URL', onSelect: () => copyToClipboard(f.url, 'Copied URL') },
                         { label: 'Open in new tab', onSelect: () => window.open(f.url, '_blank', 'noopener,noreferrer') },
+                        { label: 'Send to JWT Scanner', onSelect: () => sendToJwtScanner(f.url) },
                         'separator',
                         { label: isExpanded ? 'Collapse details' : 'Expand details', onSelect: () => setExpanded(isExpanded ? null : key) },
                       ])
                     }}
                     className={`cursor-pointer border-b border-neutral-900 hover:bg-neutral-900/60 ${dangerous ? 'bg-red-950/20' : ''} ${isExpanded ? 'bg-neutral-900/80' : ''}`}
                   >
-                    {scanId && screenshotPreviewEnabled && (
+                    {selectable && (
+                      <td className="px-3 py-1.5" onClick={(e) => e.stopPropagation()}>
+                        <input type="checkbox" checked={checked.has(key)} onChange={() => toggleChecked(key)} className="accent-sky-500" />
+                      </td>
+                    )}
+                    {caseId && screenshotPreviewEnabled && (
                       <td className="px-3 py-1.5">
-                        <Thumbnail scanId={scanId} hostname={hostnameOf(f.url)} />
+                        <Thumbnail caseId={caseId} target={hostnameOf(f.url)} />
                       </td>
                     )}
                     <td className={`px-3 py-1.5 font-mono ${statusTextClass(f.statusCode)}`}>{f.statusCode}</td>
@@ -207,7 +286,7 @@ export function ResultsTable({
                   </tr>
                   {isExpanded && (
                     <tr className="border-b border-neutral-900 bg-neutral-950/60">
-                      <td colSpan={showPreview ? COLUMNS.length + 1 : COLUMNS.length} className="px-3 py-3">
+                      <td colSpan={COLUMNS.length + extraCols} className="px-3 py-3">
                         <FindingDetail finding={f} />
                       </td>
                     </tr>
@@ -217,7 +296,7 @@ export function ResultsTable({
             })}
             {rows.length === 0 && (
               <tr>
-                <td colSpan={showPreview ? COLUMNS.length + 1 : COLUMNS.length} className="px-3 py-8 text-center text-neutral-600">
+                <td colSpan={COLUMNS.length + extraCols} className="px-3 py-8 text-center text-neutral-600">
                   No findings yet
                 </td>
               </tr>
@@ -309,12 +388,12 @@ function DetailField({ label, value }: { label: string; value?: string }) {
 // host's HTTP recon check resolves a live URL. A host with none yet (still
 // capturing, or no headless-Chrome-compatible browser installed) renders
 // nothing rather than a broken-image icon.
-export function Thumbnail({ scanId, hostname }: { scanId: string; hostname?: string }) {
+export function Thumbnail({ caseId, target }: { caseId: string; target?: string }) {
   const [failed, setFailed] = useState(false)
-  if (!hostname || failed) return <div className="h-8 w-12 rounded bg-neutral-900" />
+  if (!target || failed) return <div className="h-8 w-12 rounded bg-neutral-900" />
   return (
     <img
-      src={api.screenshotUrl(scanId, hostname)}
+      src={api.screenshotUrl(caseId, target)}
       onError={() => setFailed(true)}
       loading="lazy"
       className="h-8 w-12 rounded-sm object-cover object-top"

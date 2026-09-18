@@ -8,13 +8,16 @@ import (
 	"github.com/Indigo6415/Aperture/internal/recon"
 )
 
-// RunEvent is one message streamed to WebSocket clients watching either a
-// flow run ("finding"/"status"/"done") or a domain scan ("check"/"scanRun"/
-// "done"). The hub itself doesn't care which -- it's keyed by an arbitrary
-// string ID (a runID or a scanID), so both kinds of watcher share the same
-// plumbing.
+// RunEvent is one message streamed to WebSocket clients watching one job,
+// whatever its tool: engine-backed jobs (feroxbuster/ffuf-subdomain/
+// ffuf-vhost) emit "finding"/"status"/"progress"; an identify job emits
+// "check"; every job emits a terminal "done". The hub itself doesn't care
+// which -- it's keyed by an arbitrary string ID (a jobID), so every kind of
+// watcher shares the same plumbing. There's no "a new job started"
+// announcement event: every job is launched explicitly by the client, which
+// already has its ID synchronously from the POST response that created it.
 type RunEvent struct {
-	Type    string            `json:"type"` // "finding" | "status" | "progress" | "check" | "scanRun" | "done"
+	Type    string            `json:"type"` // "finding" | "status" | "progress" | "check" | "done"
 	NodeID  string            `json:"nodeId,omitempty"`
 	Finding *model.Finding    `json:"finding,omitempty"`
 	Check   *recon.Check      `json:"check,omitempty"`
@@ -25,25 +28,10 @@ type RunEvent struct {
 	// render an indeterminate indicator rather than a percentage.
 	Done  int `json:"done,omitempty"`
 	Total int `json:"total,omitempty"`
-	// Kind/FlowID/RunID are set only on a "scanRun" event, published once
-	// one of a scan's scanners (content discovery, subdomain bruteforce,
-	// vhost bruteforce) has had its flow built and started, so the client
-	// knows which run to open GET /ws/runs/{runId} against and which
-	// scanner tab it belongs to.
-	Kind   string `json:"kind,omitempty"`
-	FlowID string `json:"flowId,omitempty"`
-	RunID  string `json:"runId,omitempty"`
-	// Targets is set only on a "scanRun" event for a scanner with a
-	// per-target concept (content discovery) -- the same list stored on
-	// the run (store.ScanRun.Targets), in the order used to build that
-	// run's flow nodes (ffuf-<i>/feroxbuster-<i> for targets[i]), so a
-	// client can group per-node progress into one bar per target without
-	// fetching the flow itself.
-	Targets []string `json:"targets,omitempty"`
 }
 
-// hub fans out RunEvents to any number of WebSocket subscribers per run.
-// A run that finishes before a client connects is fine: the client only
+// hub fans out RunEvents to any number of WebSocket subscribers per job.
+// A job that finishes before a client connects is fine: the client only
 // misses live events, and can always fetch accumulated findings via REST.
 type hub struct {
 	mu   sync.Mutex

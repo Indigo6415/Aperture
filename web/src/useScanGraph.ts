@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { SimulationNodeDatum, SimulationLinkDatum } from 'd3-force'
-import { api, watchRun, watchScan } from './api'
-import type { Check, CVE, Finding, RunStatus, ScanKind, TechDetection } from './types'
+import { api, watchJob } from './api'
+import type { Check, CVE, Finding, Job, RunStatus, TechDetection } from './types'
 import { hostnameOf, extensionOf } from './url'
 import { isDangerousExtension } from './extensions'
 
-export type GraphNodeType = 'website' | 'subdomain' | 'page' | 'technology'
+export type GraphNodeType = 'case' | 'target' | 'page' | 'technology'
 
 export interface GraphNode extends SimulationNodeDatum {
   id: string
@@ -39,9 +39,9 @@ export interface PageGroup {
 
 const MAX_PAGE_GROUPS = 9
 
-const websiteId = (scanId: string) => `scan:${scanId}`
-const hostId = (scanId: string, hostname: string) => `host:${scanId}:${hostname}`
-const techNodeId = (scanId: string, hostname: string, techName: string) => `tech:${scanId}:${hostname}:${techName}`
+const caseNodeId = (caseId: string) => `case:${caseId}`
+const targetNodeId = (caseId: string, value: string) => `target:${caseId}:${value}`
+const techNodeId = (caseId: string, value: string, techName: string) => `tech:${caseId}:${value}:${techName}`
 
 // pathPatternOf collapses a URL path down to its first segment, the same
 // granularity a directory-bruteforce result is actually shaped by (e.g.
@@ -54,7 +54,7 @@ function pathPatternOf(pathname: string): string {
   return '/' + segments[0] + '/*'
 }
 
-// bucketPageGroups turns one host's raw content-discovery findings into the
+// bucketPageGroups turns one target's raw feroxbuster findings into the
 // page-group panel's rows: dangerous-extension 200 hits stay one row each
 // (never merged into a pattern bucket, since each is individually worth
 // looking at), everything else buckets by pathPatternOf. Capped at
@@ -106,17 +106,21 @@ function bucketPageGroups(findings: Finding[]): PageGroup[] {
   return [...dangerousRows, ...topPatterns].sort((a, b) => b.count - a.count)
 }
 
-// useScanGraph builds a live node/edge graph for exactly one scan --
-// one website node for the apex domain, one subdomain node per hostname
-// discovered (passively via crt.sh or actively via bruteforce), and one
-// page node per content-discovery finding -- staying live via the same
-// watchScan/watchRun WebSockets ScanView itself uses. Shared by the
-// full-page GraphView and the small preview embedded in a scan's
-// Overview tab, so both stay in sync with exactly one implementation of
-// "what does this scan's graph look like."
+// POLL_MS is how often this hook re-fetches the case's target list --
+// there's no live "target added" websocket event (promotion is a plain
+// REST call), so a light poll is simpler than plumbing a bespoke one.
+const POLL_MS = 4000
+
+// useScanGraph builds a live node/edge graph for exactly one case -- one
+// case node at the root, one target node per case Target, a technology node
+// per fingerprinted technology an identify job found on a target, and a
+// page node per feroxbuster finding under a target. Shared by the full-page
+// GraphView and the small preview embedded in a case's Overview area, so
+// both stay in sync with exactly one implementation of "what does this
+// case's graph look like."
 export function useScanGraph(
-  scanId: string,
-  domain: string,
+  caseId: string,
+  caseLabel: string,
 ): {
   nodes: GraphNode[]
   edges: GraphEdge[]
@@ -125,17 +129,17 @@ export function useScanGraph(
 } {
   const nodesRef = useRef(new Map<string, GraphNode>())
   const edgesRef = useRef(new Map<string, GraphEdge>())
-  // Raw content-discovery findings per hostname, kept alongside nodesRef
-  // purely to feed bucketPageGroups above -- the page GraphNodes themselves
-  // don't carry enough (no hostname, no raw path) to re-bucket from.
+  // Raw feroxbuster findings per target, kept alongside nodesRef purely to
+  // feed bucketPageGroups above -- the page GraphNodes themselves don't
+  // carry enough (no hostname, no raw path) to re-bucket from.
   const findingsRef = useRef(new Map<string, Finding[]>())
   const stopFns = useRef(new Map<string, () => void>())
-  // Progress/status per run, tracked alongside nodes/edges above so the
-  // overall "how's this scan doing" bar (ScanView's header, GraphView's
-  // toolbar) can reuse the same watchRun sockets already open here instead
+  // Progress/status per job, tracked alongside nodes/edges above so the
+  // overall "how's this case doing" bar (CaseView's header, GraphView's
+  // toolbar) can reuse the same watchJob sockets already open here instead
   // of opening a second set just to hear progress events.
-  const runStatusRef = useRef(new Map<string, RunStatus>())
-  const runProgressRef = useRef(new Map<string, { done: number; total: number }>())
+  const jobStatusRef = useRef(new Map<string, RunStatus>())
+  const jobProgressRef = useRef(new Map<string, { done: number; total: number }>())
   const bumpScheduled = useRef(false)
   const [version, setVersion] = useState(0)
 
@@ -149,20 +153,22 @@ export function useScanGraph(
   }
 
   useEffect(() => {
-    if (!scanId || !domain) return
+    if (!caseId) return
+    let cancelled = false
     nodesRef.current = new Map()
     edgesRef.current = new Map()
     findingsRef.current = new Map()
-    runStatusRef.current = new Map()
-    runProgressRef.current = new Map()
+    jobStatusRef.current = new Map()
+    jobProgressRef.current = new Map()
     setVersion((v) => v + 1)
 
-    const ensureSubdomainNode = (hostname: string): string => {
-      const id = hostId(scanId, hostname)
+    const rootId = caseNodeId(caseId)
+    const ensureTargetNode = (value: string): string => {
+      const id = targetNodeId(caseId, value)
       if (!nodesRef.current.has(id)) {
-        nodesRef.current.set(id, { id, type: 'subdomain', label: hostname })
-        const edgeId = `e:${websiteId(scanId)}->${id}`
-        edgesRef.current.set(edgeId, { id: edgeId, source: websiteId(scanId), target: id })
+        nodesRef.current.set(id, { id, type: 'target', label: value })
+        const edgeId = `e:${rootId}->${id}`
+        edgesRef.current.set(edgeId, { id: edgeId, source: rootId, target: id })
       }
       return id
     }
@@ -170,44 +176,37 @@ export function useScanGraph(
     const applyCheck = (check: Check) => {
       if (check.status !== 'done') return
       if (check.kind === 'http') {
-        // Stamps the website/subdomain node's own statusCode (distinct from
-        // a page node's) -- mutated in place like GraphCanvas's d3 x/y are,
-        // since the node object's identity is what callers (and the force
-        // simulation) hold onto.
-        const hostname = check.domain
-        const hostNodeId = hostname === domain ? websiteId(scanId) : ensureSubdomainNode(hostname)
-        const node = nodesRef.current.get(hostNodeId)
+        const nodeId = ensureTargetNode(check.domain)
+        const node = nodesRef.current.get(nodeId)
         if (node) node.statusCode = check.data?.statusCode as number | undefined
         return
       }
       if (check.kind === 'technologies') {
-        const hostname = check.domain
-        const hostNodeId = hostname === domain ? websiteId(scanId) : ensureSubdomainNode(hostname)
+        const hostNodeId = ensureTargetNode(check.domain)
         const technologies = (check.data?.technologies as TechDetection[] | undefined) ?? []
         for (const t of technologies) {
-          const id = techNodeId(scanId, hostname, t.name)
-          nodesRef.current.set(id, { id, type: 'technology', label: t.name, host: hostname, category: t.category, cves: t.cves })
+          const id = techNodeId(caseId, check.domain, t.name)
+          nodesRef.current.set(id, { id, type: 'technology', label: t.name, host: check.domain, category: t.category, cves: t.cves })
           const edgeId = `e:${hostNodeId}->${id}`
           edgesRef.current.set(edgeId, { id: edgeId, source: hostNodeId, target: id })
         }
         return
       }
-      if (check.kind !== 'subdomains') return
+      if (check.kind !== 'subdomains-verified') return
       const hostnames = (check.data?.subdomains as string[] | undefined) ?? []
-      for (const h of hostnames) ensureSubdomainNode(h)
+      for (const h of hostnames) ensureTargetNode(h)
     }
 
-    const applyFinding = (kind: ScanKind, f: Finding) => {
+    const applyFinding = (f: Finding) => {
       const hostname = hostnameOf(f.url)
       if (!hostname) return
-      const hostNodeId = hostname === domain ? websiteId(scanId) : ensureSubdomainNode(hostname)
-      if (kind !== 'content-discovery') return
+      const hostNodeId = ensureTargetNode(hostname)
 
       // Keyed by URL (not finding.id, which is a fresh random id every time
       // a finding is emitted) so re-discovering the same page across a
-      // restart or an additional "scan selected" run updates one node
-      // instead of piling up a duplicate for every observation.
-      const pageId = `page:${scanId}:${f.url}`
+      // second job against the same target updates one node instead of
+      // piling up a duplicate for every observation.
+      const pageId = `page:${caseId}:${f.url}`
       if (nodesRef.current.has(pageId)) return
       let label = f.url
       try {
@@ -226,68 +225,82 @@ export function useScanGraph(
       findingsRef.current.set(hostname, list)
     }
 
-    const startWatchingRun = (kind: ScanKind, runId: string) => {
-      const key = `run:${runId}`
+    // watchTheJob mirrors CaseView's own per-job wiring, but only cares
+    // about feroxbuster jobs' findings (page nodes) and every job's
+    // status/progress (for the overall bar) -- identify jobs' checks stream
+    // separately below.
+    const watchTheJob = (job: Job) => {
+      const key = `job:${job.id}`
       if (stopFns.current.has(key)) return
-      runStatusRef.current.set(runId, 'running')
-      api.listFindings(runId).then((findings) => {
-        for (const f of findings) applyFinding(kind, f)
-        bump()
-      })
-      api.getRun(runId).then((r) => {
-        runStatusRef.current.set(runId, r.status)
-        bump()
-      })
+      jobStatusRef.current.set(job.id, job.status)
+      if (job.tool === 'feroxbuster' && job.runId) {
+        api.listFindings(job.runId).then((findings) => {
+          if (cancelled) return
+          for (const f of findings) applyFinding(f)
+          bump()
+        })
+      }
       stopFns.current.set(
         key,
-        watchRun(runId, (ev) => {
-          if (ev.type === 'finding' && ev.finding) {
-            applyFinding(kind, ev.finding)
+        watchJob(job.id, (ev) => {
+          if (ev.type === 'finding' && ev.finding && job.tool === 'feroxbuster') {
+            applyFinding(ev.finding)
             bump()
           } else if (ev.type === 'progress') {
-            runProgressRef.current.set(runId, { done: ev.done ?? 0, total: ev.total ?? 0 })
+            jobProgressRef.current.set(job.id, { done: ev.done ?? 0, total: ev.total ?? 0 })
+            bump()
+          } else if (ev.type === 'check' && ev.check) {
+            applyCheck(ev.check)
             bump()
           } else if (ev.type === 'done') {
-            runStatusRef.current.set(runId, ev.status === 'failed' ? 'failed' : ev.status === 'cancelled' ? 'cancelled' : 'succeeded')
+            jobStatusRef.current.set(job.id, ev.status === 'failed' ? 'failed' : ev.status === 'cancelled' ? 'cancelled' : 'succeeded')
             bump()
           }
         }),
       )
     }
 
-    nodesRef.current.set(websiteId(scanId), { id: websiteId(scanId), type: 'website', label: domain })
+    nodesRef.current.set(rootId, { id: rootId, type: 'case', label: caseLabel || caseId })
     bump()
 
-    api.getScan(scanId).then((full) => {
-      for (const c of full.checks ?? []) applyCheck(c)
-      bump()
-    })
-    api.listScanRuns(scanId).then((runs) => {
-      for (const r of runs) startWatchingRun(r.kind, r.runId)
-    })
+    const refreshTargetsAndChecks = () => {
+      api.listTargets(caseId).then((targets) => {
+        if (cancelled) return
+        for (const t of targets) ensureTargetNode(t.value)
+        bump()
+      })
+      api.listCaseChecks(caseId).then((checks) => {
+        if (cancelled) return
+        for (const c of checks) applyCheck(c)
+        bump()
+      })
+    }
+    refreshTargetsAndChecks()
+    const pollTimer = setInterval(refreshTargetsAndChecks, POLL_MS)
 
-    stopFns.current.set(
-      `scan:${scanId}`,
-      watchScan(scanId, (ev) => {
-        if (ev.type === 'check' && ev.check) {
-          applyCheck(ev.check)
-          bump()
-        } else if (ev.type === 'scanRun' && ev.kind && ev.runId) {
-          startWatchingRun(ev.kind, ev.runId)
-        }
-      }),
-    )
+    const refreshJobs = () => {
+      api.listJobs(caseId).then((jobs) => {
+        if (cancelled) return
+        for (const j of jobs) watchTheJob(j)
+      })
+    }
+    refreshJobs()
+    const jobPollTimer = setInterval(refreshJobs, POLL_MS)
 
     return () => {
+      cancelled = true
+      clearInterval(pollTimer)
+      clearInterval(jobPollTimer)
       // stopFns is a plain mutable ref (not a DOM/component ref), so
       // reading .current here in cleanup is safe -- it holds whatever
-      // watchScan/watchRun subscriptions this same effect instance opened.
+      // watchJob subscriptions this same effect instance opened.
       // eslint-disable-next-line react-hooks/exhaustive-deps
       for (const stop of stopFns.current.values()) stop()
       // eslint-disable-next-line react-hooks/exhaustive-deps
       stopFns.current.clear()
     }
-  }, [scanId, domain])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [caseId, caseLabel])
 
   // version is a plain counter bumped whenever nodesRef/edgesRef (mutable
   // refs, not state) change -- it's the trigger to re-derive these arrays,
@@ -297,21 +310,21 @@ export function useScanGraph(
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const edges = useMemo(() => Array.from(edgesRef.current.values()), [version])
 
-  // progress sums done/total across every run still marked "running" --
+  // progress sums done/total across every job still marked "running" --
   // null (not just zero) once nothing is running, so callers can tell
-  // "finished" apart from "0 of 0 so far." Same indeterminate rule as
-  // ScanView's per-kind aggregation: any contributing run with an unknowable
-  // total (total === 0, e.g. feroxbuster) makes the whole aggregate
-  // indeterminate rather than reporting a misleadingly small total.
+  // "finished" apart from "0 of 0 so far." Any contributing job with an
+  // unknowable total (total === 0, e.g. feroxbuster) makes the whole
+  // aggregate indeterminate rather than reporting a misleadingly small
+  // total.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const progress = useMemo(() => {
-    const runningIds = [...runStatusRef.current.entries()].filter(([, s]) => s === 'running').map(([id]) => id)
+    const runningIds = [...jobStatusRef.current.entries()].filter(([, s]) => s === 'running').map(([id]) => id)
     if (runningIds.length === 0) return null
     let done = 0
     let total = 0
     let indeterminate = false
     for (const id of runningIds) {
-      const p = runProgressRef.current.get(id)
+      const p = jobProgressRef.current.get(id)
       if (!p) {
         indeterminate = true
         continue
@@ -323,9 +336,10 @@ export function useScanGraph(
     return { done, total: indeterminate ? 0 : total }
   }, [version])
 
-  // pageGroupsByHost re-buckets every host's findingsRef entry whenever the
-  // graph changes -- see bucketPageGroups above. Cheap enough to recompute
-  // wholesale on each bump rather than tracking per-host dirtiness.
+  // pageGroupsByHost re-buckets every target's findingsRef entry whenever
+  // the graph changes -- see bucketPageGroups above. Cheap enough to
+  // recompute wholesale on each bump rather than tracking per-target
+  // dirtiness.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const pageGroupsByHost = useMemo(() => {
     const result = new Map<string, PageGroup[]>()

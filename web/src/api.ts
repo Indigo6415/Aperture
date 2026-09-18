@@ -1,17 +1,21 @@
 import type {
   AuthUser,
+  Case,
+  CaseSummary,
+  Check,
   Finding,
+  Job,
+  JobOptions,
+  JobStartResult,
+  JwtScanRequest,
+  JwtScanResponse,
   Run,
   RunEvent,
-  Scan,
-  ScanEvent,
-  ScanKind,
-  ScanOptions,
-  ScanRun,
-  ScanRunStartResult,
-  ScanSummary,
   ScreenshotMeta,
   SettingsInfo,
+  Target,
+  TargetKind,
+  Tool,
   ToolInfo,
   WordlistCatalogEntry,
   WordlistCategory,
@@ -67,24 +71,45 @@ export const api = {
   listFindings: (runId: string, nodeId?: string) =>
     req<Finding[]>(`/api/runs/${runId}/findings${nodeId ? `?nodeId=${encodeURIComponent(nodeId)}` : ''}`),
 
-  startScan: (domain: string, options?: ScanOptions) =>
-    req<{ scanId: string }>('/api/scan', { method: 'POST', body: JSON.stringify({ domain, options }) }),
-  listScans: () => req<ScanSummary[]>('/api/scans'),
-  getScan: (id: string) => req<Scan>(`/api/scans/${id}`),
-  listScanRuns: (scanId: string) => req<ScanRun[]>(`/api/scans/${scanId}/runs`),
-  runContentDiscovery: (scanId: string, targets: string[]) =>
-    req<ScanRunStartResult>(`/api/scans/${scanId}/content-discovery`, { method: 'POST', body: JSON.stringify({ targets }) }),
-  restartScan: (scanId: string) => req<{ scanId: string }>(`/api/scans/${scanId}/restart`, { method: 'POST' }),
-  cancelScan: (scanId: string) => req<void>(`/api/scans/${scanId}/cancel`, { method: 'POST' }),
-  restartScanRun: (scanId: string, kind: ScanKind, targets?: string[]) =>
-    req<ScanRunStartResult>(`/api/scans/${scanId}/runs/${kind}/restart`, {
-      method: 'POST',
-      body: targets ? JSON.stringify({ targets }) : undefined,
-    }),
+  createCase: (name: string, description?: string) =>
+    req<{ caseId: string }>('/api/cases', { method: 'POST', body: JSON.stringify({ name, description }) }),
+  listCases: () => req<CaseSummary[]>('/api/cases'),
+  getCase: (id: string) => req<Case>(`/api/cases/${id}`),
+  deleteCase: (id: string) => req<void>(`/api/cases/${id}`, { method: 'DELETE' }),
+  listCaseChecks: (caseId: string) => req<Check[]>(`/api/cases/${caseId}/checks`),
+  reportUrl: (caseId: string, format: 'json' | 'html' | 'pdf') => `/api/cases/${caseId}/report?format=${format}`,
 
-  listScreenshots: (scanId: string) => req<ScreenshotMeta[]>(`/api/scans/${scanId}/screenshots`),
-  screenshotUrl: (scanId: string, hostname: string) => `/api/scans/${scanId}/screenshots/${encodeURIComponent(hostname)}`,
-  reportUrl: (scanId: string, format: 'json' | 'html' | 'pdf') => `/api/scans/${scanId}/report?format=${format}`,
+  listTargets: (caseId: string) => req<Target[]>(`/api/cases/${caseId}/targets`),
+  addTarget: (caseId: string, value: string, kind?: TargetKind, notes?: string) =>
+    req<Target>(`/api/cases/${caseId}/targets`, { method: 'POST', body: JSON.stringify({ value, kind, notes }) }),
+  promoteTargets: (caseId: string, jobId: string, values: string[]) =>
+    req<Target[]>(`/api/cases/${caseId}/targets/promote`, { method: 'POST', body: JSON.stringify({ jobId, values }) }),
+  deleteTarget: (id: string) => req<void>(`/api/targets/${id}`, { method: 'DELETE' }),
+
+  listJobs: (caseId: string) => req<Job[]>(`/api/cases/${caseId}/jobs`),
+  startJob: (caseId: string, tool: Tool, targets: string[], options?: JobOptions) =>
+    req<JobStartResult>(`/api/cases/${caseId}/jobs`, {
+      method: 'POST',
+      body: JSON.stringify({
+        tool,
+        targets,
+        options: {
+          preset: options?.preset,
+          threads: options?.threads,
+          timeoutSeconds: options?.timeoutSeconds,
+          rateLimit: options?.rateLimit,
+          wordlist: options?.wordlist,
+          recursive: options?.recursive,
+        },
+        scheme: options?.scheme,
+        hostSuffix: options?.hostSuffix,
+      }),
+    }),
+  getJob: (jobId: string) => req<Job>(`/api/jobs/${jobId}`),
+  cancelJob: (jobId: string) => req<void>(`/api/jobs/${jobId}/cancel`, { method: 'POST' }),
+
+  listScreenshots: (caseId: string) => req<ScreenshotMeta[]>(`/api/cases/${caseId}/screenshots`),
+  screenshotUrl: (caseId: string, target: string) => `/api/cases/${caseId}/screenshots/${encodeURIComponent(target)}`,
 
   listWordlists: () => req<WordlistInfo[]>('/api/wordlists'),
   wordlistCatalog: () => req<WordlistCatalogEntry[]>('/api/wordlists/catalog'),
@@ -101,31 +126,18 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ newName, categories }),
     }),
+
+  jwtScan: (scanReq: JwtScanRequest) => req<JwtScanResponse>('/api/jwt/scan', { method: 'POST', body: JSON.stringify(scanReq) }),
 }
 
-// watchRun opens a WebSocket streaming live RunEvents for one run and
-// returns a cleanup function. Reconnection is intentionally not handled
-// here: a run is a one-shot process, and REST (listFindings/getRun) is
-// always available as a fallback if the socket drops.
-export function watchRun(runId: string, onEvent: (ev: RunEvent) => void): () => void {
+// watchJob opens a WebSocket streaming live RunEvents for one job (whatever
+// its tool) and returns a cleanup function. Reconnection is intentionally
+// not handled here: a job is a one-shot process, and REST (listFindings/
+// getJob/listCaseChecks) is always available as a fallback if the socket
+// drops.
+export function watchJob(jobId: string, onEvent: (ev: RunEvent) => void): () => void {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
-  const ws = new WebSocket(`${proto}//${location.host}/ws/runs/${runId}`)
-  ws.onmessage = (ev) => {
-    try {
-      onEvent(JSON.parse(ev.data))
-    } catch {
-      // ignore malformed frames
-    }
-  }
-  return () => ws.close()
-}
-
-// watchScan opens a WebSocket streaming live ScanEvents (recon checks, then
-// a "scanRun" event per scanner once its flow starts) for one scan and
-// returns a cleanup function, mirroring watchRun above.
-export function watchScan(scanId: string, onEvent: (ev: ScanEvent) => void): () => void {
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
-  const ws = new WebSocket(`${proto}//${location.host}/ws/scans/${scanId}`)
+  const ws = new WebSocket(`${proto}//${location.host}/ws/jobs/${jobId}`)
   ws.onmessage = (ev) => {
     try {
       onEvent(JSON.parse(ev.data))

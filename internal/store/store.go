@@ -95,50 +95,79 @@ CREATE TABLE IF NOT EXISTS findings (
 CREATE INDEX IF NOT EXISTS idx_findings_run_id ON findings(run_id);
 CREATE INDEX IF NOT EXISTS idx_findings_node_id ON findings(run_id, node_id);
 
-CREATE TABLE IF NOT EXISTS scans (
+-- A Case is a named container the user builds up over time: targets they've
+-- added or promoted, and jobs (tool runs) launched against them. Nothing
+-- about a case is tied to a single domain -- that's the whole point of the
+-- redesign away from the old one-domain-per-scan model.
+CREATE TABLE IF NOT EXISTS cases (
 	id TEXT PRIMARY KEY,
-	domain TEXT NOT NULL,
-	scheme TEXT,
-	created_at DATETIME NOT NULL
+	name TEXT NOT NULL,
+	description TEXT,
+	created_at DATETIME NOT NULL,
+	updated_at DATETIME NOT NULL
 );
 
--- One scan fans out into several independently-run scanners (content
--- discovery, subdomain bruteforce, vhost bruteforce); content discovery in
--- particular can accumulate more than one run as the user rescans a
--- filtered subdomain selection, so this is a scan -> many-runs table rather
--- than columns on scans itself.
-CREATE TABLE IF NOT EXISTS scan_runs (
-	scan_id TEXT NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
-	kind TEXT NOT NULL,
-	flow_id TEXT NOT NULL,
-	run_id TEXT NOT NULL,
-	targets TEXT,
-	created_at DATETIME NOT NULL
+-- A target is any host/URL/IP the user has explicitly added to a case,
+-- either typed by hand or promoted from a job's results (see
+-- api.handlePromoteTargets). UNIQUE(case_id, value) makes promoting an
+-- already-known value a harmless no-op via INSERT OR IGNORE rather than a
+-- duplicate row.
+CREATE TABLE IF NOT EXISTS targets (
+	id TEXT PRIMARY KEY,
+	case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+	value TEXT NOT NULL,
+	kind TEXT,
+	source_tool TEXT,
+	source_job_id TEXT,
+	notes TEXT,
+	created_at DATETIME NOT NULL,
+	UNIQUE(case_id, value)
 );
-CREATE INDEX IF NOT EXISTS idx_scan_runs_scan_id ON scan_runs(scan_id);
+CREATE INDEX IF NOT EXISTS idx_targets_case_id ON targets(case_id);
 
-CREATE TABLE IF NOT EXISTS scan_checks (
-	scan_id TEXT NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
-	domain TEXT NOT NULL,
+-- A job is one user-launched tool run against one or more targets --
+-- feroxbuster/ffuf-subdomain/ffuf-vhost jobs drive an engine.Flow (flow_id/
+-- run_id set); an identify job runs internal/recon directly and has no flow
+-- underneath (flow_id/run_id left empty), see api.runIdentifyJob.
+CREATE TABLE IF NOT EXISTS jobs (
+	id TEXT PRIMARY KEY,
+	case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+	tool TEXT NOT NULL,
+	flow_id TEXT,
+	run_id TEXT,
+	targets TEXT NOT NULL,
+	config TEXT,
+	status TEXT NOT NULL,
+	error TEXT,
+	created_at DATETIME NOT NULL,
+	finished_at DATETIME
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_case_id ON jobs(case_id);
+
+CREATE TABLE IF NOT EXISTS case_checks (
+	case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+	target TEXT NOT NULL,
 	kind TEXT NOT NULL,
 	status TEXT NOT NULL,
 	data TEXT,
 	error TEXT,
+	job_id TEXT NOT NULL,
 	started_at DATETIME NOT NULL,
 	finished_at DATETIME,
-	PRIMARY KEY (scan_id, domain, kind)
+	PRIMARY KEY (case_id, target, kind)
 );
-CREATE INDEX IF NOT EXISTS idx_scan_checks_scan_id ON scan_checks(scan_id);
+CREATE INDEX IF NOT EXISTS idx_case_checks_case_id ON case_checks(case_id);
 
--- One screenshot per scan+hostname, captured opportunistically once a host's
--- HTTP recon check resolves a live URL for it (see api.captureScreenshot).
-CREATE TABLE IF NOT EXISTS screenshots (
-	scan_id TEXT NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
-	hostname TEXT NOT NULL,
+-- One screenshot per case+target, captured opportunistically by an identify
+-- job once a target's HTTP check resolves a live URL for it (see
+-- api.captureScreenshot). Currently unused: screenshotPreviewEnabled is off.
+CREATE TABLE IF NOT EXISTS case_screenshots (
+	case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+	target TEXT NOT NULL,
 	url TEXT NOT NULL,
 	image BLOB NOT NULL,
 	captured_at DATETIME NOT NULL,
-	PRIMARY KEY (scan_id, hostname)
+	PRIMARY KEY (case_id, target)
 );
 
 -- App-wide key/value settings (e.g. the DNSDumpster API key) -- deliberately
@@ -182,21 +211,6 @@ CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
 	_, err := s.db.Exec(schema)
 	if err != nil {
 		return fmt.Errorf("store: migrate: %w", err)
-	}
-	// Columns added after the tables above first shipped; ALTER TABLE ADD
-	// COLUMN is the only way to bring an existing on-disk database forward
-	// since CREATE TABLE IF NOT EXISTS never alters an existing table. The
-	// "duplicate column" error is SQLite's way of saying "already migrated",
-	// which is expected and fine on every run after the first.
-	alters := []string{
-		`ALTER TABLE scans ADD COLUMN scheme TEXT`,
-		`ALTER TABLE scans ADD COLUMN options TEXT`,
-		`ALTER TABLE scan_runs ADD COLUMN targets TEXT`,
-	}
-	for _, stmt := range alters {
-		if _, err := s.db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
-			return fmt.Errorf("store: migrate: %s: %w", stmt, err)
-		}
 	}
 	return nil
 }
@@ -359,243 +373,313 @@ func (s *Store) ListFindings(runID, nodeID string) ([]model.Finding, error) {
 	return out, rows.Err()
 }
 
-// --- Scans ---
+// --- Cases ---
 
-// Scan is one "enter a domain" dashboard run: the recon checks plus every
-// scanner (content discovery, subdomain bruteforce, vhost bruteforce) it
-// kicks off alongside them -- see ScanRun for those. Scheme is empty until
-// the apex HTTP check resolves it (see api.runScan), so callers should
-// tolerate it being unset for a brief window right after creation.
-type Scan struct {
-	ID        string    `json:"id"`
-	Domain    string    `json:"domain"`
-	Scheme    string    `json:"scheme,omitempty"`
-	Options   string    `json:"options,omitempty"` // raw JSON (engine.ScanOptions); opaque to store
-	CreatedAt time.Time `json:"createdAt"`
+// Case is a named container the user builds up over time: a set of Targets
+// plus every Job launched against them. Unlike the old Scan, a Case has no
+// single domain of its own.
+type Case struct {
+	ID          string    `json:"id"`
+	Name        string    `json:"name"`
+	Description string    `json:"description,omitempty"`
+	CreatedAt   time.Time `json:"createdAt"`
+	UpdatedAt   time.Time `json:"updatedAt"`
 }
 
-// CreateScan records a new scan. options is the raw JSON-encoded per-scan
-// tuning (thread count/timeout/wordlist/rate limit preset) every scanner
-// flow this scan builds should read back via GetScan -- pass "" to fall
-// back to the engine-wide defaults.
-func (s *Store) CreateScan(id, domain, options string) error {
-	_, err := s.db.Exec(`INSERT INTO scans (id, domain, options, created_at) VALUES (?, ?, ?, ?)`, id, domain, options, time.Now())
+func (s *Store) CreateCase(id, name, description string) error {
+	now := time.Now()
+	_, err := s.db.Exec(`INSERT INTO cases (id, name, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`,
+		id, name, description, now, now)
 	if err != nil {
-		return fmt.Errorf("store: create scan: %w", err)
+		return fmt.Errorf("store: create case: %w", err)
 	}
 	return nil
 }
 
-// SetScanScheme records which scheme (http/https) the apex domain answered
-// on, once the apex HTTP check resolves it -- every scanner built for this
-// scan afterwards (including a later "scan selected subdomains" content
-// discovery run) reuses it instead of re-probing.
-func (s *Store) SetScanScheme(id, scheme string) error {
-	_, err := s.db.Exec(`UPDATE scans SET scheme = ? WHERE id = ?`, scheme, id)
-	if err != nil {
-		return fmt.Errorf("store: set scan scheme: %w", err)
-	}
-	return nil
-}
-
-func (s *Store) GetScan(id string) (Scan, error) {
-	var sc Scan
-	var scheme, options sql.NullString
-	err := s.db.QueryRow(`SELECT id, domain, scheme, options, created_at FROM scans WHERE id = ?`, id).
-		Scan(&sc.ID, &sc.Domain, &scheme, &options, &sc.CreatedAt)
+func (s *Store) GetCase(id string) (Case, error) {
+	var c Case
+	var description sql.NullString
+	err := s.db.QueryRow(`SELECT id, name, description, created_at, updated_at FROM cases WHERE id = ?`, id).
+		Scan(&c.ID, &c.Name, &description, &c.CreatedAt, &c.UpdatedAt)
 	if err == sql.ErrNoRows {
-		return Scan{}, fmt.Errorf("store: scan %s: %w", id, ErrNotFound)
+		return Case{}, fmt.Errorf("store: case %s: %w", id, ErrNotFound)
 	}
 	if err != nil {
-		return Scan{}, fmt.Errorf("store: get scan: %w", err)
+		return Case{}, fmt.Errorf("store: get case: %w", err)
 	}
-	sc.Scheme = scheme.String
-	sc.Options = options.String
-	return sc, nil
+	c.Description = description.String
+	return c, nil
 }
 
-func (s *Store) ListScans() ([]Scan, error) {
-	rows, err := s.db.Query(`SELECT id, domain, scheme, options, created_at FROM scans ORDER BY created_at DESC`)
+func (s *Store) ListCases() ([]Case, error) {
+	rows, err := s.db.Query(`SELECT id, name, description, created_at, updated_at FROM cases ORDER BY created_at DESC`)
 	if err != nil {
-		return nil, fmt.Errorf("store: list scans: %w", err)
+		return nil, fmt.Errorf("store: list cases: %w", err)
 	}
 	defer rows.Close()
 
-	out := []Scan{}
+	out := []Case{}
 	for rows.Next() {
-		var sc Scan
-		var scheme, options sql.NullString
-		if err := rows.Scan(&sc.ID, &sc.Domain, &scheme, &options, &sc.CreatedAt); err != nil {
-			return nil, fmt.Errorf("store: scan row: %w", err)
+		var c Case
+		var description sql.NullString
+		if err := rows.Scan(&c.ID, &c.Name, &description, &c.CreatedAt, &c.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("store: case row: %w", err)
 		}
-		sc.Scheme = scheme.String
-		sc.Options = options.String
-		out = append(out, sc)
+		c.Description = description.String
+		out = append(out, c)
 	}
 	return out, rows.Err()
 }
 
-// --- Scan runs ---
-
-// ScanKind identifies which of a scan's independent scanners a ScanRun
-// belongs to.
-type ScanKind string
-
-const (
-	ScanKindContentDiscovery    ScanKind = "content-discovery"
-	ScanKindSubdomainBruteforce ScanKind = "subdomain-bruteforce"
-	ScanKindVHostBruteforce     ScanKind = "vhost-bruteforce"
-	ScanKindVulnScan            ScanKind = "vuln-scan"
-)
-
-// ScanRun is one scanner run belonging to a scan. A scan can own several --
-// content discovery in particular accumulates one per "scan selected
-// subdomains" click, in addition to its initial apex-only run.
-type ScanRun struct {
-	Kind      ScanKind  `json:"kind"`
-	FlowID    string    `json:"flowId"`
-	RunID     string    `json:"runId"`
-	Status    RunStatus `json:"status"`
-	Targets   []string  `json:"targets,omitempty"`
-	CreatedAt time.Time `json:"createdAt"`
-}
-
-// CreateScanRun records a new scanner run. targets is the set of hostnames
-// this run covers (e.g. the content-discovery targets it was built
-// against) -- used by CoveredTargets to figure out what's already been (or
-// is being) scanned so a later "scan selected"/restart doesn't redundantly
-// re-scan the same hosts. Pass nil for scanners with no per-target concept
-// (subdomain/vhost bruteforce).
-func (s *Store) CreateScanRun(scanID string, kind ScanKind, flowID, runID string, targets []string) error {
-	targetsJSON, err := json.Marshal(targets)
+// DeleteCase removes a case and (via ON DELETE CASCADE) every target/job/
+// check/screenshot belonging to it. It does not cascade into runs/findings,
+// since those are keyed by run_id and jobs.run_id has no FK to enforce it --
+// orphaned runs/findings for a deleted case's jobs are harmless dead rows,
+// consistent with how flows/runs already outlive whatever created them.
+func (s *Store) DeleteCase(id string) error {
+	_, err := s.db.Exec(`DELETE FROM cases WHERE id = ?`, id)
 	if err != nil {
-		return fmt.Errorf("store: marshal scan run targets: %w", err)
-	}
-	_, err = s.db.Exec(`INSERT INTO scan_runs (scan_id, kind, flow_id, run_id, targets, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
-		scanID, kind, flowID, runID, string(targetsJSON), time.Now())
-	if err != nil {
-		return fmt.Errorf("store: create scan run: %w", err)
+		return fmt.Errorf("store: delete case: %w", err)
 	}
 	return nil
 }
 
-// ListScanRuns returns every scanner run for a scan, joined with its
-// current run status, in the order they were started -- so a client
-// reloading a past scan can reconstruct which scanners exist and reopen a
-// watch on any still running.
-func (s *Store) ListScanRuns(scanID string) ([]ScanRun, error) {
+// --- Targets ---
+
+type Target struct {
+	ID          string    `json:"id"`
+	CaseID      string    `json:"caseId"`
+	Value       string    `json:"value"`
+	Kind        string    `json:"kind,omitempty"`
+	SourceTool  string    `json:"sourceTool,omitempty"`
+	SourceJobID string    `json:"sourceJobId,omitempty"`
+	Notes       string    `json:"notes,omitempty"`
+	CreatedAt   time.Time `json:"createdAt"`
+}
+
+// AddTarget records a target, or does nothing if this case already has one
+// with the same value -- INSERT OR IGNORE on the (case_id, value) unique
+// constraint is what makes re-promoting an already-known value harmless
+// rather than an error the caller has to special-case.
+func (s *Store) AddTarget(t Target) error {
+	_, err := s.db.Exec(`
+		INSERT OR IGNORE INTO targets (id, case_id, value, kind, source_tool, source_job_id, notes, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, t.ID, t.CaseID, t.Value, t.Kind, t.SourceTool, t.SourceJobID, t.Notes, time.Now())
+	if err != nil {
+		return fmt.Errorf("store: add target: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ListTargets(caseID string) ([]Target, error) {
 	rows, err := s.db.Query(`
-		SELECT sr.kind, sr.flow_id, sr.run_id, r.status, sr.targets, sr.created_at
-		FROM scan_runs sr
-		JOIN runs r ON r.id = sr.run_id
-		WHERE sr.scan_id = ?
-		ORDER BY sr.created_at ASC
-	`, scanID)
+		SELECT id, case_id, value, kind, source_tool, source_job_id, notes, created_at
+		FROM targets WHERE case_id = ? ORDER BY created_at ASC
+	`, caseID)
 	if err != nil {
-		return nil, fmt.Errorf("store: list scan runs: %w", err)
+		return nil, fmt.Errorf("store: list targets: %w", err)
 	}
 	defer rows.Close()
 
-	out := []ScanRun{}
+	out := []Target{}
 	for rows.Next() {
-		var r ScanRun
-		var targets sql.NullString
-		if err := rows.Scan(&r.Kind, &r.FlowID, &r.RunID, &r.Status, &targets, &r.CreatedAt); err != nil {
-			return nil, fmt.Errorf("store: scan run row: %w", err)
+		var t Target
+		var kind, sourceTool, sourceJobID, notes sql.NullString
+		if err := rows.Scan(&t.ID, &t.CaseID, &t.Value, &kind, &sourceTool, &sourceJobID, &notes, &t.CreatedAt); err != nil {
+			return nil, fmt.Errorf("store: target row: %w", err)
 		}
-		if targets.Valid && targets.String != "" && targets.String != "null" {
-			_ = json.Unmarshal([]byte(targets.String), &r.Targets)
-		}
-		out = append(out, r)
+		t.Kind = kind.String
+		t.SourceTool = sourceTool.String
+		t.SourceJobID = sourceJobID.String
+		t.Notes = notes.String
+		out = append(out, t)
 	}
 	return out, rows.Err()
 }
 
-// ScanRunRef identifies which scan + scanner kind a run_id belongs to --
-// looked up when a run finishes and the caller (executeRun) needs to decide
-// whether finishing it should trigger another scanner (e.g. a
-// content-discovery run completing kicks off a vuln-scan against its hits).
-type ScanRunRef struct {
-	ScanID string
-	Kind   ScanKind
-}
-
-// GetScanRunByRunID looks up which scan + scanner kind a run_id belongs to.
-func (s *Store) GetScanRunByRunID(runID string) (ScanRunRef, error) {
-	var ref ScanRunRef
-	err := s.db.QueryRow(`SELECT scan_id, kind FROM scan_runs WHERE run_id = ?`, runID).Scan(&ref.ScanID, &ref.Kind)
+// GetTargetByValue looks up one target by its case + exact value, used by
+// promotion to report back the (possibly pre-existing) target a value
+// resolved to.
+func (s *Store) GetTargetByValue(caseID, value string) (Target, error) {
+	var t Target
+	var kind, sourceTool, sourceJobID, notes sql.NullString
+	err := s.db.QueryRow(`
+		SELECT id, case_id, value, kind, source_tool, source_job_id, notes, created_at
+		FROM targets WHERE case_id = ? AND value = ?
+	`, caseID, value).Scan(&t.ID, &t.CaseID, &t.Value, &kind, &sourceTool, &sourceJobID, &notes, &t.CreatedAt)
 	if err == sql.ErrNoRows {
-		return ScanRunRef{}, fmt.Errorf("store: scan run for run %s: %w", runID, ErrNotFound)
+		return Target{}, fmt.Errorf("store: target %s/%s: %w", caseID, value, ErrNotFound)
 	}
 	if err != nil {
-		return ScanRunRef{}, fmt.Errorf("store: get scan run by run id: %w", err)
+		return Target{}, fmt.Errorf("store: get target by value: %w", err)
 	}
-	return ref, nil
+	t.Kind = kind.String
+	t.SourceTool = sourceTool.String
+	t.SourceJobID = sourceJobID.String
+	t.Notes = notes.String
+	return t, nil
 }
 
-// KindRunning reports whether a scan already has a scanner run of kind
-// currently running -- callers use this to refuse starting a duplicate,
-// overlapping run of the same kind rather than piling up redundant
-// subprocesses while one is already in flight.
-func (s *Store) KindRunning(scanID string, kind ScanKind) (bool, error) {
+func (s *Store) DeleteTarget(id string) error {
+	_, err := s.db.Exec(`DELETE FROM targets WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("store: delete target: %w", err)
+	}
+	return nil
+}
+
+// --- Jobs ---
+
+// Job is one user-launched tool run against one or more targets. flow_id/
+// run_id are empty for an identify job, which has no engine.Flow underneath
+// -- see api.runIdentifyJob.
+type Job struct {
+	ID         string     `json:"id"`
+	CaseID     string     `json:"caseId"`
+	Tool       string     `json:"tool"`
+	FlowID     string     `json:"flowId,omitempty"`
+	RunID      string     `json:"runId,omitempty"`
+	Targets    []string   `json:"targets"`
+	Config     string     `json:"config,omitempty"` // raw JSON, opaque to store
+	Status     RunStatus  `json:"status"`
+	Error      string     `json:"error,omitempty"`
+	CreatedAt  time.Time  `json:"createdAt"`
+	FinishedAt *time.Time `json:"finishedAt,omitempty"`
+}
+
+func (s *Store) CreateJob(j Job) error {
+	targetsJSON, err := json.Marshal(j.Targets)
+	if err != nil {
+		return fmt.Errorf("store: marshal job targets: %w", err)
+	}
+	_, err = s.db.Exec(`
+		INSERT INTO jobs (id, case_id, tool, flow_id, run_id, targets, config, status, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, j.ID, j.CaseID, j.Tool, j.FlowID, j.RunID, string(targetsJSON), j.Config, j.Status, time.Now())
+	if err != nil {
+		return fmt.Errorf("store: create job: %w", err)
+	}
+	return nil
+}
+
+// FinishJob records a job's terminal status directly on the jobs row --
+// authoritative for identify jobs (which have no runs row to join against);
+// for engine-backed jobs this mirrors what executeToolJob already wrote to
+// the runs table via FinishRun, kept in sync so ListCaseJobs' status column
+// is correct even before its LEFT JOIN would otherwise resolve it.
+func (s *Store) FinishJob(id string, status RunStatus, errMsg string) error {
+	_, err := s.db.Exec(`UPDATE jobs SET status = ?, error = ?, finished_at = ? WHERE id = ?`,
+		status, errMsg, time.Now(), id)
+	if err != nil {
+		return fmt.Errorf("store: finish job: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) GetJob(id string) (Job, error) {
+	var j Job
+	var flowID, runID, config, errMsg, targets sql.NullString
+	var finishedAt sql.NullTime
+	err := s.db.QueryRow(`
+		SELECT id, case_id, tool, flow_id, run_id, targets, config, status, error, created_at, finished_at
+		FROM jobs WHERE id = ?
+	`, id).Scan(&j.ID, &j.CaseID, &j.Tool, &flowID, &runID, &targets, &config, &j.Status, &errMsg, &j.CreatedAt, &finishedAt)
+	if err == sql.ErrNoRows {
+		return Job{}, fmt.Errorf("store: job %s: %w", id, ErrNotFound)
+	}
+	if err != nil {
+		return Job{}, fmt.Errorf("store: get job: %w", err)
+	}
+	j.FlowID = flowID.String
+	j.RunID = runID.String
+	j.Config = config.String
+	j.Error = errMsg.String
+	if targets.Valid && targets.String != "" && targets.String != "null" {
+		_ = json.Unmarshal([]byte(targets.String), &j.Targets)
+	}
+	if finishedAt.Valid {
+		j.FinishedAt = &finishedAt.Time
+	}
+	return j, nil
+}
+
+// ListCaseJobs returns every job belonging to a case, in the order they
+// were started. For engine-backed jobs (flow_id/run_id set) the live status
+// comes from a LEFT JOIN onto runs, since that's updated the moment the
+// engine finishes rather than waiting for FinishJob; identify jobs (no
+// run_id) fall back to the jobs table's own status column.
+func (s *Store) ListCaseJobs(caseID string) ([]Job, error) {
+	// Status/error are merged via COALESCE (TEXT columns, so no decltype to
+	// lose) but finished_at is selected from both sides separately and
+	// merged in Go instead -- COALESCE on two DATETIME columns loses the
+	// column's declared type, so the sqlite driver hands back a raw string
+	// instead of converting it to time.Time, which sql.NullTime can't Scan.
+	rows, err := s.db.Query(`
+		SELECT j.id, j.case_id, j.tool, j.flow_id, j.run_id, j.targets, j.config,
+			COALESCE(r.status, j.status), COALESCE(r.error, j.error), j.created_at,
+			r.finished_at, j.finished_at
+		FROM jobs j
+		LEFT JOIN runs r ON r.id = j.run_id
+		WHERE j.case_id = ?
+		ORDER BY j.created_at ASC
+	`, caseID)
+	if err != nil {
+		return nil, fmt.Errorf("store: list case jobs: %w", err)
+	}
+	defer rows.Close()
+
+	out := []Job{}
+	for rows.Next() {
+		var j Job
+		var flowID, runID, config, errMsg, targets sql.NullString
+		var runFinishedAt, jobFinishedAt sql.NullTime
+		if err := rows.Scan(&j.ID, &j.CaseID, &j.Tool, &flowID, &runID, &targets, &config, &j.Status, &errMsg, &j.CreatedAt, &runFinishedAt, &jobFinishedAt); err != nil {
+			return nil, fmt.Errorf("store: job row: %w", err)
+		}
+		j.FlowID = flowID.String
+		j.RunID = runID.String
+		j.Config = config.String
+		j.Error = errMsg.String
+		if targets.Valid && targets.String != "" && targets.String != "null" {
+			_ = json.Unmarshal([]byte(targets.String), &j.Targets)
+		}
+		if runFinishedAt.Valid {
+			j.FinishedAt = &runFinishedAt.Time
+		} else if jobFinishedAt.Valid {
+			j.FinishedAt = &jobFinishedAt.Time
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+
+// ToolRunning reports whether a case already has a job of tool currently
+// running -- callers use this to refuse starting a duplicate, overlapping
+// run of the same tool rather than piling up redundant subprocesses.
+func (s *Store) ToolRunning(caseID, tool string) (bool, error) {
 	var running bool
 	err := s.db.QueryRow(`
 		SELECT EXISTS(
-			SELECT 1 FROM scan_runs sr JOIN runs r ON r.id = sr.run_id
-			WHERE sr.scan_id = ? AND sr.kind = ? AND r.status = 'running'
+			SELECT 1 FROM jobs j LEFT JOIN runs r ON r.id = j.run_id
+			WHERE j.case_id = ? AND j.tool = ? AND COALESCE(r.status, j.status) = 'running'
 		)
-	`, scanID, kind).Scan(&running)
+	`, caseID, tool).Scan(&running)
 	if err != nil {
-		return false, fmt.Errorf("store: kind running: %w", err)
+		return false, fmt.Errorf("store: tool running: %w", err)
 	}
 	return running, nil
 }
 
-// CoveredTargets returns the set of hostnames already claimed by a
-// running-or-succeeded scan_runs row of kind for this scan -- a failed or
-// cancelled run's targets are deliberately excluded so they remain eligible
-// for a retry. Hostnames are lowercased since that's how recon.NormalizeDomain
-// and the frontend's hostname extraction both produce them.
-func (s *Store) CoveredTargets(scanID string, kind ScanKind) (map[string]bool, error) {
-	rows, err := s.db.Query(`
-		SELECT sr.targets FROM scan_runs sr JOIN runs r ON r.id = sr.run_id
-		WHERE sr.scan_id = ? AND sr.kind = ? AND r.status IN ('running', 'succeeded')
-	`, scanID, kind)
-	if err != nil {
-		return nil, fmt.Errorf("store: covered targets: %w", err)
-	}
-	defer rows.Close()
-
-	covered := map[string]bool{}
-	for rows.Next() {
-		var targets sql.NullString
-		if err := rows.Scan(&targets); err != nil {
-			return nil, fmt.Errorf("store: covered targets row: %w", err)
-		}
-		if !targets.Valid || targets.String == "" || targets.String == "null" {
-			continue
-		}
-		var list []string
-		if err := json.Unmarshal([]byte(targets.String), &list); err != nil {
-			continue
-		}
-		for _, t := range list {
-			covered[strings.ToLower(t)] = true
-		}
-	}
-	return covered, rows.Err()
-}
-
 // TargetRunning reports whether target is currently covered by a running
-// scan_runs row of kind for this scan -- used for a per-target restart
-// (content discovery's per-subdomain "Restart scan" action) instead of
-// KindRunning's whole-kind check, so restarting one target doesn't get
-// blocked by (or itself block) a different target's run of the same kind.
-func (s *Store) TargetRunning(scanID string, kind ScanKind, target string) (bool, error) {
+// job of tool for this case -- used for a per-target restart instead of
+// ToolRunning's whole-tool check, so restarting one target doesn't get
+// blocked by (or itself block) a different target's job of the same tool.
+func (s *Store) TargetRunning(caseID, tool, target string) (bool, error) {
 	rows, err := s.db.Query(`
-		SELECT sr.targets FROM scan_runs sr JOIN runs r ON r.id = sr.run_id
-		WHERE sr.scan_id = ? AND sr.kind = ? AND r.status = 'running'
-	`, scanID, kind)
+		SELECT j.targets FROM jobs j LEFT JOIN runs r ON r.id = j.run_id
+		WHERE j.case_id = ? AND j.tool = ? AND COALESCE(r.status, j.status) = 'running'
+	`, caseID, tool)
 	if err != nil {
 		return false, fmt.Errorf("store: target running: %w", err)
 	}
@@ -623,145 +707,83 @@ func (s *Store) TargetRunning(scanID string, kind ScanKind, target string) (bool
 	return false, rows.Err()
 }
 
-// --- Scan aggregates (for the dashboard) ---
+// --- Case aggregates (for the case list) ---
 
-// SubdomainCount returns how many subdomains crt.sh found for a scan's
-// apex domain, and whether that check has completed yet.
-func (s *Store) SubdomainCount(scanID, domain string) (count int, done bool, err error) {
-	var status string
-	var data sql.NullString
-	err = s.db.QueryRow(`SELECT status, data FROM scan_checks WHERE scan_id = ? AND domain = ? AND kind = 'subdomains'`, scanID, domain).
-		Scan(&status, &data)
-	if err == sql.ErrNoRows {
-		return 0, false, nil
-	}
-	if err != nil {
-		return 0, false, fmt.Errorf("store: subdomain count: %w", err)
-	}
-	if status != string(recon.StatusDone) || !data.Valid {
-		return 0, false, nil
-	}
-	var parsed struct {
-		Count int `json:"count"`
-	}
-	if jsonErr := json.Unmarshal([]byte(data.String), &parsed); jsonErr != nil {
-		return 0, false, nil
-	}
-	return parsed.Count, true, nil
-}
-
-// ApexHTTP returns the apex domain's HTTP status code and page title, if
-// that check has completed.
-func (s *Store) ApexHTTP(scanID, domain string) (statusCode int, title string, ok bool, err error) {
-	var status string
-	var data sql.NullString
-	err = s.db.QueryRow(`SELECT status, data FROM scan_checks WHERE scan_id = ? AND domain = ? AND kind = 'http'`, scanID, domain).
-		Scan(&status, &data)
-	if err == sql.ErrNoRows {
-		return 0, "", false, nil
-	}
-	if err != nil {
-		return 0, "", false, fmt.Errorf("store: apex http: %w", err)
-	}
-	if status != string(recon.StatusDone) || !data.Valid {
-		return 0, "", false, nil
-	}
-	var parsed struct {
-		StatusCode int    `json:"statusCode"`
-		Title      string `json:"title"`
-	}
-	if jsonErr := json.Unmarshal([]byte(data.String), &parsed); jsonErr != nil {
-		return 0, "", false, nil
-	}
-	return parsed.StatusCode, parsed.Title, true, nil
-}
-
-// ApexCloudflare reports whether the apex domain's HTTP check detected
-// Cloudflare fronting it (see recon.isCloudflare) -- false (not just
-// "unknown") if that check hasn't completed yet, since the dashboard only
-// ever wants a definite yes/no badge.
-func (s *Store) ApexCloudflare(scanID, domain string) (bool, error) {
-	var status string
-	var data sql.NullString
-	err := s.db.QueryRow(`SELECT status, data FROM scan_checks WHERE scan_id = ? AND domain = ? AND kind = 'http'`, scanID, domain).
-		Scan(&status, &data)
-	if err == sql.ErrNoRows {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("store: apex cloudflare: %w", err)
-	}
-	if status != string(recon.StatusDone) || !data.Valid {
-		return false, nil
-	}
-	var parsed struct {
-		Cloudflare bool `json:"cloudflare"`
-	}
-	if jsonErr := json.Unmarshal([]byte(data.String), &parsed); jsonErr != nil {
-		return false, nil
-	}
-	return parsed.Cloudflare, nil
-}
-
-// ContentDiscoveryFindingCount counts findings reaching the terminal table
-// sink ("table") across every content-discovery run belonging to a scan.
-func (s *Store) ContentDiscoveryFindingCount(scanID string) (int, error) {
+func (s *Store) CaseTargetCount(caseID string) (int, error) {
 	var count int
-	err := s.db.QueryRow(`
-		SELECT COUNT(*) FROM findings f
-		JOIN scan_runs sr ON sr.run_id = f.run_id
-		WHERE sr.scan_id = ? AND sr.kind = ? AND f.node_id = 'table'
-	`, scanID, ScanKindContentDiscovery).Scan(&count)
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM targets WHERE case_id = ?`, caseID).Scan(&count)
 	if err != nil {
-		return 0, fmt.Errorf("store: content discovery finding count: %w", err)
+		return 0, fmt.Errorf("store: case target count: %w", err)
 	}
 	return count, nil
 }
 
-// ScanRunning reports whether any apex/subdomain check or scanner run for a
-// scan is still in progress, so the dashboard can show a "scanning..." vs
-// "done" pill.
-func (s *Store) ScanRunning(scanID string) (bool, error) {
+func (s *Store) CaseJobCount(caseID string) (int, error) {
+	var count int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM jobs WHERE case_id = ?`, caseID).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("store: case job count: %w", err)
+	}
+	return count, nil
+}
+
+// CaseFindingCount counts findings reaching the terminal table sink
+// ("table") across every job belonging to a case.
+func (s *Store) CaseFindingCount(caseID string) (int, error) {
+	var count int
+	err := s.db.QueryRow(`
+		SELECT COUNT(*) FROM findings f
+		JOIN jobs j ON j.run_id = f.run_id
+		WHERE j.case_id = ? AND f.node_id = 'table'
+	`, caseID).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("store: case finding count: %w", err)
+	}
+	return count, nil
+}
+
+// CaseRunning reports whether any job for a case is still in progress, so
+// the case list can show a "running..." vs "idle" pill.
+func (s *Store) CaseRunning(caseID string) (bool, error) {
 	var running bool
 	err := s.db.QueryRow(`
 		SELECT EXISTS(
-			SELECT 1 FROM scan_checks WHERE scan_id = ? AND status = 'running'
-			UNION
-			SELECT 1 FROM scan_runs sr JOIN runs r ON r.id = sr.run_id WHERE sr.scan_id = ? AND r.status = 'running'
+			SELECT 1 FROM jobs j LEFT JOIN runs r ON r.id = j.run_id
+			WHERE j.case_id = ? AND COALESCE(r.status, j.status) = 'running'
 		)
-	`, scanID, scanID).Scan(&running)
+	`, caseID).Scan(&running)
 	if err != nil {
-		return false, fmt.Errorf("store: scan running: %w", err)
+		return false, fmt.Errorf("store: case running: %w", err)
 	}
 	return running, nil
 }
 
-// --- Scan checks ---
+// --- Case checks (identify job results) ---
 
-func (s *Store) SaveCheck(scanID string, c recon.Check) error {
+func (s *Store) SaveCaseCheck(caseID, jobID string, c recon.Check) error {
 	data, err := json.Marshal(c.Data)
 	if err != nil {
 		return fmt.Errorf("store: marshal check data: %w", err)
 	}
 	_, err = s.db.Exec(`
-		INSERT INTO scan_checks (scan_id, domain, kind, status, data, error, started_at, finished_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(scan_id, domain, kind) DO UPDATE SET
-			status=excluded.status, data=excluded.data, error=excluded.error, finished_at=excluded.finished_at
-	`, scanID, c.Domain, c.Kind, c.Status, string(data), c.Error, c.StartedAt, c.FinishedAt)
+		INSERT INTO case_checks (case_id, target, kind, status, data, error, job_id, started_at, finished_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(case_id, target, kind) DO UPDATE SET
+			status=excluded.status, data=excluded.data, error=excluded.error, job_id=excluded.job_id, finished_at=excluded.finished_at
+	`, caseID, c.Domain, c.Kind, c.Status, string(data), c.Error, jobID, c.StartedAt, c.FinishedAt)
 	if err != nil {
-		return fmt.Errorf("store: save check: %w", err)
+		return fmt.Errorf("store: save case check: %w", err)
 	}
 	return nil
 }
 
-// ListChecks returns every check recorded for a scan, in the order they
-// were started, so a client reloading a past scan sees them roughly as
-// they originally streamed in.
-func (s *Store) ListChecks(scanID string) ([]recon.Check, error) {
-	rows, err := s.db.Query(`SELECT domain, kind, status, data, error, started_at, finished_at FROM scan_checks WHERE scan_id = ? ORDER BY started_at ASC`, scanID)
+// ListCaseChecks returns every identify check recorded for a case, in the
+// order they were started, so a client reloading a case sees them roughly
+// as they originally streamed in.
+func (s *Store) ListCaseChecks(caseID string) ([]recon.Check, error) {
+	rows, err := s.db.Query(`SELECT target, kind, status, data, error, started_at, finished_at FROM case_checks WHERE case_id = ? ORDER BY started_at ASC`, caseID)
 	if err != nil {
-		return nil, fmt.Errorf("store: list checks: %w", err)
+		return nil, fmt.Errorf("store: list case checks: %w", err)
 	}
 	defer rows.Close()
 
@@ -771,7 +793,7 @@ func (s *Store) ListChecks(scanID string) ([]recon.Check, error) {
 		var data, errMsg sql.NullString
 		var finishedAt sql.NullTime
 		if err := rows.Scan(&c.Domain, &c.Kind, &c.Status, &data, &errMsg, &c.StartedAt, &finishedAt); err != nil {
-			return nil, fmt.Errorf("store: scan check row: %w", err)
+			return nil, fmt.Errorf("store: case check row: %w", err)
 		}
 		c.Error = errMsg.String
 		if finishedAt.Valid {
@@ -785,73 +807,73 @@ func (s *Store) ListChecks(scanID string) ([]recon.Check, error) {
 	return out, rows.Err()
 }
 
-// --- Screenshots ---
+// --- Case screenshots ---
 
 // ScreenshotMeta is a screenshot's metadata without its image bytes, for
 // listing what's available without pulling every PNG over the wire.
 type ScreenshotMeta struct {
-	Hostname   string    `json:"hostname"`
+	Target     string    `json:"target"`
 	URL        string    `json:"url"`
 	CapturedAt time.Time `json:"capturedAt"`
 }
 
-// SaveScreenshot upserts the captured PNG for one scan+hostname -- a
-// re-capture (e.g. a scan restart) replaces the previous image rather than
-// accumulating history, since only the latest view of a host is useful.
-func (s *Store) SaveScreenshot(scanID, hostname, url string, image []byte) error {
+// SaveCaseScreenshot upserts the captured PNG for one case+target -- a
+// re-capture (e.g. a re-run identify job) replaces the previous image
+// rather than accumulating history, since only the latest view of a target
+// is useful.
+func (s *Store) SaveCaseScreenshot(caseID, target, url string, image []byte) error {
 	_, err := s.db.Exec(`
-		INSERT INTO screenshots (scan_id, hostname, url, image, captured_at)
+		INSERT INTO case_screenshots (case_id, target, url, image, captured_at)
 		VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT(scan_id, hostname) DO UPDATE SET url=excluded.url, image=excluded.image, captured_at=excluded.captured_at
-	`, scanID, hostname, url, image, time.Now())
+		ON CONFLICT(case_id, target) DO UPDATE SET url=excluded.url, image=excluded.image, captured_at=excluded.captured_at
+	`, caseID, target, url, image, time.Now())
 	if err != nil {
-		return fmt.Errorf("store: save screenshot: %w", err)
+		return fmt.Errorf("store: save case screenshot: %w", err)
 	}
 	return nil
 }
 
-// ListScreenshots returns metadata for every screenshot captured so far for
-// a scan, so the UI knows which hostnames have a thumbnail to fetch.
-func (s *Store) ListScreenshots(scanID string) ([]ScreenshotMeta, error) {
-	rows, err := s.db.Query(`SELECT hostname, url, captured_at FROM screenshots WHERE scan_id = ? ORDER BY hostname ASC`, scanID)
+// ListCaseScreenshots returns metadata for every screenshot captured so far
+// for a case, so the UI knows which targets have a thumbnail to fetch.
+func (s *Store) ListCaseScreenshots(caseID string) ([]ScreenshotMeta, error) {
+	rows, err := s.db.Query(`SELECT target, url, captured_at FROM case_screenshots WHERE case_id = ? ORDER BY target ASC`, caseID)
 	if err != nil {
-		return nil, fmt.Errorf("store: list screenshots: %w", err)
+		return nil, fmt.Errorf("store: list case screenshots: %w", err)
 	}
 	defer rows.Close()
 
 	out := []ScreenshotMeta{}
 	for rows.Next() {
 		var m ScreenshotMeta
-		if err := rows.Scan(&m.Hostname, &m.URL, &m.CapturedAt); err != nil {
-			return nil, fmt.Errorf("store: screenshot row: %w", err)
+		if err := rows.Scan(&m.Target, &m.URL, &m.CapturedAt); err != nil {
+			return nil, fmt.Errorf("store: case screenshot row: %w", err)
 		}
 		out = append(out, m)
 	}
 	return out, rows.Err()
 }
 
-// GetScreenshot returns one hostname's captured PNG bytes.
-func (s *Store) GetScreenshot(scanID, hostname string) ([]byte, error) {
+// GetCaseScreenshot returns one target's captured PNG bytes.
+func (s *Store) GetCaseScreenshot(caseID, target string) ([]byte, error) {
 	var image []byte
-	err := s.db.QueryRow(`SELECT image FROM screenshots WHERE scan_id = ? AND hostname = ?`, scanID, hostname).Scan(&image)
+	err := s.db.QueryRow(`SELECT image FROM case_screenshots WHERE case_id = ? AND target = ?`, caseID, target).Scan(&image)
 	if err == sql.ErrNoRows {
-		return nil, fmt.Errorf("store: screenshot %s/%s: %w", scanID, hostname, ErrNotFound)
+		return nil, fmt.Errorf("store: case screenshot %s/%s: %w", caseID, target, ErrNotFound)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("store: get screenshot: %w", err)
+		return nil, fmt.Errorf("store: get case screenshot: %w", err)
 	}
 	return image, nil
 }
 
-// HasScreenshot reports whether a screenshot already exists for scanID +
-// hostname, so the capture pipeline can skip a host it's already shot
-// instead of re-launching a browser for it on every recon check that fires
-// (e.g. a restarted scan re-observing the same live host).
-func (s *Store) HasScreenshot(scanID, hostname string) (bool, error) {
+// HasCaseScreenshot reports whether a screenshot already exists for
+// caseID + target, so the capture pipeline can skip a target it's already
+// shot instead of re-launching a browser for it on every check that fires.
+func (s *Store) HasCaseScreenshot(caseID, target string) (bool, error) {
 	var exists bool
-	err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM screenshots WHERE scan_id = ? AND hostname = ?)`, scanID, hostname).Scan(&exists)
+	err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM case_screenshots WHERE case_id = ? AND target = ?)`, caseID, target).Scan(&exists)
 	if err != nil {
-		return false, fmt.Errorf("store: has screenshot: %w", err)
+		return false, fmt.Errorf("store: has case screenshot: %w", err)
 	}
 	return exists, nil
 }

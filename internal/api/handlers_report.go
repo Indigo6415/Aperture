@@ -9,20 +9,18 @@ import (
 	"github.com/Indigo6415/Aperture/internal/store"
 )
 
-// handleScanReport is the "Download report" action: it bundles a scan's
-// recon checks and every scanner run's findings into one document, in
+// handleCaseReport is the "Download report" action: it bundles a case's
+// targets, identify checks, and every job's findings into one document, in
 // whichever of json/html/pdf the ?format= query param names (json is the
-// default). This is what wires engine.KindExport's underlying idea to an
-// actual UI action -- see internal/report's package doc for how it relates
-// to the flow-node export.
-func (s *Server) handleScanReport(w http.ResponseWriter, r *http.Request) {
-	scanID := r.PathValue("id")
+// default).
+func (s *Server) handleCaseReport(w http.ResponseWriter, r *http.Request) {
+	caseID := r.PathValue("id")
 	format := r.URL.Query().Get("format")
 	if format == "" {
 		format = "json"
 	}
 
-	rep, err := report.Build(s.store, scanID)
+	rep, err := report.Build(s.store, caseID)
 	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, http.StatusNotFound, err)
 		return
@@ -32,7 +30,7 @@ func (s *Server) handleScanReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	filename := "aperture-report-" + rep.Scan.Domain
+	filename := "aperture-report-" + rep.Case.Name
 	switch format {
 	case "json":
 		b, err := rep.RenderJSON()

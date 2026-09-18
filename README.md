@@ -1,14 +1,17 @@
 # Aperture
 
-A recon/enumeration suite with a web UI: enter a domain and it runs DNS/TLS/
-HTTP/WHOIS recon, subdomain discovery (passive crt.sh + DNSDumpster, each
-candidate verified live via two independent DNS resolution paths, plus
-active [ffuf](https://github.com/ffuf/ffuf) bruteforce), virtual-host
-bruteforce, content discovery ([ffuf](https://github.com/ffuf/ffuf) +
-[feroxbuster](https://github.com/epi052/feroxbuster)), and web
-technology/CVE fingerprinting as independent scanners you can filter and
-drill into — shipped as a single static Go binary with the frontend
-embedded.
+A graphical front end for CLI recon/enumeration tools, organized around
+**cases**: start a case, add targets to it (by hand, or by promoting results
+from a tool run), then launch [feroxbuster](https://github.com/epi052/feroxbuster)
+(directory busting) or [ffuf](https://github.com/ffuf/ffuf) (subdomain/vhost
+enumeration) against whichever targets you pick. An "Identify" action runs
+passive/read-only recon (DNS/TLS/HTTP/WHOIS, certificate-transparency
+subdomain discovery) against selected targets. Nothing runs automatically —
+every job is one you explicitly launched, and any running job can be
+stopped. Findings from a job's results can be selected and saved back to the
+case as new targets, so a case builds up over time into a full picture you
+can export as a report — shipped as a single static Go binary with the
+frontend embedded.
 
 ## Install
 
@@ -62,12 +65,12 @@ cd web && npm run dev                        # terminal 2, http://localhost:5173
 
 - `cmd/aperture` — CLI entrypoint
 - `internal/model` — the common `Finding` data model every adapter normalizes into
-- `internal/adapters` — subprocess wrappers around ffuf/feroxbuster/nuclei (a native `webfuzz` fuzzer/bruteforcer also lives here, kept registered but unused by any auto-generated flow)
-- `internal/engine` — DAG flow executor (filter/merge/table/export nodes + adapters), driving the auto-generated per-scanner flows
-- `internal/recon` — fast stdlib-only DNS/TLS/HTTP/WHOIS checks, passive (crt.sh + DNSDumpster) subdomain discovery with two-path liveness verification, and web technology fingerprinting
+- `internal/adapters` — subprocess wrappers around ffuf/feroxbuster (nuclei/nmap/webfuzz also live here, kept registered but unused for now)
+- `internal/engine` — DAG flow executor (filter/merge/table/export nodes + adapters), driving each job's flow
+- `internal/recon` — fast stdlib-only DNS/TLS/HTTP/WHOIS checks, passive (crt.sh + DNSDumpster) subdomain discovery with two-path liveness verification, and web technology fingerprinting -- run on demand by an "Identify" job, never automatically
 - `internal/cve` — live NVD CVE lookups for fingerprinted technology versions
 - `internal/techfp` — the curated web technology fingerprint signature set
-- `internal/store` — SQLite persistence (scans, scanner runs, findings)
+- `internal/store` — SQLite persistence (cases, targets, jobs, findings)
 - `internal/api` — REST + WebSocket server
 - `internal/webui` — embeds the built frontend (`internal/webui/dist`) into the binary
 - `web` — React + Tailwind frontend

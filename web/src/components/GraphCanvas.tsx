@@ -3,6 +3,8 @@ import { forceCenter, forceCollide, forceLink, forceManyBody, forceSimulation, t
 import type { GraphEdge, GraphNode, GraphNodeType } from '../useScanGraph'
 import { statusHexColor } from '../statusColor'
 import { api, screenshotPreviewEnabled } from '../api'
+import { copyToClipboard, useContextMenu } from '../contextMenu'
+import { sendToJwtScanner } from '../jwtHandoff'
 
 // Interactive controls (pan/zoom/drag) can be turned off for the small
 // read-only preview embedded in a scan's Overview tab -- it just needs to
@@ -12,10 +14,10 @@ export interface GraphCanvasProps {
   nodes: GraphNode[]
   edges: GraphEdge[]
   interactive?: boolean
-  // scanId enables the hover screenshot tooltip on website/subdomain nodes
+  // caseId enables the hover screenshot tooltip on case/target nodes
   // (see ScreenshotTooltip below) -- omitted entirely by the read-only
   // Overview preview, which is too small for a tooltip to be worth it.
-  scanId?: string
+  caseId?: string
 }
 
 type Drag = { mode: 'pan'; startClientX: number; startClientY: number; origX: number; origY: number } | { mode: 'node'; node: GraphNode }
@@ -26,7 +28,8 @@ type Drag = { mode: 'pan'; startClientX: number; startClientY: number; origX: nu
 // circles/lines/text is the entire feature. Panning/zooming/node-dragging
 // are hand-rolled pointer-event handling rather than a library, since they
 // only take a few dozen lines.
-export function GraphCanvas({ nodes, edges, interactive = true, scanId }: GraphCanvasProps) {
+export function GraphCanvas({ nodes, edges, interactive = true, caseId }: GraphCanvasProps) {
+  const { openMenu } = useContextMenu()
   const containerRef = useRef<HTMLDivElement>(null)
   const svgRef = useRef<SVGSVGElement>(null)
   const simRef = useRef<Simulation<GraphNode, GraphEdge> | null>(null)
@@ -160,8 +163,16 @@ export function GraphCanvas({ nodes, edges, interactive = true, scanId }: GraphC
             <g
               key={n.id}
               onPointerDown={(e) => startNodeDrag(e, n)}
-              onPointerEnter={(e) => scanId && n.type !== 'page' && setHovered({ node: n, x: e.clientX, y: e.clientY })}
+              onPointerEnter={(e) => caseId && n.type !== 'page' && setHovered({ node: n, x: e.clientX, y: e.clientY })}
               onPointerLeave={() => setHovered(null)}
+              onContextMenu={(e) => {
+                if (n.type !== 'target') return
+                e.stopPropagation()
+                openMenu(e, [
+                  { label: 'Copy value', onSelect: () => copyToClipboard(n.label, 'Copied target') },
+                  { label: 'Send to JWT Scanner', onSelect: () => sendToJwtScanner(n.label) },
+                ])
+              }}
               className={interactive ? 'cursor-pointer' : undefined}
             >
               <circle
@@ -183,8 +194,8 @@ export function GraphCanvas({ nodes, edges, interactive = true, scanId }: GraphC
           ))}
         </g>
       </svg>
-      {hovered && scanId && screenshotPreviewEnabled && (
-        <ScreenshotTooltip key={hovered.node.label} scanId={scanId} hostname={hovered.node.label} x={hovered.x} y={hovered.y} />
+      {hovered && caseId && screenshotPreviewEnabled && (
+        <ScreenshotTooltip key={hovered.node.label} caseId={caseId} target={hovered.node.label} x={hovered.x} y={hovered.y} />
       )}
     </div>
   )
@@ -197,7 +208,7 @@ export function GraphCanvas({ nodes, edges, interactive = true, scanId }: GraphC
 // rather than an ugly broken-image icon.
 // Keyed by hostname at the call site so switching which node is hovered
 // remounts this (resetting `failed`) instead of needing an effect to do it.
-function ScreenshotTooltip({ scanId, hostname, x, y }: { scanId: string; hostname: string; x: number; y: number }) {
+function ScreenshotTooltip({ caseId, target, x, y }: { caseId: string; target: string; x: number; y: number }) {
   const [failed, setFailed] = useState(false)
   if (failed) return null
   return (
@@ -206,26 +217,26 @@ function ScreenshotTooltip({ scanId, hostname, x, y }: { scanId: string; hostnam
       style={{ left: x + 14, top: y + 14 }}
     >
       <img
-        src={api.screenshotUrl(scanId, hostname)}
+        src={api.screenshotUrl(caseId, target)}
         onError={() => setFailed(true)}
         className="h-24 w-40 rounded-sm object-cover object-top"
-        alt={hostname}
+        alt={target}
       />
-      <div className="mt-0.5 max-w-[10rem] truncate text-center text-[10px] text-neutral-400">{hostname}</div>
+      <div className="mt-0.5 max-w-[10rem] truncate text-center text-[10px] text-neutral-400">{target}</div>
     </div>
   )
 }
 
 function radiusFor(type: GraphNodeType): number {
-  if (type === 'website') return 14
-  if (type === 'subdomain') return 9
+  if (type === 'case') return 14
+  if (type === 'target') return 9
   if (type === 'technology') return 6
   return 5
 }
 
 function colorFor(n: GraphNode): string {
   if (n.type === 'page') return n.statusCode ? statusHexColor(n.statusCode) : '#71717a'
-  if (n.type === 'website') return '#38bdf8'
+  if (n.type === 'case') return '#38bdf8'
   if (n.type === 'technology') return '#fbbf24'
   return '#a78bfa'
 }

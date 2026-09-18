@@ -62,7 +62,17 @@ export function ContextMenuProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     if (!menu) return
-    const onMouseDown = () => close()
+    // A mousedown that lands inside the menu itself must NOT close it here:
+    // mousedown fires before click, so closing (and unmounting the button)
+    // on mousedown would remove the button from the DOM before the browser
+    // ever dispatches the click that runs its onSelect -- every menu item
+    // would silently do nothing. The button's own onClick already calls
+    // close() after onSelect() runs, so this listener only needs to handle
+    // dismissing the menu when the click was truly outside it.
+    const onMouseDown = (e: MouseEvent) => {
+      if (menuRef.current?.contains(e.target as Node)) return
+      close()
+    }
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') close()
     }

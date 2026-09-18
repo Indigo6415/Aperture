@@ -1,23 +1,21 @@
 import { useEffect, useState } from 'react'
 import { api, ApiError } from './api'
 import type { AuthUser } from './types'
-import { Dashboard } from './components/Dashboard'
-import { ScanView } from './components/ScanView'
+import { CaseList } from './components/CaseList'
+import { CaseView } from './components/CaseView'
 import { Wordlists } from './components/Wordlists'
-import { GraphView } from './components/GraphView'
 import { Login } from './components/Login'
 import { Settings } from './components/Settings'
 import { ContextMenuProvider } from './contextMenu'
 import { ToastHost } from './toast'
 
 // View is a small discriminated union instead of a plain string so a view
-// that needs an id (which scan) carries it along rather than living in a
-// second piece of state that could get out of sync. Graph is scoped to one
-// scan (matching the rest of the app) so it carries that scan's id too.
-type View = { name: 'dashboard' } | { name: 'scan'; scanId: string } | { name: 'wordlists' } | { name: 'settings' } | { name: 'graph'; scanId: string }
+// that needs an id (which case) carries it along rather than living in a
+// second piece of state that could get out of sync.
+type View = { name: 'caseList' } | { name: 'case'; caseId: string } | { name: 'wordlists' } | { name: 'settings' }
 
 export default function App() {
-  const [view, setView] = useState<View>({ name: 'dashboard' })
+  const [view, setView] = useState<View>({ name: 'caseList' })
   // undefined = still probing api.me() on load; null = signed out.
   const [user, setUser] = useState<AuthUser | null | undefined>(undefined)
 
@@ -40,7 +38,7 @@ export default function App() {
   const logout = async () => {
     await api.logout()
     setUser(null)
-    setView({ name: 'dashboard' })
+    setView({ name: 'caseList' })
   }
 
   // ContextMenuProvider/ToastHost wrap every branch below (including the
@@ -67,17 +65,12 @@ export default function App() {
     <ContextMenuProvider>
       <div className="flex h-screen flex-col bg-neutral-950">
         <nav className="flex shrink-0 items-center gap-4 border-b border-neutral-800 px-4 py-2 text-sm">
-          <button onClick={() => setView({ name: 'dashboard' })} className="font-semibold text-neutral-100 hover:text-sky-400">
+          <button onClick={() => setView({ name: 'caseList' })} className="font-semibold text-neutral-100 hover:text-sky-400">
             Aperture
           </button>
-          {view.name === 'graph' && (
-            <button onClick={() => setView({ name: 'scan', scanId: view.scanId })} className="text-neutral-400 hover:text-neutral-200">
-              ← Back to scan
-            </button>
-          )}
           {(view.name === 'wordlists' || view.name === 'settings') && (
-            <button onClick={() => setView({ name: 'dashboard' })} className="text-neutral-400 hover:text-neutral-200">
-              ← Back to dashboard
+            <button onClick={() => setView({ name: 'caseList' })} className="text-neutral-400 hover:text-neutral-200">
+              ← Back to cases
             </button>
           )}
           <div className="ml-auto flex items-center gap-4">
@@ -96,13 +89,10 @@ export default function App() {
         </nav>
 
         <div className="flex-1 overflow-hidden">
-          {view.name === 'dashboard' && <Dashboard onOpen={(scanId) => setView({ name: 'scan', scanId })} />}
-          {view.name === 'scan' && (
-            <ScanView scanId={view.scanId} onOpenGraph={() => setView({ name: 'graph', scanId: view.scanId })} />
-          )}
+          {view.name === 'caseList' && <CaseList onOpen={(caseId) => setView({ name: 'case', caseId })} />}
+          {view.name === 'case' && <CaseView caseId={view.caseId} />}
           {view.name === 'wordlists' && <Wordlists />}
           {view.name === 'settings' && <Settings />}
-          {view.name === 'graph' && <GraphView scanId={view.scanId} />}
         </div>
       </div>
       <ToastHost />

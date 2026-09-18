@@ -21,19 +21,20 @@ const screenshotCaptureTimeout = 30 * time.Second
 const screenshotPreviewEnabled = false
 
 // captureScreenshot renders url headlessly and persists it, unless a
-// screenshot for this scan+hostname already exists -- called (in the
-// background, best-effort) from runScan's onCheck every time a host's HTTP
-// recon check resolves a live URL, so a restarted scan re-observing the
-// same host doesn't re-launch a browser for it. s.screenshotSem bounds how
-// many of these run concurrently across the whole server, since each is a
-// real browser process.
-func (s *Server) captureScreenshot(scanID, hostname, url string) {
+// screenshot for this case+target already exists -- called (in the
+// background, best-effort) from runIdentifyJob's onCheck every time a
+// target's HTTP recon check resolves a live URL, so re-identifying the same
+// target doesn't re-launch a browser for it. s.screenshotSem bounds how many
+// of these run concurrently across the whole server, since each is a real
+// browser process. jobID is only used to publish the "screenshot" event on
+// that identify job's own channel.
+func (s *Server) captureScreenshot(caseID, jobID, target, url string) {
 	// The feature is disabled: skip launching headless Chrome entirely
 	// rather than just hiding the result, since that's the expensive part.
 	if !screenshotPreviewEnabled {
 		return
 	}
-	if already, err := s.store.HasScreenshot(scanID, hostname); err != nil || already {
+	if already, err := s.store.HasCaseScreenshot(caseID, target); err != nil || already {
 		return
 	}
 
@@ -46,19 +47,19 @@ func (s *Server) captureScreenshot(scanID, hostname, url string) {
 	image, err := adapters.CaptureScreenshot(ctx, url)
 	if err != nil {
 		// Best-effort: a missing screenshot just means no thumbnail for
-		// this host, not a scan failure -- most likely no headless-Chrome-
-		// compatible browser is installed, which every capture attempt
-		// would fail on identically.
+		// this target, not a job failure -- most likely no headless-
+		// Chrome-compatible browser is installed, which every capture
+		// attempt would fail on identically.
 		return
 	}
-	if err := s.store.SaveScreenshot(scanID, hostname, url, image); err != nil {
+	if err := s.store.SaveCaseScreenshot(caseID, target, url, image); err != nil {
 		return
 	}
-	s.hub.publish(scanID, RunEvent{Type: "screenshot", Message: hostname})
+	s.hub.publish(jobID, RunEvent{Type: "screenshot", Message: target})
 }
 
-func (s *Server) handleListScreenshots(w http.ResponseWriter, r *http.Request) {
-	list, err := s.store.ListScreenshots(r.PathValue("id"))
+func (s *Server) handleListCaseScreenshots(w http.ResponseWriter, r *http.Request) {
+	list, err := s.store.ListCaseScreenshots(r.PathValue("id"))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -66,8 +67,8 @@ func (s *Server) handleListScreenshots(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, list)
 }
 
-func (s *Server) handleGetScreenshot(w http.ResponseWriter, r *http.Request) {
-	image, err := s.store.GetScreenshot(r.PathValue("id"), r.PathValue("hostname"))
+func (s *Server) handleGetCaseScreenshot(w http.ResponseWriter, r *http.Request) {
+	image, err := s.store.GetCaseScreenshot(r.PathValue("id"), r.PathValue("target"))
 	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, http.StatusNotFound, err)
 		return

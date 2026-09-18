@@ -337,6 +337,32 @@ func CountLines(path string) (int, error) {
 	return n, scanner.Err()
 }
 
+// ReadLines returns every non-empty, trimmed line of the wordlist called
+// name inside dir -- used where a caller wants the wordlist's actual
+// contents (e.g. as a secret candidate list) rather than just its line
+// count.
+func ReadLines(dir, name string) ([]string, error) {
+	path, err := safePath(dir, name)
+	if err != nil {
+		return nil, err
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("wordlists: read %s: %w", name, err)
+	}
+	defer f.Close()
+
+	var lines []string
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		if line := strings.TrimSpace(scanner.Text()); line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines, scanner.Err()
+}
+
 // Delete removes a wordlist by name. The bundled defaults are protected
 // since they're guaranteed to exist for the auto-generated scan flow.
 func Delete(dir, name string) error {

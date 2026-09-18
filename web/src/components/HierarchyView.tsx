@@ -5,6 +5,8 @@ import type { PageGroup } from '../useScanGraph'
 import type { ClusterId } from '../estate'
 import { statusHexColor } from '../statusColor'
 import { ProgressBar } from './ProgressBar'
+import { copyToClipboard, useContextMenu } from '../contextMenu'
+import { sendToJwtScanner } from '../jwtHandoff'
 
 // Board geometry -- lifted verbatim from the Estate Hierarchy design spec's
 // "Layout — exact geometry" section (design_handoff_estate_hierarchy/README.md).
@@ -73,20 +75,19 @@ function hostMatches(h: EstateHostModel, q: string, riskOnly: boolean): boolean 
 // for the two interactive tiers (cluster, host) so tab order and
 // :focus-visible work without duplicating the visual design into HTML.
 export function HierarchyView({
-  scanId,
-  domain,
+  caseId,
   apex,
   clusters,
   pageGroupsByHost,
   progress,
 }: {
-  scanId: string
-  domain: string
+  caseId: string
   apex: { hostname: string; hostCount: number; pageCount: number; technologies: EstateHostModel['technologies'] }
   clusters: EstateCluster[]
   pageGroupsByHost: Map<string, PageGroup[]>
   progress: { done: number; total: number } | null
 }) {
+  const { openMenu } = useContextMenu()
   const [expanded, setExpanded] = useState<ClusterId | null>(null)
   const [selHost, setSelHost] = useState<string | null>(null)
   const [hover, setHover] = useState<string | null>(null)
@@ -145,12 +146,18 @@ export function HierarchyView({
     })
   }
 
-  const scanSelected = async () => {
+  // saveSelected adds every selected host to the case as a manually-tagged
+  // target (no source job -- these come from graph selection, not a
+  // result-row promotion) so they become pickable in every tool's target
+  // list. AddTarget's UNIQUE(case_id, value) makes re-saving an
+  // already-known host a harmless no-op.
+  const saveSelected = async () => {
     setScanning(true)
     setScanMessage('')
     try {
-      const res = await api.runContentDiscovery(scanId, [domain, ...selected])
-      setScanMessage(res.skipped ? (res.message ?? 'Nothing new to scan') : 'Started — see Content Discovery tab')
+      await Promise.all([...selected].map((hostname) => api.addTarget(caseId, hostname)))
+      setScanMessage(`Saved ${selected.size} target${selected.size === 1 ? '' : 's'} to the case`)
+      setSelected(new Set())
     } catch (err) {
       setScanMessage(err instanceof Error ? err.message : String(err))
     } finally {
@@ -178,6 +185,22 @@ export function HierarchyView({
   const pageGroups = sel ? (pageGroupsByHost.get(sel.hostname) ?? []) : []
   const maxGroupCount = Math.max(1, ...pageGroups.map((g) => g.count), 0)
   const selCy = sel ? (hostCyByName.get(sel.hostname) ?? 330) : 330
+
+  // The board's fixed geometry (BOARD_H) is sized for the design's sample
+  // data -- a host with many technologies or page groups (or a cluster with
+  // many hosts) can render past it. Rather than clip that content inside
+  // the SVG's own overflow, grow the canvas to whatever the tallest column
+  // actually needs, so the scroll container around it (below) picks up the
+  // difference. Cluster/host centering (clusterY0/hostY0) stays keyed to
+  // the constant BOARD_H so short columns still center the way the design
+  // intends.
+  const svgHeight = Math.max(
+    BOARD_H,
+    clusterY0 + clusterTotal + 24,
+    expanded ? hostY0 + hostTotal + 24 : 0,
+    sel && tierVisible.technology ? PANEL.top + techPanelH + 24 : 0,
+    sel && tierVisible.pagegroup ? pagePanelTop + PANEL.headerH + pageGroups.length * PANEL.rowH + 24 : 0,
+  )
 
   // --- filtered counts for the toolbar / cluster subtitles ---
 
@@ -229,26 +252,26 @@ export function HierarchyView({
             {shownPages.toLocaleString()} of {apex.pageCount.toLocaleString()} pages · {shownHosts}/{apex.hostCount} hosts
           </span>
           <button
-            onClick={scanSelected}
+            onClick={saveSelected}
             disabled={scanning || selected.size === 0}
             className="rounded bg-sky-600 px-3 py-1 text-xs font-medium text-white hover:bg-sky-500 disabled:opacity-50"
           >
-            {scanning ? 'Starting…' : `Scan selected (${selected.size})`}
+            {scanning ? 'Saving…' : `Save selected to case (${selected.size})`}
           </button>
           {scanMessage && <span className="text-xs text-neutral-500">{scanMessage}</span>}
         </div>
       </div>
 
       <div className="flex-1 overflow-auto bg-neutral-950 p-3">
-        {!domain ? (
+        {!apex.hostname ? (
           <p className="px-3 py-6 text-center text-xs text-neutral-600">Loading…</p>
         ) : (
-          <div className="relative border border-neutral-800" style={{ width: BOARD_W, height: BOARD_H }}>
-          <svg viewBox={`0 0 ${BOARD_W} ${BOARD_H}`} width={BOARD_W} height={BOARD_H} className="block" style={{ background: '#0a0a0a' }}>
+          <div className="relative border border-neutral-800" style={{ width: BOARD_W, height: svgHeight }}>
+          <svg viewBox={`0 0 ${BOARD_W} ${svgHeight}`} width={BOARD_W} height={svgHeight} className="block" style={{ background: '#0a0a0a' }}>
             {/* tier hairlines */}
             <g stroke="#1c1c20" strokeWidth={1}>
               {GRID_X.map((x) => (
-                <line key={x} x1={x} y1={0} x2={x} y2={BOARD_H} />
+                <line key={x} x1={x} y1={0} x2={x} y2={svgHeight} />
               ))}
             </g>
 
@@ -499,6 +522,13 @@ export function HierarchyView({
               click/focus/hover semantics. */}
           <button
             onClick={() => setSelHost(apex.hostname)}
+            onContextMenu={(e) => {
+              e.stopPropagation()
+              openMenu(e, [
+                { label: 'Copy hostname', onSelect: () => copyToClipboard(apex.hostname, 'Copied hostname') },
+                { label: 'Send to JWT Scanner', onSelect: () => sendToJwtScanner(apex.hostname) },
+              ])
+            }}
             aria-label={`${apex.hostname} apex`}
             className="absolute border-0 bg-transparent p-0 outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400"
             style={{ left: APEX_BOX.x, top: APEX_Y - APEX_BOX.h / 2, width: APEX_BOX.w, height: APEX_BOX.h }}
@@ -522,12 +552,19 @@ export function HierarchyView({
               <button
                 key={host.hostname}
                 onClick={() => toggleHost(host)}
+                onContextMenu={(e) => {
+                  e.stopPropagation()
+                  openMenu(e, [
+                    { label: 'Copy hostname', onSelect: () => copyToClipboard(host.hostname, 'Copied hostname') },
+                    { label: 'Send to JWT Scanner', onSelect: () => sendToJwtScanner(host.hostname) },
+                  ])
+                }}
                 onMouseEnter={() => setHover(host.hostname)}
                 onMouseLeave={() => setHover(null)}
                 onFocus={() => setHover(host.hostname)}
                 onBlur={() => setHover(null)}
                 aria-pressed={selected.has(host.hostname)}
-                aria-label={`${host.hostname}${selected.has(host.hostname) ? ' (selected for scan)' : ''}`}
+                aria-label={`${host.hostname}${selected.has(host.hostname) ? ' (selected)' : ''}`}
                 className="absolute border-0 bg-transparent p-0 outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400"
                 style={{ left: HOST_BOX.x, top: y, width: HOST_BOX.w, height: HOST_BOX.h }}
               />

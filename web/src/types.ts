@@ -37,9 +37,10 @@ export interface Run {
 export type NodeStatus = 'pending' | 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled'
 
 export interface RunEvent {
-  type: 'finding' | 'status' | 'progress' | 'done'
+  type: 'finding' | 'status' | 'progress' | 'check' | 'done'
   nodeId?: string
   finding?: Finding
+  check?: Check
   status?: NodeStatus
   message?: string
   // Set only on a "progress" event -- total 0 (or absent) means the total
@@ -49,7 +50,7 @@ export interface RunEvent {
   total?: number
 }
 
-// --- Domain scans (recon checks + the scanner tabs each scan runs) ---
+// --- Cases (a named container of targets + jobs run against them) ---
 
 export type CheckKind =
   | 'dns'
@@ -94,80 +95,99 @@ export interface Check {
   finishedAt?: string
 }
 
-// ScanKind identifies one of the independent scanners a scan runs -- mirrors
-// internal/store.ScanKind.
-export type ScanKind = 'content-discovery' | 'subdomain-bruteforce' | 'vhost-bruteforce' | 'vuln-scan'
+export interface Case {
+  id: string
+  name: string
+  description?: string
+  createdAt: string
+  updatedAt: string
+}
 
-export interface ScanRun {
-  kind: ScanKind
-  flowId: string
-  runId: string
-  status: RunStatus
-  targets?: string[]
+export interface CaseSummary extends Case {
+  targetCount: number
+  jobCount: number
+  findingCount: number
+  running: boolean
+}
+
+// TargetKind is a UI hint only -- the backend never branches on it.
+export type TargetKind = 'domain' | 'subdomain' | 'url' | 'ip' | 'other'
+
+export interface Target {
+  id: string
+  caseId: string
+  value: string
+  kind?: TargetKind
+  sourceTool?: string
+  sourceJobId?: string
+  notes?: string
   createdAt: string
 }
 
-// ScanOptionsPreset mirrors internal/engine.ScanOptions' Preset field --
+// Tool identifies which job a case can run -- mirrors the tool constants in
+// internal/api/handlers_jobs.go.
+export type Tool = 'feroxbuster' | 'ffuf-subdomain' | 'ffuf-vhost' | 'identify'
+
+// JobOptionsPreset mirrors internal/engine.ScanOptions' Preset field --
 // "aggressive"/"stealth" fill in Threads/TimeoutSeconds/RateLimit with a
 // preset default for any of those left unset, "custom" (or omitted) takes
 // every field literally.
-export type ScanOptionsPreset = 'aggressive' | 'stealth' | 'custom'
+export type JobOptionsPreset = 'aggressive' | 'stealth' | 'custom'
 
-export interface ScanOptions {
-  preset?: ScanOptionsPreset
+export interface JobOptions {
+  preset?: JobOptionsPreset
   threads?: number
   timeoutSeconds?: number
   rateLimit?: number
   wordlist?: string
-}
-
-export interface Scan {
-  id: string
-  domain: string
+  // scheme is feroxbuster/ffuf-subdomain only (default "https" if omitted).
   scheme?: string
-  options?: string
-  createdAt: string
-  checks?: Check[]
+  // hostSuffix is ffuf-vhost only: the domain fuzzed into the Host header
+  // while each target (an IP) is hit directly.
+  hostSuffix?: string
+  // recursive is feroxbuster only: fuzz found directories again with the
+  // same wordlist. Defaults to false (off) if omitted.
+  recursive?: boolean
 }
 
-export interface ScanSummary {
+// JobNodeDetail mirrors internal/api.JobNodeDetail -- one target node's
+// actual scan config (wordlist, estimated candidate count, tuning), derived
+// server-side from the job's saved flow.
+export interface JobNodeDetail {
+  nodeId: string
+  target: string
+  wordlist?: string
+  extensions?: string[]
+  candidates?: number
+  threads?: number
+  timeoutSeconds?: number
+  rateLimit?: number
+}
+
+export interface Job {
   id: string
-  domain: string
-  scheme?: string
-  createdAt: string
-  subdomainCount: number
-  findingCount: number
-  httpStatus?: number
-  httpTitle?: string
-  cloudflare: boolean
-  running: boolean
-}
-
-export interface ScanEvent {
-  type: 'check' | 'scanRun' | 'screenshot' | 'done'
-  check?: Check
-  message?: string
-  kind?: ScanKind
+  caseId: string
+  tool: Tool
   flowId?: string
   runId?: string
-  // Set only on a "scanRun" event for a scanner with a per-target concept
-  // (content discovery) -- see store.ScanRun.Targets/RunEvent.Targets.
-  targets?: string[]
+  targets: string[]
+  status: RunStatus
+  error?: string
+  createdAt: string
+  finishedAt?: string
+  // nodes is populated server-side from the job's saved flow (see
+  // internal/api.handleGetJob/handleListCaseJobs) -- absent for jobs with no
+  // flow (e.g. identify).
+  nodes?: JobNodeDetail[]
 }
 
-// ScanRunStartResult is the response shape for every endpoint that starts
-// (or declines to start) a scanner run -- runId is set on success; skipped
-// is set instead when every requested target was already covered by a
-// running-or-succeeded run of that kind (see store.CoveredTargets), with
-// message explaining why nothing new was started.
-export interface ScanRunStartResult {
-  runId?: string
-  skipped?: boolean
-  message?: string
+// JobStartResult is the response shape for POST .../jobs.
+export interface JobStartResult {
+  jobId?: string
 }
 
 export interface ScreenshotMeta {
-  hostname: string
+  target: string
   url: string
   capturedAt: string
 }
@@ -200,4 +220,53 @@ export interface AuthUser {
 export interface SettingsInfo {
   dnsdumpsterApiKeySet: boolean
   nvdApiKeySet: boolean
+}
+
+// --- JWT scanner (mirrors internal/jwtscan) ---
+
+export type JwtTestStatus = 'vulnerable' | 'safe' | 'skipped'
+
+export interface JwtAttempt {
+  label: string
+  token: string
+  httpStatus?: number
+  hit: boolean
+  error?: string
+}
+
+export interface JwtTestResult {
+  id: string
+  name: string
+  status: JwtTestStatus
+  summary: string
+  token?: string
+  attempts?: JwtAttempt[]
+}
+
+export interface JwtBaseline {
+  validStatus: number
+  validLength: number
+  invalidStatus: number
+  invalidLength: number
+  identical: boolean
+}
+
+export interface JwtScanResponse {
+  header: Record<string, unknown>
+  payload: Record<string, unknown>
+  baseline: JwtBaseline
+  results: JwtTestResult[]
+  crackedSecret?: string
+  secretsTried: number
+}
+
+export interface JwtScanRequest {
+  url: string
+  token: string
+  method?: string
+  cookie?: string
+  headers?: Record<string, string>
+  pubKeyPem?: string
+  wordlist?: string
+  extraSecrets?: string
 }
