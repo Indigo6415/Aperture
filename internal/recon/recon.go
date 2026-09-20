@@ -25,6 +25,9 @@ const (
 	KindHTTP       CheckKind = "http"
 	KindSubdomains CheckKind = "subdomains"
 	KindWHOIS      CheckKind = "whois"
+	// KindASN is only ever emitted right after a KindDNS check that
+	// resolved at least one IPv4 address -- see checkASN's doc comment.
+	KindASN CheckKind = "asn"
 	// KindTakeover is only ever emitted for a subdomain flagged as a
 	// possible dangling-CNAME takeover (see fanOutSubdomains) -- a clean
 	// subdomain gets no takeover Check at all, rather than one saying so.
@@ -143,7 +146,13 @@ func Scan(ctx context.Context, domain, dnsdumpsterAPIKey string, onCheck func(Ch
 			defer wg.Done()
 			switch kind {
 			case KindDNS:
-				onCheck(runCheck(ctx, domain, kind, apexTimeout, func(c context.Context) (map[string]any, error) { return checkDNS(c, domain) }))
+				dnsCheck := runCheck(ctx, domain, kind, apexTimeout, func(c context.Context) (map[string]any, error) { return checkDNS(c, domain) })
+				onCheck(dnsCheck)
+				if dnsCheck.Status == StatusDone {
+					if ip := firstIPv4(dnsCheck.Data); ip != "" {
+						onCheck(runCheck(ctx, domain, KindASN, apexTimeout, func(c context.Context) (map[string]any, error) { return checkASN(c, ip) }))
+					}
+				}
 			case KindTLS:
 				onCheck(runCheck(ctx, domain, kind, apexTimeout, func(c context.Context) (map[string]any, error) { return checkTLS(c, domain) }))
 			case KindHTTP:
@@ -252,6 +261,11 @@ func fanOutSubdomains(ctx context.Context, subdomains []string, onCheck func(Che
 
 			dnsCheck := runCheck(ctx, sub, KindDNS, subdomainTimeout, func(c context.Context) (map[string]any, error) { return checkDNS(c, sub) })
 			onCheck(dnsCheck)
+			if dnsCheck.Status == StatusDone {
+				if ip := firstIPv4(dnsCheck.Data); ip != "" {
+					onCheck(runCheck(ctx, sub, KindASN, subdomainTimeout, func(c context.Context) (map[string]any, error) { return checkASN(c, ip) }))
+				}
+			}
 			onCheck(runCheck(ctx, sub, KindTLS, subdomainTimeout, func(c context.Context) (map[string]any, error) { return checkTLS(c, sub) }))
 			httpCheck := runCheck(ctx, sub, KindHTTP, subdomainTimeout, func(c context.Context) (map[string]any, error) { return checkHTTP(c, sub) })
 			onCheck(httpCheck)

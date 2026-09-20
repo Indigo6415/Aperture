@@ -1,8 +1,15 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api, ApiError } from '../api'
-import { showToast } from '../toast'
 import type { JwtScannerRequest } from '../jwtHandoff'
-import type { JwtAttempt, JwtScanResponse, JwtTestResult, JwtTestStatus, WordlistInfo } from '../types'
+import type { Credential, JwtAttempt, JwtScanResponse, JwtTestResult, JwtTestStatus, Target, WordlistInfo } from '../types'
+import { CopyButton } from './CopyButton'
+import { CollapsibleFormPanel } from './CollapsibleFormPanel'
+import { TargetButtons } from './TargetButtons'
+import { CredentialPicker } from './CredentialPicker'
+import { useAutoCollapseOnce, useCollapsible } from '../collapsible'
+import { inputBase } from '../formStyles'
+import { toAbsoluteUrl } from '../url'
+import { sendToRepeater } from '../repeaterHandoff'
 
 // b64urlDecode decodes one base64url JWT segment (header or payload) into
 // its UTF-8 text, tolerating the missing padding JWTs conventionally omit.
@@ -31,11 +38,6 @@ function decodeToken(token: string): { header?: unknown; payload?: unknown; erro
 
 type HeaderRow = { name: string; value: string }
 
-// inputBase matches the input styling Settings.tsx's KeyCard already uses,
-// so the two API-key inputs and this whole form read as the same design
-// language rather than introducing a second input style.
-const inputBase = 'w-full rounded border border-neutral-700 bg-neutral-950 px-2.5 py-1.5 text-sm text-neutral-100 outline-none focus:border-sky-500'
-
 const TEST_ORDER_HINT: Record<string, string> = {
   alg_none: '1',
   empty_sig: '2',
@@ -46,8 +48,19 @@ const TEST_ORDER_HINT: Record<string, string> = {
   rs256_hs256_confusion: '7',
 }
 
-export function JwtScan({ prefill }: { prefill?: JwtScannerRequest }) {
+export function JwtScan({
+  caseId,
+  targets,
+  credentials,
+  prefill,
+}: {
+  caseId: string
+  targets: Target[]
+  credentials: Credential[]
+  prefill?: JwtScannerRequest
+}) {
   const [url, setUrl] = useState('')
+  const [credentialId, setCredentialId] = useState<string | undefined>()
   const [token, setToken] = useState('')
   const [method, setMethod] = useState('GET')
   const [authMode, setAuthMode] = useState<'header' | 'cookie'>('header')
@@ -62,6 +75,14 @@ export function JwtScan({ prefill }: { prefill?: JwtScannerRequest }) {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [result, setResult] = useState<JwtScanResponse | null>(null)
+
+  // Form starts open (there's nothing else to look at yet) and collapses
+  // itself the first time a scan result arrives, so the results column
+  // below gets the full width -- see collapsible.ts. A user who re-expands
+  // it afterward (e.g. to tweak a header and re-run) is never overridden
+  // again this session, and their choice persists across reloads.
+  const [formOpen, setFormOpen] = useCollapsible('jwtscan.form', true)
+  useAutoCollapseOnce(result !== null, setFormOpen)
 
   useEffect(() => {
     api.listWordlists().then(setWordlists).catch(() => {})
@@ -104,6 +125,8 @@ export function JwtScan({ prefill }: { prefill?: JwtScannerRequest }) {
         pubKeyPem: pubKeyPem.trim() || undefined,
         wordlist: wordlistName || undefined,
         extraSecrets: extraSecrets.trim() || undefined,
+        credentialId,
+        caseId,
       })
       setResult(resp)
     } catch (err) {
@@ -120,8 +143,18 @@ export function JwtScan({ prefill }: { prefill?: JwtScannerRequest }) {
   }, [result])
 
   return (
-    <div className="mx-auto grid max-w-6xl grid-cols-1 gap-6 p-6 lg:grid-cols-[26rem_1fr]">
-      <div className="space-y-4">
+    <div className="flex h-full min-h-0 flex-col gap-4 overflow-y-auto p-6 lg:flex-row lg:overflow-hidden">
+      <div className="lg:min-h-0 lg:w-[26rem] lg:shrink-0 lg:overflow-y-auto lg:pr-1">
+      <CollapsibleFormPanel
+        title="JWT Scanner"
+        open={formOpen}
+        onToggle={() => setFormOpen(!formOpen)}
+        summary={url.trim() ? `${method} ${url}` : 'No target set'}
+        onRun={runScan}
+        canRun={canRun}
+        loading={loading}
+        runLabel="Run Scan"
+      >
         <div>
           <h1 className="text-sm font-semibold uppercase tracking-wide text-neutral-400">JWT Scanner</h1>
           <p className="mt-1 text-xs text-neutral-500">
@@ -137,6 +170,7 @@ export function JwtScan({ prefill }: { prefill?: JwtScannerRequest }) {
             placeholder="https://target.htb/api/me"
             className={inputBase}
           />
+          <TargetButtons targets={targets} onPick={(v) => setUrl(toAbsoluteUrl(v))} className="mt-1.5" />
         </Field>
 
         <Field label="JWT token">
@@ -208,6 +242,7 @@ export function JwtScan({ prefill }: { prefill?: JwtScannerRequest }) {
             <button onClick={addHeaderRow} className="text-xs text-sky-400 hover:text-sky-300">
               + Add header
             </button>
+            <CredentialPicker credentials={credentials} selected={credentialId} onSelect={setCredentialId} />
           </div>
         </Field>
 
@@ -255,9 +290,10 @@ export function JwtScan({ prefill }: { prefill?: JwtScannerRequest }) {
         </button>
 
         <ManualHints show={showHints} onToggle={() => setShowHints((v) => !v)} />
+      </CollapsibleFormPanel>
       </div>
 
-      <div className="min-w-0 space-y-4">
+      <div className="min-w-0 flex-1 space-y-4 lg:min-h-0 lg:overflow-y-auto lg:pr-1">
         {error && (
           <div className="rounded-lg border border-red-800 bg-red-950/40 p-4 text-sm text-red-300">
             <p className="font-medium">Scan could not run</p>
@@ -315,7 +351,7 @@ export function JwtScan({ prefill }: { prefill?: JwtScannerRequest }) {
 
             <div className="space-y-3">
               {result.results.map((r) => (
-                <TestCard key={r.id} result={r} />
+                <TestCard key={r.id} result={r} url={url} method={method} authMode={authMode} cookieName={cookieName} />
               ))}
             </div>
           </>
@@ -367,10 +403,28 @@ function statusStyles(status: JwtTestStatus): { border: string; badge: string; l
   }
 }
 
-function TestCard({ result }: { result: JwtTestResult }) {
+function TestCard({
+  result,
+  url,
+  method,
+  authMode,
+  cookieName,
+}: {
+  result: JwtTestResult
+  url: string
+  method: string
+  authMode: 'header' | 'cookie'
+  cookieName: string
+}) {
   const [expanded, setExpanded] = useState(result.status === 'vulnerable')
   const styles = statusStyles(result.status)
   const order = TEST_ORDER_HINT[result.id]
+
+  const sendTokenToRepeater = (token: string) => {
+    const headers: Record<string, string> =
+      authMode === 'cookie' ? { Cookie: `${cookieName || 'session'}=${token}` } : { Authorization: `Bearer ${token}` }
+    sendToRepeater(url, method || 'GET', headers)
+  }
 
   return (
     <div className={`rounded-lg border border-neutral-800 border-l-4 bg-neutral-900 p-4 ${styles.border}`}>
@@ -391,6 +445,13 @@ function TestCard({ result }: { result: JwtTestResult }) {
         <div className="mt-3 flex items-start gap-2 rounded border border-neutral-800 bg-neutral-950 p-2">
           <code className="min-w-0 flex-1 break-all text-[10px] text-neutral-400">{result.token}</code>
           <CopyButton text={result.token} />
+          <button
+            onClick={() => sendTokenToRepeater(result.token!)}
+            className="shrink-0 rounded border border-neutral-700 px-2 py-0.5 text-[11px] text-neutral-300 hover:border-sky-500 hover:text-sky-300"
+            title="Send this token (as the request's auth) to the Repeater"
+          >
+            Send to Repeater
+          </button>
         </div>
       )}
 
@@ -423,24 +484,6 @@ function AttemptRow({ attempt }: { attempt: JwtAttempt }) {
         <span className="shrink-0 text-neutral-500">{attempt.httpStatus}</span>
       )}
     </li>
-  )
-}
-
-function CopyButton({ text }: { text: string }) {
-  return (
-    <button
-      onClick={async () => {
-        try {
-          await navigator.clipboard.writeText(text)
-          showToast('Copied to clipboard', 'success')
-        } catch {
-          showToast('Could not copy to clipboard', 'error')
-        }
-      }}
-      className="shrink-0 rounded border border-neutral-700 px-2 py-0.5 text-[11px] text-neutral-300 hover:border-sky-500 hover:text-sky-300"
-    >
-      Copy
-    </button>
   )
 }
 

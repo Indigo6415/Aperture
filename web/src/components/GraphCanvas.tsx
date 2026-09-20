@@ -5,6 +5,9 @@ import { statusHexColor } from '../statusColor'
 import { api, screenshotPreviewEnabled } from '../api'
 import { copyToClipboard, useContextMenu } from '../contextMenu'
 import { sendToJwtScanner } from '../jwtHandoff'
+import { sendToProbe } from '../probeHandoff'
+import { sendToSecretScan } from '../secretScanHandoff'
+import { sendToRepeater } from '../repeaterHandoff'
 
 // Interactive controls (pan/zoom/drag) can be turned off for the small
 // read-only preview embedded in a scan's Overview tab -- it just needs to
@@ -171,6 +174,9 @@ export function GraphCanvas({ nodes, edges, interactive = true, caseId }: GraphC
                 openMenu(e, [
                   { label: 'Copy value', onSelect: () => copyToClipboard(n.label, 'Copied target') },
                   { label: 'Send to JWT Scanner', onSelect: () => sendToJwtScanner(n.label) },
+                  { label: 'Send to Probe', onSelect: () => sendToProbe(n.label) },
+                  { label: 'Send to Secret Scanner', onSelect: () => sendToSecretScan(n.label) },
+                  { label: 'Send to Repeater', onSelect: () => sendToRepeater(n.label) },
                 ])
               }}
               className={interactive ? 'cursor-pointer' : undefined}

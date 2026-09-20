@@ -29,6 +29,7 @@ func (s *Server) handleCaseReport(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	_ = s.store.LogActivity(caseID, "report_exported", fmt.Sprintf("Exported report (%s)", format))
 
 	filename := "aperture-report-" + rep.Case.Name
 	switch format {

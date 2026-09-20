@@ -1,6 +1,6 @@
 import { useMemo } from 'react'
 import { useScanGraph, type GraphEdge, type GraphNode, type PageGroup } from './useScanGraph'
-import { clusterOf, riskOf, type ClusterId, type EstateHost } from './estate'
+import { clusterOf, clusterOfNetwork, riskOf, type ClusterId, type ClusterMode, type EstateHost } from './estate'
 import type { TechDetection } from './types'
 
 // Rotated across clusters in risk order -- violet/sky/amber/steel/emerald/red,
@@ -44,9 +44,18 @@ export interface EstateModel {
 // clusterLabel is the dominant CMS/framework shared by a cluster's hosts --
 // the reason clusterOf grouped them in the first place -- or, for a
 // prefix-fallback cluster (mail/infra hosts with no fingerprint), the
-// prefix itself.
-function clusterLabel(id: ClusterId, hosts: EstateHostModel[]): string {
+// prefix itself. In 'network' mode, a cluster's id already carries its
+// label (see clusterOfNetwork) -- the ASN plus whatever org name Team
+// Cymru resolved for it, or just the ASN when that lookup came back empty.
+function clusterLabel(id: ClusterId, hosts: EstateHostModel[], clusterBy: ClusterMode): string {
   if (id.startsWith('prefix:')) return id.slice('prefix:'.length)
+  if (clusterBy === 'network' && id.startsWith('net:')) {
+    const rest = id.slice('net:'.length)
+    const sep = rest.indexOf(':')
+    const asn = sep === -1 ? rest : rest.slice(0, sep)
+    const org = sep === -1 ? '' : rest.slice(sep + 1)
+    return org ? `${asn} · ${org}` : asn
+  }
   const categoryOf = new Map<string, string>()
   for (const h of hosts) for (const t of h.technologies) categoryOf.set(t.name, t.category)
   for (const category of CATEGORY_PRIORITY) {
@@ -62,7 +71,7 @@ function clusterLabel(id: ClusterId, hosts: EstateHostModel[]): string {
 // one useScanGraph subscription it already holds for the retained `graph`
 // mode, instead of HierarchyView opening a second, redundant socket to the
 // same scan.
-export function buildEstateModel(nodes: GraphNode[], edges: GraphEdge[], rootLabel: string): EstateModel {
+export function buildEstateModel(nodes: GraphNode[], edges: GraphEdge[], rootLabel: string, clusterBy: ClusterMode = 'stack'): EstateModel {
   const nodeById = new Map(nodes.map((n) => [n.id, n]))
 
   const techByHost = new Map<string, TechDetection[]>()
@@ -99,10 +108,11 @@ export function buildEstateModel(nodes: GraphNode[], edges: GraphEdge[], rootLab
     if (n.type !== 'target') continue
     const technologies = techByHost.get(n.label) ?? []
     const exposedFiles = exposedFilesByHost.get(n.label) ?? 0
-    const host: EstateHost = { hostname: n.label, technologies, exposedFiles }
+    const network = n.asn ? { asn: n.asn, org: n.asnOrg ?? '' } : undefined
+    const host: EstateHost = { hostname: n.label, technologies, exposedFiles, network }
     const model: EstateHostModel = {
       hostname: n.label,
-      clusterId: clusterOf(host),
+      clusterId: clusterBy === 'network' ? clusterOfNetwork(host) : clusterOf(host),
       statusCode: n.statusCode,
       pageCount: pageCountByHost.get(n.label) ?? 0,
       technologies,
@@ -124,7 +134,7 @@ export function buildEstateModel(nodes: GraphNode[], edges: GraphEdge[], rootLab
       pageCount += h.pageCount
       exposedFiles += h.exposedFiles
     }
-    return { id, label: clusterLabel(id, hosts), color: '', hosts, pageCount, exposedFiles, techCount: techNames.size }
+    return { id, label: clusterLabel(id, hosts, clusterBy), color: '', hosts, pageCount, exposedFiles, techCount: techNames.size }
   })
 
   // Riskiest clusters first (summed host risk), so the tier rail reads
@@ -153,8 +163,12 @@ export function buildEstateModel(nodes: GraphNode[], edges: GraphEdge[], rootLab
 // it. GraphView doesn't use this (it shares one useScanGraph call across
 // both its modes via buildEstateModel directly); kept for any future
 // consumer that wants the hierarchy model on its own.
-export function useEstateModel(caseId: string, caseLabel: string): EstateModel & { pageGroupsByHost: Map<string, PageGroup[]>; progress: { done: number; total: number } | null } {
+export function useEstateModel(
+  caseId: string,
+  caseLabel: string,
+  clusterBy: ClusterMode = 'stack',
+): EstateModel & { pageGroupsByHost: Map<string, PageGroup[]>; progress: { done: number; total: number } | null } {
   const { nodes, edges, progress, pageGroupsByHost } = useScanGraph(caseId, caseLabel)
-  const model = useMemo(() => buildEstateModel(nodes, edges, caseLabel), [nodes, edges, caseLabel])
+  const model = useMemo(() => buildEstateModel(nodes, edges, caseLabel, clusterBy), [nodes, edges, caseLabel, clusterBy])
   return { ...model, pageGroupsByHost, progress }
 }

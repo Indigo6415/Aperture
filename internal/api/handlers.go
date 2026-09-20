@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net/http"
 
 	"github.com/Indigo6415/Aperture/internal/engine"
@@ -26,8 +27,9 @@ func newID() string {
 // ffuf-vhost) -- see handleStartJob in handlers_jobs.go, which builds the
 // flow and creates the job+run rows before calling this. Cancellation and
 // event delivery are keyed by jobID, not runID, so the client only ever
-// needs to know one ID per job.
-func (s *Server) executeToolJob(flow engine.Flow, jobID, runID string) {
+// needs to know one ID per job. caseID is only used to log the job's
+// completion to the case's activity timeline.
+func (s *Server) executeToolJob(caseID string, flow engine.Flow, jobID, runID string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	s.trackJobCancel(jobID, cancel)
 	defer func() {
@@ -65,6 +67,7 @@ func (s *Server) executeToolJob(flow engine.Flow, jobID, runID string) {
 	}
 	_ = s.store.FinishRun(runID, final, errMsg)
 	_ = s.store.FinishJob(jobID, final, errMsg)
+	_ = s.store.LogActivity(caseID, "job_finished", fmt.Sprintf("Job %s finished: %s", jobID, final))
 	s.hub.publish(jobID, RunEvent{Type: "done", Status: engine.NodeStatus(final), Message: errMsg})
 }
 

@@ -27,6 +27,16 @@ func (s *Server) handleWatchJob(w http.ResponseWriter, r *http.Request) {
 // watch is the subscribe-and-relay loop behind handleWatchJob: the hub is
 // keyed by an arbitrary string ID (a jobID).
 func (s *Server) watch(w http.ResponseWriter, r *http.Request, id string) {
+	s.watchWithStart(w, r, id, nil)
+}
+
+// watchWithStart is watch, plus an optional start callback invoked right
+// after subscribing to id's hub channel and before relaying begins --
+// handleWatchProbeScan uses this to only start a probe scan once a client
+// is actually subscribed to hear about it, since a scan can otherwise
+// finish (and every event with it) before the WebSocket handshake that
+// would have received them completes.
+func (s *Server) watchWithStart(w http.ResponseWriter, r *http.Request, id string, start func()) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
@@ -35,6 +45,10 @@ func (s *Server) watch(w http.ResponseWriter, r *http.Request, id string) {
 
 	events := s.hub.subscribe(id)
 	defer s.hub.unsubscribe(id, events)
+
+	if start != nil {
+		start()
+	}
 
 	// The only messages we expect from the client are close frames; this
 	// goroutine's sole purpose is to notice the connection went away.

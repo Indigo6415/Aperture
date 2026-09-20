@@ -21,10 +21,37 @@ const (
 	ToolFeroxbuster   = "feroxbuster"
 	ToolFFufSubdomain = "ffuf-subdomain"
 	ToolFFufVHost     = "ffuf-vhost"
+	// ToolFFufCustom is the general-purpose FFuF GUI: unlike
+	// ToolFFufSubdomain/ToolFFufVHost, it doesn't derive the fuzzed
+	// URL/header from a target string at all -- each target IS the full URL
+	// (FUZZ keyword and all) the user typed, so it can fuzz a path segment,
+	// a query parameter, a POST body field, or a header, not just a
+	// subdomain label or vhost Host header.
+	ToolFFufCustom = "ffuf-custom"
 	// ToolIdentify runs passive recon (internal/recon) directly rather than
 	// an engine.Flow -- see runIdentifyJob in identify.go.
 	ToolIdentify = "identify"
 )
+
+// FFufJobOptions carries every field specific to ToolFFufCustom -- an almost
+// full mirror of adapters.FFufConfig, minus the fields (Threads/Timeout/
+// RateLimit/Wordlist) that already come from the shared engine.ScanOptions
+// every tool accepts. Left nil on any other tool's request.
+type FFufJobOptions struct {
+	Method          string            `json:"method,omitempty"`
+	Headers         map[string]string `json:"headers,omitempty"`
+	Body            string            `json:"body,omitempty"`
+	Extensions      []string          `json:"extensions,omitempty"`
+	MatchCodes      string            `json:"matchCodes,omitempty"`
+	FilterCodes     string            `json:"filterCodes,omitempty"`
+	MatchSize       string            `json:"matchSize,omitempty"`
+	FilterSize      string            `json:"filterSize,omitempty"`
+	AutoCalibrate   bool              `json:"autoCalibrate,omitempty"`
+	FollowRedirects bool              `json:"followRedirects,omitempty"`
+	Delay           string            `json:"delay,omitempty"`
+	Proxy           string            `json:"proxy,omitempty"`
+	ExtraArgs       []string          `json:"extraArgs,omitempty"`
+}
 
 type startJobRequest struct {
 	Tool    string             `json:"tool"`
@@ -40,6 +67,13 @@ type startJobRequest struct {
 	// this is a small field on the launch request rather than its own
 	// Target.
 	HostSuffix string `json:"hostSuffix,omitempty"`
+	// FFuf is ffuf-custom only: the tool's own general-purpose parameters.
+	FFuf *FFufJobOptions `json:"ffuf,omitempty"`
+	// CredentialID optionally names a saved case credential (see
+	// handlers_credentials.go) whose headers/cookie are applied to every
+	// request feroxbuster/ffuf issues for this job -- the same vault
+	// Probe/JWT Scanner/Secret Scanner/Repeater already draw from.
+	CredentialID string `json:"credentialId,omitempty"`
 }
 
 type jobStartResult struct {
@@ -81,8 +115,12 @@ func dedupeTargets(requested []string) []string {
 
 // buildToolFlow assembles the engine.Flow for one job, dispatching on tool.
 // Every branch fans out one source node per target into a shared merge
-// (dedup) + table sink via buildFanoutFlow.
-func (s *Server) buildToolFlow(tool string, targets []string, req startJobRequest) (engine.Flow, error) {
+// (dedup) + table sink via buildFanoutFlow. credHeaders is a resolved
+// credential's headers/cookie (see mergedCredentialHeaders), nil when the
+// job wasn't launched with one -- merged into whatever headers each branch
+// already sets, with a branch's own explicit headers (ffuf-vhost's Host,
+// ffuf-custom's user-typed headers) always winning on a conflicting key.
+func (s *Server) buildToolFlow(tool string, targets []string, req startJobRequest, credHeaders map[string]string) (engine.Flow, error) {
 	scheme := req.Scheme
 	if scheme == "" {
 		scheme = "https"
@@ -99,7 +137,7 @@ func (s *Server) buildToolFlow(tool string, targets []string, req startJobReques
 				base = scheme + "://" + base
 			}
 			cfg, _ := json.Marshal(adapters.FeroxbusterConfig{
-				URL: base + "/", Wordlist: wordlistPath, Extensions: extensions,
+				URL: base + "/", Wordlist: wordlistPath, Extensions: extensions, Headers: credHeaders,
 				Threads: opts.Threads, Timeout: opts.TimeoutSeconds, RateLimit: opts.RateLimit,
 				NoRecursion: !opts.Recursive,
 			})
@@ -110,7 +148,7 @@ func (s *Server) buildToolFlow(tool string, targets []string, req startJobReques
 		wordlistPath := s.resolveWordlist(opts, wordlists.CategorySubdomains, wordlists.SubdomainsDefaultName)
 		return buildFanoutFlow("FFuF subdomain enum", targets, func(i int, target string) (engine.NodeKind, string, json.RawMessage) {
 			cfg, _ := json.Marshal(adapters.FFufConfig{
-				URL: scheme + "://FUZZ." + target + "/", Wordlist: wordlistPath, AutoCalibrate: true,
+				URL: scheme + "://FUZZ." + target + "/", Wordlist: wordlistPath, AutoCalibrate: true, Headers: credHeaders,
 				Threads: opts.Threads, Timeout: opts.TimeoutSeconds, RateLimit: opts.RateLimit,
 			})
 			return engine.KindFFuf, "ffuf: " + target, cfg
@@ -122,10 +160,43 @@ func (s *Server) buildToolFlow(tool string, targets []string, req startJobReques
 		}
 		wordlistPath := s.resolveWordlist(opts, wordlists.CategorySubdomains, wordlists.SubdomainsDefaultName)
 		return buildFanoutFlow("FFuF vhost enum", targets, func(i int, target string) (engine.NodeKind, string, json.RawMessage) {
+			headers := map[string]string{}
+			for k, v := range credHeaders {
+				headers[k] = v
+			}
+			headers["Host"] = "FUZZ." + req.HostSuffix
 			cfg, _ := json.Marshal(adapters.FFufConfig{
 				URL: scheme + "://" + target + "/", Wordlist: wordlistPath,
-				Headers: map[string]string{"Host": "FUZZ." + req.HostSuffix}, AutoCalibrate: true,
+				Headers: headers, AutoCalibrate: true,
 				Threads: opts.Threads, Timeout: opts.TimeoutSeconds, RateLimit: opts.RateLimit,
+			})
+			return engine.KindFFuf, "ffuf: " + target, cfg
+		}), nil
+
+	case ToolFFufCustom:
+		if req.FFuf == nil {
+			return engine.Flow{}, fmt.Errorf("ffuf-custom: ffuf options are required")
+		}
+		// No sensible per-target scheme/category exists here (each target is
+		// already a complete URL template) -- only fall back to the general
+		// directory wordlist when the caller didn't pick one explicitly.
+		wordlistPath := s.resolveWordlist(opts, wordlists.CategoryDirectories, wordlists.DefaultName)
+		headers := map[string]string{}
+		for k, v := range credHeaders {
+			headers[k] = v
+		}
+		for k, v := range req.FFuf.Headers {
+			headers[k] = v
+		}
+		return buildFanoutFlow("FFuF", targets, func(i int, target string) (engine.NodeKind, string, json.RawMessage) {
+			cfg, _ := json.Marshal(adapters.FFufConfig{
+				URL: target, Wordlist: wordlistPath, Extensions: req.FFuf.Extensions,
+				Headers: headers, Body: req.FFuf.Body, Method: req.FFuf.Method,
+				Threads: opts.Threads, MatchCodes: req.FFuf.MatchCodes, FilterCodes: req.FFuf.FilterCodes,
+				MatchSize: req.FFuf.MatchSize, FilterSize: req.FFuf.FilterSize, Timeout: opts.TimeoutSeconds,
+				RateLimit: opts.RateLimit, Delay: req.FFuf.Delay, Proxy: req.FFuf.Proxy,
+				AutoCalibrate: req.FFuf.AutoCalibrate, FollowRedirects: req.FFuf.FollowRedirects,
+				ExtraArgs: req.FFuf.ExtraArgs,
 			})
 			return engine.KindFFuf, "ffuf: " + target, cfg
 		}), nil
@@ -196,12 +267,27 @@ func (s *Server) handleStartJob(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
+		_ = s.store.LogActivity(caseID, "job_started", fmt.Sprintf("Started identify against %d target(s)", len(targets)))
 		go s.runIdentifyJob(caseID, jobID, targets)
 		writeJSON(w, http.StatusAccepted, jobStartResult{JobID: jobID})
 		return
 	}
 
-	flow, err := s.buildToolFlow(req.Tool, targets, req)
+	var credHeaders map[string]string
+	if req.CredentialID != "" {
+		cred, err := s.store.GetCredential(req.CredentialID)
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("credential %s not found", req.CredentialID))
+			return
+		}
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		credHeaders = mergedCredentialHeaders(cred, nil)
+	}
+
+	flow, err := s.buildToolFlow(req.Tool, targets, req, credHeaders)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -227,7 +313,8 @@ func (s *Server) handleStartJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	go s.executeToolJob(flow, jobID, runID)
+	_ = s.store.LogActivity(caseID, "job_started", fmt.Sprintf("Started %s against %d target(s)", req.Tool, len(targets)))
+	go s.executeToolJob(caseID, flow, jobID, runID)
 
 	writeJSON(w, http.StatusAccepted, jobStartResult{JobID: jobID})
 }

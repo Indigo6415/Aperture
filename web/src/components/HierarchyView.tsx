@@ -7,6 +7,9 @@ import { statusHexColor } from '../statusColor'
 import { ProgressBar } from './ProgressBar'
 import { copyToClipboard, useContextMenu } from '../contextMenu'
 import { sendToJwtScanner } from '../jwtHandoff'
+import { sendToProbe } from '../probeHandoff'
+import { sendToSecretScan } from '../secretScanHandoff'
+import { sendToRepeater } from '../repeaterHandoff'
 
 // Board geometry -- lifted verbatim from the Estate Hierarchy design spec's
 // "Layout — exact geometry" section (design_handoff_estate_hierarchy/README.md).
@@ -527,6 +530,9 @@ export function HierarchyView({
               openMenu(e, [
                 { label: 'Copy hostname', onSelect: () => copyToClipboard(apex.hostname, 'Copied hostname') },
                 { label: 'Send to JWT Scanner', onSelect: () => sendToJwtScanner(apex.hostname) },
+                { label: 'Send to Probe', onSelect: () => sendToProbe(apex.hostname) },
+                { label: 'Send to Secret Scanner', onSelect: () => sendToSecretScan(apex.hostname) },
+                { label: 'Send to Repeater', onSelect: () => sendToRepeater(apex.hostname) },
               ])
             }}
             aria-label={`${apex.hostname} apex`}
@@ -557,6 +563,9 @@ export function HierarchyView({
                   openMenu(e, [
                     { label: 'Copy hostname', onSelect: () => copyToClipboard(host.hostname, 'Copied hostname') },
                     { label: 'Send to JWT Scanner', onSelect: () => sendToJwtScanner(host.hostname) },
+                    { label: 'Send to Probe', onSelect: () => sendToProbe(host.hostname) },
+                    { label: 'Send to Secret Scanner', onSelect: () => sendToSecretScan(host.hostname) },
+                    { label: 'Send to Repeater', onSelect: () => sendToRepeater(host.hostname) },
                   ])
                 }}
                 onMouseEnter={() => setHover(host.hostname)}

@@ -44,6 +44,15 @@ type Server struct {
 	// fanning one out per discovered host unbounded would just make every
 	// one of them queue behind NVD's own rate limit anyway.
 	techSem chan struct{}
+
+	// probeMu guards pendingProbeScans: a probe scan is registered here by
+	// handleProbeScan and only actually started once handleWatchProbeScan's
+	// client subscribes to its hub channel (see runProbeScan) -- otherwise
+	// a fast scan against a responsive target could finish, and every
+	// "module" event with it, before the frontend's WebSocket connection
+	// even completes its handshake.
+	probeMu           sync.Mutex
+	pendingProbeScans map[string]pendingProbeScan
 }
 
 // maxConcurrentScreenshots is screenshotSem's capacity.
@@ -59,14 +68,15 @@ const maxConcurrentTechLookups = 4
 // the wordlist-management endpoints both read/write it.
 func NewServer(st *store.Store, eng *engine.Engine, uiFS fs.FS, wordlistsDir string) *Server {
 	s := &Server{
-		store:         st,
-		engine:        eng,
-		hub:           newHub(),
-		mux:           http.NewServeMux(),
-		wordlistsDir:  wordlistsDir,
-		jobCancels:    map[string]context.CancelFunc{},
-		screenshotSem: make(chan struct{}, maxConcurrentScreenshots),
-		techSem:       make(chan struct{}, maxConcurrentTechLookups),
+		store:             st,
+		engine:            eng,
+		hub:               newHub(),
+		mux:               http.NewServeMux(),
+		wordlistsDir:      wordlistsDir,
+		jobCancels:        map[string]context.CancelFunc{},
+		screenshotSem:     make(chan struct{}, maxConcurrentScreenshots),
+		techSem:           make(chan struct{}, maxConcurrentTechLookups),
+		pendingProbeScans: map[string]pendingProbeScan{},
 	}
 
 	// Login (and its own probe, handleMe, and logout) are the only
@@ -93,6 +103,16 @@ func NewServer(st *store.Store, eng *engine.Engine, uiFS fs.FS, wordlistsDir str
 	s.mux.HandleFunc("GET /api/cases/{id}/report", s.requireAuth(s.handleCaseReport))
 	s.mux.HandleFunc("GET /api/cases/{id}/screenshots", s.requireAuth(s.handleListCaseScreenshots))
 	s.mux.HandleFunc("GET /api/cases/{id}/screenshots/{target}", s.requireAuth(s.handleGetCaseScreenshot))
+	s.mux.HandleFunc("GET /api/cases/{id}/activity", s.requireAuth(s.handleListActivity))
+	s.mux.HandleFunc("GET /api/cases/{id}/scans", s.requireAuth(s.handleListCaseScans))
+
+	s.mux.HandleFunc("GET /api/cases/{id}/credentials", s.requireAuth(s.handleListCredentials))
+	s.mux.HandleFunc("POST /api/cases/{id}/credentials", s.requireAuth(s.handleAddCredential))
+	s.mux.HandleFunc("DELETE /api/credentials/{id}", s.requireAuth(s.handleDeleteCredential))
+
+	s.mux.HandleFunc("GET /api/job-templates", s.requireAuth(s.handleListJobTemplates))
+	s.mux.HandleFunc("POST /api/job-templates", s.requireAuth(s.handleSaveJobTemplate))
+	s.mux.HandleFunc("DELETE /api/job-templates/{id}", s.requireAuth(s.handleDeleteJobTemplate))
 
 	s.mux.HandleFunc("GET /api/cases/{id}/targets", s.requireAuth(s.handleListTargets))
 	s.mux.HandleFunc("POST /api/cases/{id}/targets", s.requireAuth(s.handleAddTarget))
@@ -116,6 +136,14 @@ func NewServer(st *store.Store, eng *engine.Engine, uiFS fs.FS, wordlistsDir str
 	s.mux.HandleFunc("GET /api/runs/{id}/findings", s.requireAuth(s.handleListFindings))
 
 	s.mux.HandleFunc("POST /api/jwt/scan", s.requireAuth(s.handleJWTScan))
+	s.mux.HandleFunc("GET /api/probe/modules", s.requireAuth(s.handleProbeModules))
+	s.mux.HandleFunc("POST /api/probe/scan", s.requireAuth(s.handleProbeScan))
+	s.mux.HandleFunc("GET /ws/probe/{id}", s.requireAuth(s.handleWatchProbeScan))
+
+	s.mux.HandleFunc("POST /api/secrets/scan", s.requireAuth(s.handleSecretScan))
+	s.mux.HandleFunc("POST /api/repeater/send", s.requireAuth(s.handleRepeaterSend))
+	s.mux.HandleFunc("GET /api/cases/{id}/repeater/history", s.requireAuth(s.handleListRepeaterHistory))
+	s.mux.HandleFunc("DELETE /api/repeater/history/{id}", s.requireAuth(s.handleDeleteRepeaterHistoryEntry))
 
 	if uiFS != nil {
 		s.mux.Handle("/", spaHandler(uiFS))

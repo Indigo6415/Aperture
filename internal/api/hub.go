@@ -5,19 +5,21 @@ import (
 
 	"github.com/Indigo6415/Aperture/internal/engine"
 	"github.com/Indigo6415/Aperture/internal/model"
+	"github.com/Indigo6415/Aperture/internal/probescan"
 	"github.com/Indigo6415/Aperture/internal/recon"
 )
 
 // RunEvent is one message streamed to WebSocket clients watching one job,
 // whatever its tool: engine-backed jobs (feroxbuster/ffuf-subdomain/
 // ffuf-vhost) emit "finding"/"status"/"progress"; an identify job emits
-// "check"; every job emits a terminal "done". The hub itself doesn't care
-// which -- it's keyed by an arbitrary string ID (a jobID), so every kind of
-// watcher shares the same plumbing. There's no "a new job started"
+// "check"; a probe scan emits "module" as each check module finishes; every
+// job emits a terminal "done". The hub itself doesn't care which -- it's
+// keyed by an arbitrary string ID (a jobID, or a probe scan ID), so every
+// kind of watcher shares the same plumbing. There's no "a new job started"
 // announcement event: every job is launched explicitly by the client, which
 // already has its ID synchronously from the POST response that created it.
 type RunEvent struct {
-	Type    string            `json:"type"` // "finding" | "status" | "progress" | "check" | "done"
+	Type    string            `json:"type"` // "finding" | "status" | "progress" | "check" | "module" | "done"
 	NodeID  string            `json:"nodeId,omitempty"`
 	Finding *model.Finding    `json:"finding,omitempty"`
 	Check   *recon.Check      `json:"check,omitempty"`
@@ -28,6 +30,15 @@ type RunEvent struct {
 	// render an indeterminate indicator rather than a percentage.
 	Done  int `json:"done,omitempty"`
 	Total int `json:"total,omitempty"`
+
+	// Module is set on a "module" event: one probe check module just
+	// finished, findings included. ProbeTarget/ProbeHealth are set
+	// alongside Status on a probe scan's terminal "done" event, since a
+	// probe scan has no case/job row a REST fallback could re-fetch them
+	// from.
+	Module      *probescan.ModuleResult  `json:"module,omitempty"`
+	ProbeTarget *probescan.Target        `json:"probeTarget,omitempty"`
+	ProbeHealth *probescan.HealthSummary `json:"probeHealth,omitempty"`
 }
 
 // hub fans out RunEvents to any number of WebSocket subscribers per job.

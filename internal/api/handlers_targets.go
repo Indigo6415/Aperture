@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 
 	"github.com/Indigo6415/Aperture/internal/store"
@@ -35,6 +36,7 @@ func (s *Server) handleAddTarget(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	_ = s.store.LogActivity(caseID, "target_added", fmt.Sprintf("Added target %q", req.Value))
 	writeJSON(w, http.StatusCreated, t)
 }
 
@@ -105,13 +107,30 @@ func (s *Server) handlePromoteTargets(w http.ResponseWriter, r *http.Request) {
 		out = append(out, t)
 	}
 
+	if len(out) > 0 {
+		_ = s.store.LogActivity(caseID, "target_promoted", fmt.Sprintf("Promoted %d target(s) from job %s (%s)", len(out), job.ID, job.Tool))
+	}
 	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) handleDeleteTarget(w http.ResponseWriter, r *http.Request) {
-	if err := s.store.DeleteTarget(r.PathValue("id")); err != nil {
+	id := r.PathValue("id")
+	// Fetched first (rather than just DELETE-ing blind, like most other
+	// delete handlers) purely so the activity log entry can name the
+	// case/value -- the route itself only carries the target's own id.
+	t, err := s.store.GetTargetByID(id)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	if err := s.store.DeleteTarget(id); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	_ = s.store.LogActivity(t.CaseID, "target_removed", fmt.Sprintf("Removed target %q", t.Value))
 	w.WriteHeader(http.StatusNoContent)
 }

@@ -207,6 +207,87 @@ CREATE TABLE IF NOT EXISTS sessions (
 	expires_at DATETIME NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
+
+-- A saved auth bundle (headers/cookie) a user can apply to Repeater/JWT
+-- Scanner/Probe/Secret Scanner instead of re-pasting the same
+-- Authorization header or session cookie into each tool every time. Scoped
+-- to a case (an engagement's credentials rarely make sense reused in
+-- another one) -- unlike settings' app-wide API keys, values here ARE
+-- returned in full on every read: this is a single-operator local tool and
+-- the whole point is reusing what's stored, not hiding it from its owner.
+CREATE TABLE IF NOT EXISTS credentials (
+	id TEXT PRIMARY KEY,
+	case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+	name TEXT NOT NULL,
+	headers TEXT,
+	cookie TEXT,
+	notes TEXT,
+	created_at DATETIME NOT NULL,
+	UNIQUE(case_id, name)
+);
+CREATE INDEX IF NOT EXISTS idx_credentials_case_id ON credentials(case_id);
+
+-- A named, reusable bundle of job-launch options (preset/threads/timeout/
+-- rate/wordlist/scheme/hostSuffix/recursive, plus ffuf-custom's own
+-- fields) for one tool, so a launcher's tuning doesn't have to be rebuilt
+-- by hand on every job. Global rather than case-scoped -- the intensity/
+-- wordlist choices this saves are reusable across every case, unlike
+-- targets or credentials.
+CREATE TABLE IF NOT EXISTS job_templates (
+	id TEXT PRIMARY KEY,
+	tool TEXT NOT NULL,
+	name TEXT NOT NULL,
+	options TEXT NOT NULL,
+	created_at DATETIME NOT NULL,
+	UNIQUE(tool, name)
+);
+
+-- A chronological log of notable actions taken within a case (targets
+-- added/removed, jobs started/finished, credentials saved, reports
+-- exported) -- a lightweight engagement record, not a full audit trail.
+CREATE TABLE IF NOT EXISTS case_activity (
+	id TEXT PRIMARY KEY,
+	case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+	kind TEXT NOT NULL,
+	message TEXT NOT NULL,
+	created_at DATETIME NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_case_activity_case_id ON case_activity(case_id);
+
+-- One row per Probe/JWT/Secret Scanner run launched with a case selected --
+-- unlike case_checks (one row per case+target+kind, overwritten on re-run),
+-- this keeps every run so a case's scan history is never silently
+-- replaced. data is the tool's raw JSON response, kept opaque here (like
+-- jobs.config) so the store package never needs to know probescan/jwtscan/
+-- secretscan's response shapes.
+CREATE TABLE IF NOT EXISTS case_scans (
+	id TEXT PRIMARY KEY,
+	case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+	target TEXT NOT NULL,
+	tool TEXT NOT NULL, -- 'probe' | 'jwt' | 'secrets'
+	severity TEXT NOT NULL, -- worst finding severity, on the same info/low/medium/high/critical scale as probescan
+	summary TEXT NOT NULL,
+	data TEXT NOT NULL,
+	created_at DATETIME NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_case_scans_case_id ON case_scans(case_id);
+
+-- One row per Repeater request sent with a case selected -- every one of
+-- Repeater's "one explicit request, one response" sends is otherwise gone
+-- the moment the tab is closed (see internal/repeater's own doc comment),
+-- so a case-scoped history lets a manual test from earlier in an
+-- engagement be revisited or replayed instead of re-typed from memory.
+CREATE TABLE IF NOT EXISTS repeater_history (
+	id TEXT PRIMARY KEY,
+	case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+	method TEXT NOT NULL,
+	url TEXT NOT NULL,
+	request_headers TEXT,
+	request_body TEXT,
+	response TEXT NOT NULL,
+	created_at DATETIME NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_repeater_history_case_id ON repeater_history(case_id);
 `
 	_, err := s.db.Exec(schema)
 	if err != nil {
@@ -513,6 +594,30 @@ func (s *Store) GetTargetByValue(caseID, value string) (Target, error) {
 	}
 	if err != nil {
 		return Target{}, fmt.Errorf("store: get target by value: %w", err)
+	}
+	t.Kind = kind.String
+	t.SourceTool = sourceTool.String
+	t.SourceJobID = sourceJobID.String
+	t.Notes = notes.String
+	return t, nil
+}
+
+// GetTargetByID looks up one target by its own id -- used by
+// handleDeleteTarget (whose route only carries the target id, not its
+// case) to know which case's activity log a deletion should be recorded
+// against before the row is gone.
+func (s *Store) GetTargetByID(id string) (Target, error) {
+	var t Target
+	var kind, sourceTool, sourceJobID, notes sql.NullString
+	err := s.db.QueryRow(`
+		SELECT id, case_id, value, kind, source_tool, source_job_id, notes, created_at
+		FROM targets WHERE id = ?
+	`, id).Scan(&t.ID, &t.CaseID, &t.Value, &kind, &sourceTool, &sourceJobID, &notes, &t.CreatedAt)
+	if err == sql.ErrNoRows {
+		return Target{}, fmt.Errorf("store: target %s: %w", id, ErrNotFound)
+	}
+	if err != nil {
+		return Target{}, fmt.Errorf("store: get target by id: %w", err)
 	}
 	t.Kind = kind.String
 	t.SourceTool = sourceTool.String
@@ -876,6 +981,338 @@ func (s *Store) HasCaseScreenshot(caseID, target string) (bool, error) {
 		return false, fmt.Errorf("store: has case screenshot: %w", err)
 	}
 	return exists, nil
+}
+
+// --- Credentials ---
+
+// Credential is a saved auth bundle for one case -- see the migrate()
+// schema comment above credentials for why values are returned in full
+// rather than redacted the way settings' app-wide API keys are.
+type Credential struct {
+	ID        string            `json:"id"`
+	CaseID    string            `json:"caseId"`
+	Name      string            `json:"name"`
+	Headers   map[string]string `json:"headers,omitempty"`
+	Cookie    string            `json:"cookie,omitempty"`
+	Notes     string            `json:"notes,omitempty"`
+	CreatedAt time.Time         `json:"createdAt"`
+}
+
+func (s *Store) SaveCredential(c Credential) error {
+	headersJSON, err := json.Marshal(c.Headers)
+	if err != nil {
+		return fmt.Errorf("store: marshal credential headers: %w", err)
+	}
+	_, err = s.db.Exec(`
+		INSERT INTO credentials (id, case_id, name, headers, cookie, notes, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, c.ID, c.CaseID, c.Name, string(headersJSON), c.Cookie, c.Notes, time.Now())
+	if err != nil {
+		return fmt.Errorf("store: save credential: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ListCredentials(caseID string) ([]Credential, error) {
+	rows, err := s.db.Query(`
+		SELECT id, case_id, name, headers, cookie, notes, created_at
+		FROM credentials WHERE case_id = ? ORDER BY created_at ASC
+	`, caseID)
+	if err != nil {
+		return nil, fmt.Errorf("store: list credentials: %w", err)
+	}
+	defer rows.Close()
+
+	out := []Credential{}
+	for rows.Next() {
+		c, err := scanCredential(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) GetCredential(id string) (Credential, error) {
+	row := s.db.QueryRow(`SELECT id, case_id, name, headers, cookie, notes, created_at FROM credentials WHERE id = ?`, id)
+	c, err := scanCredential(row)
+	if err == sql.ErrNoRows {
+		return Credential{}, fmt.Errorf("store: credential %s: %w", id, ErrNotFound)
+	}
+	if err != nil {
+		return Credential{}, fmt.Errorf("store: get credential: %w", err)
+	}
+	return c, nil
+}
+
+func (s *Store) DeleteCredential(id string) error {
+	_, err := s.db.Exec(`DELETE FROM credentials WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("store: delete credential: %w", err)
+	}
+	return nil
+}
+
+// credentialScanner is satisfied by both *sql.Row and *sql.Rows, so
+// GetCredential and ListCredentials can share one scan+decode routine.
+type credentialScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanCredential(row credentialScanner) (Credential, error) {
+	var c Credential
+	var headersJSON, cookie, notes sql.NullString
+	if err := row.Scan(&c.ID, &c.CaseID, &c.Name, &headersJSON, &cookie, &notes, &c.CreatedAt); err != nil {
+		return Credential{}, err
+	}
+	if headersJSON.String != "" {
+		if err := json.Unmarshal([]byte(headersJSON.String), &c.Headers); err != nil {
+			return Credential{}, fmt.Errorf("store: decode credential headers: %w", err)
+		}
+	}
+	c.Cookie = cookie.String
+	c.Notes = notes.String
+	return c, nil
+}
+
+// --- Job templates ---
+
+// JobTemplate is a named, reusable bundle of job-launch options for one
+// tool -- see the migrate() schema comment above job_templates.
+type JobTemplate struct {
+	ID        string    `json:"id"`
+	Tool      string    `json:"tool"`
+	Name      string    `json:"name"`
+	Options   string    `json:"options"` // raw JSON, opaque to store -- mirrors Job.Config
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+func (s *Store) SaveJobTemplate(t JobTemplate) error {
+	_, err := s.db.Exec(`
+		INSERT INTO job_templates (id, tool, name, options, created_at)
+		VALUES (?, ?, ?, ?, ?)
+	`, t.ID, t.Tool, t.Name, t.Options, time.Now())
+	if err != nil {
+		return fmt.Errorf("store: save job template: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ListJobTemplates(tool string) ([]JobTemplate, error) {
+	rows, err := s.db.Query(`
+		SELECT id, tool, name, options, created_at FROM job_templates WHERE tool = ? ORDER BY created_at ASC
+	`, tool)
+	if err != nil {
+		return nil, fmt.Errorf("store: list job templates: %w", err)
+	}
+	defer rows.Close()
+
+	out := []JobTemplate{}
+	for rows.Next() {
+		var t JobTemplate
+		if err := rows.Scan(&t.ID, &t.Tool, &t.Name, &t.Options, &t.CreatedAt); err != nil {
+			return nil, fmt.Errorf("store: job template row: %w", err)
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) DeleteJobTemplate(id string) error {
+	_, err := s.db.Exec(`DELETE FROM job_templates WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("store: delete job template: %w", err)
+	}
+	return nil
+}
+
+// --- Case activity ---
+
+// Activity is one logged case event -- see the migrate() schema comment
+// above case_activity.
+type Activity struct {
+	ID        string    `json:"id"`
+	CaseID    string    `json:"caseId"`
+	Kind      string    `json:"kind"`
+	Message   string    `json:"message"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+// activityListLimit caps how many rows ListActivity returns -- this is a
+// running engagement log meant to be skimmed, not a paginated archive.
+const activityListLimit = 500
+
+// LogActivity records one case event, minting its own id/timestamp. Every
+// call site treats a logging failure as non-fatal to the action it's
+// recording (the action itself already succeeded) -- see its callers'
+// `_ = s.store.LogActivity(...)` convention.
+func (s *Store) LogActivity(caseID, kind, message string) error {
+	_, err := s.db.Exec(`
+		INSERT INTO case_activity (id, case_id, kind, message, created_at)
+		VALUES (?, ?, ?, ?, ?)
+	`, randomID(), caseID, kind, message, time.Now())
+	if err != nil {
+		return fmt.Errorf("store: log activity: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ListActivity(caseID string) ([]Activity, error) {
+	rows, err := s.db.Query(`
+		SELECT id, case_id, kind, message, created_at FROM case_activity
+		WHERE case_id = ? ORDER BY created_at DESC LIMIT ?
+	`, caseID, activityListLimit)
+	if err != nil {
+		return nil, fmt.Errorf("store: list activity: %w", err)
+	}
+	defer rows.Close()
+
+	out := []Activity{}
+	for rows.Next() {
+		var a Activity
+		if err := rows.Scan(&a.ID, &a.CaseID, &a.Kind, &a.Message, &a.CreatedAt); err != nil {
+			return nil, fmt.Errorf("store: activity row: %w", err)
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// --- Case scans (persisted Probe/JWT/Secret Scanner runs) ---
+
+// CaseScan is one Probe/JWT/Secret Scanner run launched with a case
+// selected -- see the migrate() schema comment above case_scans.
+type CaseScan struct {
+	ID        string    `json:"id"`
+	CaseID    string    `json:"caseId"`
+	Target    string    `json:"target"`
+	Tool      string    `json:"tool"`
+	Severity  string    `json:"severity"`
+	Summary   string    `json:"summary"`
+	Data      string    `json:"data,omitempty"` // raw JSON, opaque to store -- only sent on GetCaseScan, not the list view
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+func (s *Store) SaveCaseScan(c CaseScan) error {
+	_, err := s.db.Exec(`
+		INSERT INTO case_scans (id, case_id, target, tool, severity, summary, data, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, c.ID, c.CaseID, c.Target, c.Tool, c.Severity, c.Summary, c.Data, time.Now())
+	if err != nil {
+		return fmt.Errorf("store: save case scan: %w", err)
+	}
+	return nil
+}
+
+// ListCaseScans returns every scan recorded for a case, most recent first,
+// without each row's raw data payload -- a case can accumulate many scans
+// over an engagement, and the list view (Activity/Risk Panel) only ever
+// needs target/tool/severity/summary.
+func (s *Store) ListCaseScans(caseID string) ([]CaseScan, error) {
+	rows, err := s.db.Query(`
+		SELECT id, case_id, target, tool, severity, summary, created_at
+		FROM case_scans WHERE case_id = ? ORDER BY created_at DESC
+	`, caseID)
+	if err != nil {
+		return nil, fmt.Errorf("store: list case scans: %w", err)
+	}
+	defer rows.Close()
+
+	out := []CaseScan{}
+	for rows.Next() {
+		var c CaseScan
+		if err := rows.Scan(&c.ID, &c.CaseID, &c.Target, &c.Tool, &c.Severity, &c.Summary, &c.CreatedAt); err != nil {
+			return nil, fmt.Errorf("store: case scan row: %w", err)
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// GetCaseScan returns one scan's full record, including its raw data
+// payload -- used when a case scan's details are opened individually.
+func (s *Store) GetCaseScan(id string) (CaseScan, error) {
+	var c CaseScan
+	err := s.db.QueryRow(`
+		SELECT id, case_id, target, tool, severity, summary, data, created_at FROM case_scans WHERE id = ?
+	`, id).Scan(&c.ID, &c.CaseID, &c.Target, &c.Tool, &c.Severity, &c.Summary, &c.Data, &c.CreatedAt)
+	if err == sql.ErrNoRows {
+		return CaseScan{}, fmt.Errorf("store: case scan %s: %w", id, ErrNotFound)
+	}
+	if err != nil {
+		return CaseScan{}, fmt.Errorf("store: get case scan: %w", err)
+	}
+	return c, nil
+}
+
+// --- Repeater history ---
+
+// RepeaterEntry is one sent Repeater request+response, kept for a case's
+// history -- see the migrate() schema comment above repeater_history.
+type RepeaterEntry struct {
+	ID             string            `json:"id"`
+	CaseID         string            `json:"caseId"`
+	Method         string            `json:"method"`
+	URL            string            `json:"url"`
+	RequestHeaders map[string]string `json:"requestHeaders,omitempty"`
+	RequestBody    string            `json:"requestBody,omitempty"`
+	Response       string            `json:"response"` // raw JSON of repeater.Response, opaque to store
+	CreatedAt      time.Time         `json:"createdAt"`
+}
+
+func (s *Store) SaveRepeaterEntry(e RepeaterEntry) error {
+	headersJSON, err := json.Marshal(e.RequestHeaders)
+	if err != nil {
+		return fmt.Errorf("store: marshal repeater headers: %w", err)
+	}
+	_, err = s.db.Exec(`
+		INSERT INTO repeater_history (id, case_id, method, url, request_headers, request_body, response, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, e.ID, e.CaseID, e.Method, e.URL, string(headersJSON), e.RequestBody, e.Response, time.Now())
+	if err != nil {
+		return fmt.Errorf("store: save repeater entry: %w", err)
+	}
+	return nil
+}
+
+// repeaterHistoryLimit caps how many entries ListRepeaterHistory returns --
+// a history meant to be skimmed for "what did I just send," not a
+// paginated archive, matching activityListLimit's reasoning.
+const repeaterHistoryLimit = 200
+
+func (s *Store) ListRepeaterHistory(caseID string) ([]RepeaterEntry, error) {
+	rows, err := s.db.Query(`
+		SELECT id, case_id, method, url, request_headers, request_body, response, created_at
+		FROM repeater_history WHERE case_id = ? ORDER BY created_at DESC LIMIT ?
+	`, caseID, repeaterHistoryLimit)
+	if err != nil {
+		return nil, fmt.Errorf("store: list repeater history: %w", err)
+	}
+	defer rows.Close()
+
+	out := []RepeaterEntry{}
+	for rows.Next() {
+		var e RepeaterEntry
+		var headersJSON, body sql.NullString
+		if err := rows.Scan(&e.ID, &e.CaseID, &e.Method, &e.URL, &headersJSON, &body, &e.Response, &e.CreatedAt); err != nil {
+			return nil, fmt.Errorf("store: repeater entry row: %w", err)
+		}
+		e.RequestBody = body.String
+		if headersJSON.Valid && headersJSON.String != "" && headersJSON.String != "null" {
+			_ = json.Unmarshal([]byte(headersJSON.String), &e.RequestHeaders)
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) DeleteRepeaterEntry(id string) error {
+	_, err := s.db.Exec(`DELETE FROM repeater_history WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("store: delete repeater entry: %w", err)
+	}
+	return nil
 }
 
 // --- Settings ---

@@ -22,6 +22,17 @@ type CVE struct {
 	Score       float64   `json:"score"`
 	Published   time.Time `json:"published"`
 	References  []string  `json:"references"`
+	// KEV/EPSS are exploit-likelihood signals layered on top of NVD's own
+	// CVSS severity -- filled in by EnrichExploitSignals, not by Lookup
+	// itself (NVD's API knows nothing about either). KEV is true when this
+	// CVE is in CISA's Known Exploited Vulnerabilities catalog: confirmed
+	// active exploitation, not a theoretical score. EPSS is FIRST.org's
+	// predicted probability (0-1) of exploitation in the next 30 days, left
+	// at zero when no EPSS score exists for this CVE yet (too new, or
+	// withdrawn) -- indistinguishable from a genuinely near-zero score, but
+	// EPSS itself treats those the same way (nothing to prioritize either).
+	KEV  bool    `json:"kev,omitempty"`
+	EPSS float64 `json:"epss,omitempty"`
 }
 
 const (

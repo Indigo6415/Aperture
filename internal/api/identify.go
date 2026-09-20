@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/Indigo6415/Aperture/internal/cve"
@@ -78,6 +79,7 @@ func (s *Server) runIdentifyJob(caseID, jobID string, targets []string) {
 		final = store.RunCancelled
 	}
 	_ = s.store.FinishJob(jobID, final, "")
+	_ = s.store.LogActivity(caseID, "job_finished", fmt.Sprintf("Job %s finished: %s", jobID, final))
 	s.hub.publish(jobID, RunEvent{Type: "done", Message: string(final)})
 }
 
@@ -155,6 +157,9 @@ func (s *Server) cvesFor(ctx context.Context, product, version, nvdKey string) [
 	if err != nil {
 		return nil
 	}
+	// Layered on before caching, so a cache hit above already carries KEV/
+	// EPSS too and doesn't need to re-fetch either on every repeat lookup.
+	cve.EnrichExploitSignals(ctx, cves)
 	if data, err := json.Marshal(cves); err == nil {
 		_ = s.store.SetCVECache(product, version, string(data))
 	}

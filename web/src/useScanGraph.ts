@@ -20,6 +20,12 @@ export interface GraphNode extends SimulationNodeDatum {
   host?: string
   category?: string
   cves?: CVE[]
+  // Set only on 'target' nodes once an 'asn' check completes for that
+  // host (see internal/recon/asn.go) -- the hosting network Team Cymru's
+  // DNS-based lookup resolved, backing the Estate Hierarchy view's
+  // network/ASN clustering mode (see estate.ts's clusterOfNetwork).
+  asn?: string
+  asnOrg?: string
 }
 
 export type GraphEdge = SimulationLinkDatum<GraphNode> & { id: string }
@@ -179,6 +185,15 @@ export function useScanGraph(
         const nodeId = ensureTargetNode(check.domain)
         const node = nodesRef.current.get(nodeId)
         if (node) node.statusCode = check.data?.statusCode as number | undefined
+        return
+      }
+      if (check.kind === 'asn') {
+        const nodeId = ensureTargetNode(check.domain)
+        const node = nodesRef.current.get(nodeId)
+        if (node) {
+          node.asn = check.data?.asn as string | undefined
+          node.asnOrg = check.data?.org as string | undefined
+        }
         return
       }
       if (check.kind === 'technologies') {

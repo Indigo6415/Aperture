@@ -6,6 +6,7 @@ package engine
 const (
 	PresetAggressive = "aggressive"
 	PresetStealth    = "stealth"
+	PresetNormal     = "normal"
 	PresetCustom     = "custom"
 )
 
@@ -31,9 +32,15 @@ type ScanOptions struct {
 // presetDefaults backs each preset's Threads/TimeoutSeconds/RateLimit --
 // aggressive favors speed (many threads, a rate limit doesn't help attacker
 // stealth so it's left unlimited), stealth favors staying under the radar
-// (few threads, a generous per-request timeout, and a capped rate).
+// (few threads, a generous per-request timeout, and a capped rate), and
+// normal is a balanced middle ground -- unlike "custom" (which leaves
+// unset fields at the tool's own binary default, e.g. ffuf's 40 threads or
+// feroxbuster's 50), normal is an explicit, tool-independent choice so the
+// three presets read as a real stealthy/normal/aggressive spectrum rather
+// than two extremes and an "unset."
 var presetDefaults = map[string]ScanOptions{
 	PresetAggressive: {Threads: 80, TimeoutSeconds: 5, RateLimit: 0},
+	PresetNormal:     {Threads: 20, TimeoutSeconds: 10, RateLimit: 0},
 	PresetStealth:    {Threads: 3, TimeoutSeconds: 15, RateLimit: 5},
 }
 

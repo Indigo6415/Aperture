@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { api } from '../api'
 import { useScanGraph, type GraphNode, type GraphNodeType } from '../useScanGraph'
 import { buildEstateModel } from '../useEstateModel'
+import type { ClusterMode } from '../estate'
 import { statusHexColor } from '../statusColor'
 import { isDangerousExtension } from '../extensions'
 import { FacetFilterBar, type FacetDimension } from './FacetFilterBar'
@@ -37,6 +38,10 @@ type Mode = 'hierarchy' | 'graph'
 export function GraphView({ caseId }: { caseId: string }) {
   const [caseName, setCaseName] = useState('')
   const [mode, setMode] = useState<Mode>('hierarchy')
+  // clusterBy only affects hierarchy mode's grouping tier -- 'stack'
+  // (shared technology fingerprint) is the long-standing default,
+  // 'network' groups by hosting ASN/organization instead (see estate.ts).
+  const [clusterBy, setClusterBy] = useState<ClusterMode>('stack')
 
   useEffect(() => {
     let cancelled = false
@@ -49,7 +54,7 @@ export function GraphView({ caseId }: { caseId: string }) {
   }, [caseId])
 
   const { nodes: allNodes, edges: allEdges, progress, pageGroupsByHost } = useScanGraph(caseId, caseName)
-  const estateModel = useMemo(() => buildEstateModel(allNodes, allEdges, caseName), [allNodes, allEdges, caseName])
+  const estateModel = useMemo(() => buildEstateModel(allNodes, allEdges, caseName, clusterBy), [allNodes, allEdges, caseName, clusterBy])
 
   const [typeVisible, setTypeVisible] = useState<Record<GraphNodeType, boolean>>({ case: true, target: true, page: true, technology: true })
   const [search, setSearch] = useState('')
@@ -97,6 +102,26 @@ export function GraphView({ caseId }: { caseId: string }) {
             </button>
           ))}
         </div>
+
+        {mode === 'hierarchy' && (
+          <>
+            <span className="ml-3 text-[10px] font-semibold uppercase tracking-wide text-neutral-500">Cluster by</span>
+            <div className="flex gap-1">
+              {(['stack', 'network'] as ClusterMode[]).map((c) => (
+                <button
+                  key={c}
+                  onClick={() => setClusterBy(c)}
+                  title={c === 'stack' ? 'Group hosts by shared technology fingerprint' : 'Group hosts by shared hosting ASN/organization'}
+                  className={`rounded border px-2 py-0.5 text-xs capitalize transition-colors ${
+                    clusterBy === c ? 'border-sky-500 bg-sky-950/40 text-sky-300' : 'border-neutral-700 bg-transparent text-neutral-400 hover:border-neutral-500'
+                  }`}
+                >
+                  {c === 'stack' ? 'Tech stack' : 'Network'}
+                </button>
+              ))}
+            </div>
+          </>
+        )}
       </div>
 
       {mode === 'hierarchy' ? (

@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type ReactElement, type SVGProps } from 'react'
 import { api, watchJob } from '../api'
-import type { Case, Check, CheckKind, Finding, Job, JobOptions, JobOptionsPreset, NodeStatus, RunStatus, Target, Tool } from '../types'
+import type { Case, CaseScan, Check, CheckKind, Credential, Finding, Job, JobOptions, JobOptionsPreset, NodeStatus, RunStatus, Target, Tool } from '../types'
+import { JOB_PRESETS } from '../presets'
 import { statusHexColor } from '../statusColor'
 import { estimateEtaSeconds } from '../eta'
 import { ResultsTable } from './ResultsTable'
@@ -8,9 +9,44 @@ import { TargetProgressPanel, type TargetProgress } from './TargetProgressPanel'
 import { GraphView } from './GraphView'
 import { TechTable } from './TechTable'
 import { JwtScan } from './JwtScan'
+import { Probe } from './Probe'
+import { SecretScan } from './SecretScan'
+import { Repeater } from './Repeater'
+import { FfufTab } from './Ffuf'
+import { JobHistory } from './JobHistory'
+import { TargetPicker } from './TargetPicker'
 import { copyToClipboard, useContextMenu } from '../contextMenu'
 import { showToast } from '../toast'
 import { sendToJwtScanner, onJwtScannerRequest, type JwtScannerRequest } from '../jwtHandoff'
+import { sendToProbe, onProbeRequest, type ProbeRequest } from '../probeHandoff'
+import { sendToSecretScan, onSecretScanRequest, type SecretScanRequest } from '../secretScanHandoff'
+import { sendToRepeater, onRepeaterRequest, type RepeaterHandoffRequest } from '../repeaterHandoff'
+import { CollapsibleFormPanel } from './CollapsibleFormPanel'
+import { useAutoCollapseOnce, useAutoExpandOnce, useCollapsible } from '../collapsible'
+import { CredentialVault } from './CredentialVault'
+import { CredentialPicker } from './CredentialPicker'
+import { ActivityTimeline } from './ActivityTimeline'
+import { RiskPanel } from './RiskPanel'
+import { JobTemplatePicker } from './JobTemplatePicker'
+import {
+  IconActivity,
+  IconChart,
+  IconCrosshair,
+  IconFolderSearch,
+  IconGlobe,
+  IconKey,
+  IconLightning,
+  IconLock,
+  IconRadar,
+  IconRepeat,
+  IconScan,
+  IconServer,
+  IconShieldKey,
+  IconSitemap,
+  IconTarget,
+  IconWarning,
+  IconWrench,
+} from './icons'
 
 const CHECK_LABELS: Record<CheckKind, string> = {
   dns: 'DNS',
@@ -22,6 +58,7 @@ const CHECK_LABELS: Record<CheckKind, string> = {
   takeover: 'Takeover',
   dnsdumpster: 'DNSDumpster',
   technologies: 'Technologies',
+  asn: 'Hosting network',
 }
 
 const STATUS_DOT: Record<Check['status'] | 'pending', string> = {
@@ -35,16 +72,57 @@ function keyFor(target: string, kind: CheckKind): string {
   return `${target}::${kind}`
 }
 
-type Tab = 'targets' | 'identify' | 'feroxbuster' | 'ffuf-subdomain' | 'ffuf-vhost' | 'graph' | 'jwtscan'
+type Tab =
+  | 'targets'
+  | 'credentials'
+  | 'identify'
+  | 'risk'
+  | 'feroxbuster'
+  | 'ffuf-subdomain'
+  | 'ffuf-vhost'
+  | 'ffuf-custom'
+  | 'graph'
+  | 'jwtscan'
+  | 'probe'
+  | 'secrets'
+  | 'repeater'
+  | 'activity'
 
-const TABS: { id: Tab; label: string }[] = [
-  { id: 'targets', label: 'Targets' },
-  { id: 'identify', label: 'Identify' },
-  { id: 'feroxbuster', label: 'Feroxbuster' },
-  { id: 'ffuf-subdomain', label: 'FFuF Subdomain' },
-  { id: 'ffuf-vhost', label: 'FFuF VHost' },
-  { id: 'jwtscan', label: 'JWT Scanner' },
-  { id: 'graph', label: 'Graph' },
+type IconType = (props: SVGProps<SVGSVGElement>) => ReactElement
+
+const TAB_META: Record<Tab, { label: string; icon: IconType }> = {
+  targets: { label: 'Targets', icon: IconTarget },
+  credentials: { label: 'Credentials', icon: IconKey },
+  identify: { label: 'Identify', icon: IconRadar },
+  feroxbuster: { label: 'Directory Scanner', icon: IconFolderSearch },
+  'ffuf-subdomain': { label: 'Subdomain Scanner', icon: IconGlobe },
+  'ffuf-vhost': { label: 'VHost Scanner', icon: IconServer },
+  'ffuf-custom': { label: 'FFuF', icon: IconLightning },
+  jwtscan: { label: 'JWT Scanner', icon: IconShieldKey },
+  probe: { label: 'Probe', icon: IconCrosshair },
+  secrets: { label: 'Secrets', icon: IconLock },
+  repeater: { label: 'Repeater', icon: IconRepeat },
+  risk: { label: 'Risk', icon: IconWarning },
+  graph: { label: 'Graph', icon: IconSitemap },
+  activity: { label: 'Activity', icon: IconActivity },
+}
+
+// NAV_GROUPS is the left navbar's shape: case-management tabs pinned above
+// the groups, then groups ordered the way a case is actually worked --
+// identify the target first, run the automated scanners, reach for a
+// standalone tool for something targeted, and finish in the
+// intelligence/analysis views that summarize everything above. Each group
+// (other than the pinned "Case" one) is independently collapsible -- see
+// the `navGroupOpen` state below.
+type NavGroup = { id: string; label: string; icon: IconType; tabs: Tab[] }
+
+const PINNED_TABS: Tab[] = ['targets', 'credentials']
+
+const NAV_GROUPS: NavGroup[] = [
+  { id: 'identify', label: 'Identify', icon: IconRadar, tabs: ['identify'] },
+  { id: 'scanners', label: 'Scanners', icon: IconScan, tabs: ['feroxbuster', 'ffuf-subdomain', 'ffuf-vhost'] },
+  { id: 'tools', label: 'Tools', icon: IconWrench, tabs: ['ffuf-custom', 'jwtscan', 'probe', 'secrets', 'repeater'] },
+  { id: 'intelligence', label: 'Intelligence', icon: IconChart, tabs: ['risk', 'graph', 'activity'] },
 ]
 
 // CaseView is one case's workspace: a left navbar switching between Targets,
@@ -55,7 +133,9 @@ const TABS: { id: Tab; label: string }[] = [
 export function CaseView({ caseId }: { caseId: string }) {
   const [c, setCase] = useState<Case | null>(null)
   const [targets, setTargets] = useState<Target[]>([])
+  const [credentials, setCredentials] = useState<Credential[]>([])
   const [jobs, setJobs] = useState<Job[]>([])
+  const [caseScans, setCaseScans] = useState<CaseScan[]>([])
   const [checks, setChecks] = useState<Record<string, Check>>({})
   const [runFindings, setRunFindings] = useState<Record<string, Finding[]>>({}) // keyed by jobId
   const [jobStatus, setJobStatus] = useState<Record<string, RunStatus>>({}) // keyed by jobId, overrides job.status once live events arrive
@@ -66,11 +146,23 @@ export function CaseView({ caseId }: { caseId: string }) {
   const nodeStartedAtRef = useRef<Record<string, number>>({})
   const [tab, setTab] = useState<Tab>('targets')
   const [reportFormat, setReportFormat] = useState<'json' | 'html' | 'pdf'>('html')
+  // Collapses the tab nav to a slim dot rail so a case with many tools open
+  // gives the active tab's content the width instead of a permanently fixed
+  // 12rem sidebar -- persisted like every other collapse toggle in this file.
+  const [navOpen, setNavOpen] = useCollapsible('caseNav', true)
   // Set by a "Send to JWT Scanner" context-menu item anywhere in this case
   // (Targets list, tool results, graph/hierarchy nodes -- see
   // jwtHandoff.ts); JwtScan applies it even though it stays mounted the
   // whole time this case is open.
   const [jwtPrefill, setJwtPrefill] = useState<JwtScannerRequest | undefined>()
+  // Set by a "Send to Probe" context-menu item, same shape as jwtPrefill
+  // above -- see probeHandoff.ts.
+  const [probePrefill, setProbePrefill] = useState<ProbeRequest | undefined>()
+  // Set by a "Send to Secret Scanner" context-menu item -- see
+  // secretScanHandoff.ts.
+  const [secretScanPrefill, setSecretScanPrefill] = useState<SecretScanRequest | undefined>()
+  // Set by a "Send to Repeater" context-menu item -- see repeaterHandoff.ts.
+  const [repeaterPrefill, setRepeaterPrefill] = useState<RepeaterHandoffRequest | undefined>()
 
   // Only one case is ever open at a time, so this subscription always
   // targets whichever case is currently visible -- no need to key it by
@@ -79,6 +171,27 @@ export function CaseView({ caseId }: { caseId: string }) {
     return onJwtScannerRequest((req) => {
       setJwtPrefill(req)
       setTab('jwtscan')
+    })
+  }, [])
+
+  useEffect(() => {
+    return onProbeRequest((req) => {
+      setProbePrefill(req)
+      setTab('probe')
+    })
+  }, [])
+
+  useEffect(() => {
+    return onSecretScanRequest((req) => {
+      setSecretScanPrefill(req)
+      setTab('secrets')
+    })
+  }, [])
+
+  useEffect(() => {
+    return onRepeaterRequest((req) => {
+      setRepeaterPrefill(req)
+      setTab('repeater')
     })
   }, [])
 
@@ -117,7 +230,9 @@ export function CaseView({ caseId }: { caseId: string }) {
     let cancelled = false
     setCase(null)
     setTargets([])
+    setCredentials([])
     setJobs([])
+    setCaseScans([])
     setChecks({})
     setRunFindings({})
     setJobStatus({})
@@ -134,6 +249,9 @@ export function CaseView({ caseId }: { caseId: string }) {
     api.listTargets(caseId).then((t) => {
       if (!cancelled) setTargets(t)
     })
+    api.listCredentials(caseId).then((c) => {
+      if (!cancelled) setCredentials(c)
+    })
     api.listCaseChecks(caseId).then((list) => {
       if (cancelled) return
       const byKey: Record<string, Check> = {}
@@ -144,6 +262,9 @@ export function CaseView({ caseId }: { caseId: string }) {
       if (cancelled) return
       setJobs(js)
       for (const j of js) watchTheJob(j)
+    })
+    api.listCaseScans(caseId).then((list) => {
+      if (!cancelled) setCaseScans(list)
     })
 
     return () => {
@@ -157,6 +278,19 @@ export function CaseView({ caseId }: { caseId: string }) {
   const refreshTargets = () => {
     api.listTargets(caseId).then(setTargets)
   }
+
+  const refreshCredentials = () => {
+    api.listCredentials(caseId).then(setCredentials)
+  }
+
+  // Probe/JWT/Secret Scanner runs are one-shot actions with no live stream
+  // (unlike checks/findings above), so the Risk Panel's rollup of them is
+  // only ever as fresh as its last fetch -- refetched every time that tab
+  // is opened rather than polled continuously.
+  useEffect(() => {
+    if (tab === 'risk') api.listCaseScans(caseId).then(setCaseScans)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, caseId])
 
   const addJob = (job: Job) => {
     setJobs((prev) => [...prev, job])
@@ -207,8 +341,15 @@ export function CaseView({ caseId }: { caseId: string }) {
     'ffuf-subdomain':
       jobsOfTool('ffuf-subdomain').length === 0 ? STATUS_DOT.pending : jobsOfTool('ffuf-subdomain').some((j) => statusOf(j) === 'running') ? STATUS_DOT.running : STATUS_DOT.done,
     'ffuf-vhost': jobsOfTool('ffuf-vhost').length === 0 ? STATUS_DOT.pending : jobsOfTool('ffuf-vhost').some((j) => statusOf(j) === 'running') ? STATUS_DOT.running : STATUS_DOT.done,
+    'ffuf-custom': jobsOfTool('ffuf-custom').length === 0 ? STATUS_DOT.pending : jobsOfTool('ffuf-custom').some((j) => statusOf(j) === 'running') ? STATUS_DOT.running : STATUS_DOT.done,
     graph: STATUS_DOT.done,
     jwtscan: STATUS_DOT.done,
+    probe: STATUS_DOT.done,
+    secrets: STATUS_DOT.done,
+    repeater: STATUS_DOT.done,
+    credentials: STATUS_DOT.done,
+    risk: STATUS_DOT.done,
+    activity: STATUS_DOT.done,
   }
   const counts: Record<Tab, number | null> = {
     targets: targets.length,
@@ -216,8 +357,15 @@ export function CaseView({ caseId }: { caseId: string }) {
     feroxbuster: findingsOfTool('feroxbuster').length,
     'ffuf-subdomain': findingsOfTool('ffuf-subdomain').length,
     'ffuf-vhost': findingsOfTool('ffuf-vhost').length,
+    'ffuf-custom': findingsOfTool('ffuf-custom').length,
     graph: null,
     jwtscan: null,
+    probe: null,
+    secrets: null,
+    repeater: null,
+    credentials: credentials.length,
+    risk: null,
+    activity: null,
   }
 
   return (
@@ -251,21 +399,46 @@ export function CaseView({ caseId }: { caseId: string }) {
       </header>
 
       <div className="flex flex-1 overflow-hidden">
-        <aside className="w-48 shrink-0 space-y-0.5 overflow-y-auto border-r border-neutral-800 bg-neutral-950 p-2">
-          {TABS.map((t) => (
-            <button
-              key={t.id}
-              onClick={() => setTab(t.id)}
-              className={`flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm ${
-                tab === t.id ? 'bg-neutral-800 text-neutral-100' : 'text-neutral-400 hover:bg-neutral-900 hover:text-neutral-200'
-              }`}
-            >
-              <span className="inline-block h-1.5 w-1.5 shrink-0 rounded-full" style={{ background: dots[t.id] }} />
-              <span className="flex-1">{t.label}</span>
-              {counts[t.id] !== null && <span className="text-xs text-neutral-500">{counts[t.id]}</span>}
+        {navOpen ? (
+          <aside className="flex w-52 shrink-0 flex-col overflow-y-auto border-r border-neutral-800 bg-neutral-950 p-2">
+            <button onClick={() => setNavOpen(false)} title="Collapse" className="mb-1 self-end px-1 text-xs text-neutral-600 hover:text-neutral-300">
+              ◂
             </button>
-          ))}
-        </aside>
+            <div className="space-y-0.5">
+              {PINNED_TABS.map((id) => (
+                <NavTabButton key={id} id={id} active={tab === id} dot={dots[id]} count={counts[id]} onSelect={() => setTab(id)} />
+              ))}
+            </div>
+            <div className="my-2 border-t border-neutral-900" />
+            <div className="space-y-1">
+              {NAV_GROUPS.map((group) => (
+                <NavGroupSection key={group.id} group={group} activeTab={tab} dots={dots} counts={counts} onSelect={setTab} />
+              ))}
+            </div>
+          </aside>
+        ) : (
+          <aside className="flex w-9 shrink-0 flex-col items-center gap-1 overflow-y-auto border-r border-neutral-800 bg-neutral-950 py-2">
+            <button onClick={() => setNavOpen(true)} title="Expand navigation" className="mb-1 text-neutral-600 hover:text-neutral-300">
+              ▸
+            </button>
+            {[...PINNED_TABS, ...NAV_GROUPS.flatMap((g) => g.tabs)].map((id) => {
+              const Icon = TAB_META[id].icon
+              return (
+                <button
+                  key={id}
+                  onClick={() => setTab(id)}
+                  title={`${TAB_META[id].label}${counts[id] !== null ? ` (${counts[id]})` : ''}`}
+                  className={`relative flex h-7 w-7 items-center justify-center rounded ${
+                    tab === id ? 'bg-neutral-800 text-neutral-100' : 'text-neutral-500 hover:bg-neutral-900 hover:text-neutral-300'
+                  }`}
+                >
+                  <Icon className="h-4 w-4" />
+                  <span className="absolute right-0.5 top-0.5 h-1.5 w-1.5 rounded-full" style={{ background: dots[id] }} />
+                </button>
+              )
+            })}
+          </aside>
+        )}
 
         {/* Every tab stays mounted (toggled via `hidden`, not conditional
             rendering) so switching tabs to peek at another tool doesn't
@@ -274,6 +447,10 @@ export function CaseView({ caseId }: { caseId: string }) {
         <div className="flex-1 overflow-hidden">
           <div className={`h-full ${tab === 'targets' ? '' : 'hidden'}`}>
             <TargetsTab caseId={caseId} targets={targets} onChange={refreshTargets} />
+          </div>
+
+          <div className={`h-full overflow-y-auto ${tab === 'credentials' ? '' : 'hidden'}`}>
+            <CredentialVault caseId={caseId} credentials={credentials} onChanged={refreshCredentials} />
           </div>
 
           <div className={`h-full ${tab === 'identify' ? '' : 'hidden'}`}>
@@ -294,6 +471,7 @@ export function CaseView({ caseId }: { caseId: string }) {
               caseId={caseId}
               tool="feroxbuster"
               targets={targets}
+              credentials={credentials}
               jobs={jobsOfTool('feroxbuster')}
               findings={findingsOfTool('feroxbuster')}
               statusOf={statusOf}
@@ -314,6 +492,7 @@ export function CaseView({ caseId }: { caseId: string }) {
               caseId={caseId}
               tool="ffuf-subdomain"
               targets={targets}
+              credentials={credentials}
               jobs={jobsOfTool('ffuf-subdomain')}
               findings={findingsOfTool('ffuf-subdomain')}
               statusOf={statusOf}
@@ -332,6 +511,7 @@ export function CaseView({ caseId }: { caseId: string }) {
               caseId={caseId}
               tool="ffuf-vhost"
               targets={targets}
+              credentials={credentials}
               jobs={jobsOfTool('ffuf-vhost')}
               findings={findingsOfTool('ffuf-vhost')}
               statusOf={statusOf}
@@ -346,15 +526,129 @@ export function CaseView({ caseId }: { caseId: string }) {
             />
           </div>
 
+          <div className={`h-full ${tab === 'ffuf-custom' ? '' : 'hidden'}`}>
+            <FfufTab
+              caseId={caseId}
+              targets={targets}
+              credentials={credentials}
+              jobs={jobsOfTool('ffuf-custom')}
+              findings={findingsOfTool('ffuf-custom')}
+              statusOf={statusOf}
+              nodeStatus={nodeStatus}
+              jobProgress={jobProgress}
+              nodeStartedAtRef={nodeStartedAtRef}
+              onStart={addJob}
+              onCancel={cancelJob}
+              onPromote={(values) => promoteFromTool('ffuf-custom', values)}
+            />
+          </div>
+
+          <div className={`h-full ${tab === 'risk' ? '' : 'hidden'}`}>
+            <RiskPanel checks={checks} targets={targets} jobs={jobs} caseScans={caseScans} />
+          </div>
+
           <div className={`h-full ${tab === 'graph' ? '' : 'hidden'}`}>
             <GraphView caseId={caseId} />
           </div>
 
-          <div className={`h-full overflow-y-auto ${tab === 'jwtscan' ? '' : 'hidden'}`}>
-            <JwtScan prefill={jwtPrefill} />
+          <div className={`h-full overflow-hidden ${tab === 'jwtscan' ? '' : 'hidden'}`}>
+            <JwtScan caseId={caseId} targets={targets} credentials={credentials} prefill={jwtPrefill} />
+          </div>
+
+          <div className={`h-full overflow-y-auto ${tab === 'probe' ? '' : 'hidden'}`}>
+            <Probe caseId={caseId} targets={targets} credentials={credentials} prefill={probePrefill} />
+          </div>
+
+          <div className={`h-full overflow-y-auto ${tab === 'secrets' ? '' : 'hidden'}`}>
+            <SecretScan caseId={caseId} targets={targets} credentials={credentials} prefill={secretScanPrefill} />
+          </div>
+
+          <div className={`h-full overflow-hidden ${tab === 'repeater' ? '' : 'hidden'}`}>
+            <Repeater caseId={caseId} targets={targets} credentials={credentials} prefill={repeaterPrefill} />
+          </div>
+
+          <div className={`h-full ${tab === 'activity' ? '' : 'hidden'}`}>
+            <ActivityTimeline caseId={caseId} />
           </div>
         </div>
       </div>
+    </div>
+  )
+}
+
+// --- Nav (left sidebar) ---
+
+// NavTabButton is one row in the expanded nav -- either pinned above the
+// groups (Targets/Credentials) or inside a NavGroupSection below.
+function NavTabButton({
+  id,
+  active,
+  dot,
+  count,
+  onSelect,
+}: {
+  id: Tab
+  active: boolean
+  dot: string
+  count: number | null
+  onSelect: () => void
+}) {
+  const { label, icon: Icon } = TAB_META[id]
+  return (
+    <button
+      onClick={onSelect}
+      className={`flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm ${
+        active ? 'bg-neutral-800 text-neutral-100' : 'text-neutral-400 hover:bg-neutral-900 hover:text-neutral-200'
+      }`}
+    >
+      <Icon className="h-3.5 w-3.5 shrink-0" />
+      <span className="flex-1 truncate">{label}</span>
+      <span className="inline-block h-1.5 w-1.5 shrink-0 rounded-full" style={{ background: dot }} />
+      {count !== null && <span className="text-xs text-neutral-500">{count}</span>}
+    </button>
+  )
+}
+
+// NavGroupSection renders one collapsible group (Identify/Scanners/Tools/
+// Intelligence). Each group remembers its own open/closed state under its
+// own key so collapsing "Tools" doesn't affect "Scanners" -- and it starts
+// open, expanding to reveal the active tab if a group is reopened to reveal
+// a saved-collapsed tab that later becomes active (e.g. via a "Send to X"
+// handoff from elsewhere in the case).
+function NavGroupSection({
+  group,
+  activeTab,
+  dots,
+  counts,
+  onSelect,
+}: {
+  group: NavGroup
+  activeTab: Tab
+  dots: Record<Tab, string>
+  counts: Record<Tab, number | null>
+  onSelect: (tab: Tab) => void
+}) {
+  const [open, setOpen] = useCollapsible(`caseNav.group.${group.id}`, true)
+  const hasActive = group.tabs.includes(activeTab)
+  useAutoExpandOnce(hasActive, setOpen)
+  const Icon = group.icon
+  return (
+    <div>
+      <button
+        onClick={() => setOpen(!open)}
+        className="flex w-full items-center gap-1.5 border-l-2 border-sky-700/70 py-1.5 pl-2 pr-1 text-left text-[11px] font-bold uppercase tracking-wider text-sky-400 hover:border-sky-500 hover:text-sky-300"
+      >
+        <Icon className="h-3.5 w-3.5 shrink-0 text-sky-500" />
+        <span className="flex-1">{group.label}</span>
+        <span className="text-sky-700">{open ? '▾' : '▸'}</span>
+      </button>
+      {open && (
+        <div className="space-y-0.5 border-l-2 border-transparent pt-0.5">
+          {group.tabs.map((id) => (
+            <NavTabButton key={id} id={id} active={activeTab === id} dot={dots[id]} count={counts[id]} onSelect={() => onSelect(id)} />
+          ))}
+        </div>
+      )}
     </div>
   )
 }
@@ -431,6 +725,9 @@ function TargetsTab({ caseId, targets, onChange }: { caseId: string; targets: Ta
                   openMenu(e, [
                     { label: 'Copy value', onSelect: () => copyToClipboard(t.value, 'Copied target') },
                     { label: 'Send to JWT Scanner', onSelect: () => sendToJwtScanner(t.value) },
+                    { label: 'Send to Probe', onSelect: () => sendToProbe(t.value) },
+                    { label: 'Send to Secret Scanner', onSelect: () => sendToSecretScan(t.value) },
+                    { label: 'Send to Repeater', onSelect: () => sendToRepeater(t.value) },
                     'separator',
                     { label: 'Remove target', onSelect: () => remove(t), danger: true },
                   ])
@@ -454,52 +751,7 @@ function TargetsTab({ caseId, targets, onChange }: { caseId: string; targets: Ta
   )
 }
 
-// --- Shared target picker used by every job launcher ---
-
-function TargetPicker({ targets, selected, onChange }: { targets: Target[]; selected: Set<string>; onChange: (next: Set<string>) => void }) {
-  const toggle = (value: string) => {
-    const next = new Set(selected)
-    if (next.has(value)) next.delete(value)
-    else next.add(value)
-    onChange(next)
-  }
-  if (targets.length === 0) {
-    return <p className="text-xs text-neutral-600">No targets in this case yet — add one on the Targets tab first.</p>
-  }
-  const allSelected = targets.every((t) => selected.has(t.value))
-  const toggleAll = () => onChange(allSelected ? new Set() : new Set(targets.map((t) => t.value)))
-  return (
-    <div className="space-y-1.5">
-      <button
-        type="button"
-        onClick={toggleAll}
-        className="rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-xs text-neutral-400 hover:border-sky-600 hover:text-sky-400"
-      >
-        {allSelected ? 'Deselect all' : `Select all (${targets.length})`}
-      </button>
-      <div className="flex max-h-32 flex-wrap gap-1.5 overflow-y-auto">
-        {targets.map((t) => (
-          <button
-            key={t.id}
-            type="button"
-            onClick={() => toggle(t.value)}
-            className={`rounded border px-2 py-1 font-mono text-xs ${
-              selected.has(t.value) ? 'border-sky-500 bg-sky-950/40 text-sky-300' : 'border-neutral-700 bg-neutral-900 text-neutral-400 hover:border-neutral-500'
-            }`}
-          >
-            {t.value}
-          </button>
-        ))}
-      </div>
-    </div>
-  )
-}
-
-const PRESETS: { id: JobOptionsPreset; label: string; description: string }[] = [
-  { id: 'custom', label: 'Default', description: 'Engine defaults (balanced speed).' },
-  { id: 'aggressive', label: 'Aggressive', description: 'Many threads, short timeout, no rate limit — fastest, loudest.' },
-  { id: 'stealth', label: 'Stealth', description: 'Few threads, longer timeout, rate-limited — slower, quieter.' },
-]
+const PRESETS = JOB_PRESETS
 
 // --- Identify tab ---
 
@@ -592,9 +844,7 @@ function IdentifyTab({
         </div>
       </div>
 
-      {jobs.length > 0 && (
-        <JobHistory jobs={jobs} statusOf={statusOf} onCancel={onCancel} />
-      )}
+      {jobs.length > 0 && <JobHistory jobs={jobs} statusOf={statusOf} onCancel={onCancel} panelKey="identify" />}
 
       {targetsWithChecks.length > 0 && (
         <div className="space-y-2">
@@ -748,6 +998,11 @@ function checkCellText(kind: CheckKind, check?: Check): string {
     }
     case 'whois':
       return (data.registrar as string) || 'unknown registrar'
+    case 'asn': {
+      const asn = (data.asn as string) || ''
+      const org = (data.org as string) || ''
+      return [asn, org].filter(Boolean).join(' · ') || 'unresolved'
+    }
     default:
       return ''
   }
@@ -798,45 +1053,28 @@ function CheckSummary({ kind, data }: { kind: CheckKind; data: Record<string, un
         </div>
       )
     }
+    case 'asn': {
+      return (
+        <div className="space-y-0.5 text-xs text-neutral-300">
+          <p className="truncate font-mono">{(data.asn as string) || 'unresolved'}</p>
+          <p className="truncate text-neutral-500">{(data.org as string) || ''}</p>
+        </div>
+      )
+    }
     default:
       return null
   }
 }
 
 // --- Tool tabs (feroxbuster / ffuf-subdomain / ffuf-vhost) ---
-
-function JobHistory({ jobs, statusOf, onCancel }: { jobs: Job[]; statusOf: (job: Job) => RunStatus; onCancel: (job: Job) => void }) {
-  return (
-    <div className="rounded-lg border border-neutral-800">
-      <div className="border-b border-neutral-800 px-3 py-2">
-        <h2 className="text-xs font-semibold uppercase tracking-wide text-neutral-400">Jobs</h2>
-      </div>
-      <div className="divide-y divide-neutral-900">
-        {[...jobs].reverse().map((job) => {
-          const status = statusOf(job)
-          return (
-            <div key={job.id} className="flex items-center gap-2 px-3 py-1.5 text-xs">
-              <span className="inline-block h-1.5 w-1.5 shrink-0 rounded-full" style={{ background: STATUS_DOT[status === 'running' ? 'running' : status === 'failed' ? 'error' : 'done'] }} />
-              <span className="truncate font-mono text-neutral-300">{job.targets.join(', ')}</span>
-              <span className="shrink-0 text-neutral-600">{status}</span>
-              <span className="shrink-0 text-neutral-600">{new Date(job.createdAt).toLocaleTimeString()}</span>
-              {status === 'running' && (
-                <button onClick={() => onCancel(job)} className="ml-auto shrink-0 rounded border border-red-900 px-2 py-0.5 text-red-400 hover:border-red-500 hover:text-red-300">
-                  Stop
-                </button>
-              )}
-            </div>
-          )
-        })}
-      </div>
-    </div>
-  )
-}
+// JobHistory (a tab's past-job log) is shared with Ffuf.tsx -- see
+// ./JobHistory.tsx.
 
 function ToolTab({
   caseId,
   tool,
   targets,
+  credentials,
   jobs,
   findings,
   statusOf,
@@ -854,6 +1092,7 @@ function ToolTab({
   caseId: string
   tool: Tool
   targets: Target[]
+  credentials: Credential[]
   jobs: Job[]
   findings: Finding[]
   statusOf: (job: Job) => RunStatus
@@ -879,10 +1118,18 @@ function ToolTab({
   const [wordlist, setWordlist] = useState('')
   const [scheme, setScheme] = useState('https')
   const [hostSuffix, setHostSuffix] = useState('')
+  const [credentialId, setCredentialId] = useState<string | undefined>()
   // Off by default -- see engine.ScanOptions.Recursive: recursion
   // multiplies request volume by however many directories turn up, so it's
   // opt-in rather than a silent default.
   const [recursive, setRecursive] = useState(false)
+
+  // Collapses the launcher (target picker, scheme/preset/tuning controls)
+  // to a compact bar the first time this tab has a job to show, so the
+  // results table gets the width instead of the launcher permanently
+  // occupying it -- same pattern as JwtScan/Probe's form column.
+  const [launcherOpen, setLauncherOpen] = useCollapsible(`launcher.${tool}`, true)
+  useAutoCollapseOnce(jobs.length > 0, setLauncherOpen)
 
   const nodePrefix = tool === 'feroxbuster' ? 'feroxbuster' : 'ffuf'
 
@@ -900,6 +1147,7 @@ function ToolTab({
         scheme: schemeField ? scheme : undefined,
         hostSuffix: hostSuffixField ? hostSuffix.trim() || undefined : undefined,
         recursive: recursiveField ? recursive : undefined,
+        credentialId,
       }
       const res = await api.startJob(caseId, tool, [...selected], options)
       if (res.jobId) {
@@ -937,100 +1185,137 @@ function ToolTab({
     return rows
   }
 
+  const canRun = !starting && selected.size > 0 && !(hostSuffixField && !hostSuffix.trim())
+  const launcherSummary =
+    selected.size > 0
+      ? `${selected.size} target${selected.size === 1 ? '' : 's'} selected${preset !== 'custom' ? ` · ${preset}` : ''}`
+      : 'No targets selected'
+
   return (
     <div className="flex h-full flex-col overflow-hidden">
       <div className="shrink-0 overflow-y-auto border-b border-neutral-800 p-3">
-        <TargetPicker targets={targets} selected={selected} onChange={setSelected} />
-        <div className="mt-2 flex flex-wrap items-center gap-2">
-          {schemeField && (
-            <label className="flex items-center gap-1 text-xs text-neutral-400">
-              Scheme
-              <select
-                value={scheme}
-                onChange={(e) => setScheme(e.target.value)}
-                className="rounded border border-neutral-700 bg-neutral-900 px-1.5 py-0.5 text-xs text-neutral-200 outline-none focus:border-sky-500"
+        <CollapsibleFormPanel
+          title="Configure"
+          open={launcherOpen}
+          onToggle={() => setLauncherOpen(!launcherOpen)}
+          summary={launcherSummary}
+          onRun={start}
+          canRun={canRun}
+          loading={starting}
+          runLabel={`Run (${selected.size})`}
+        >
+          <TargetPicker targets={targets} selected={selected} onChange={setSelected} />
+          <div className="flex flex-wrap items-center gap-2">
+            {schemeField && (
+              <label className="flex items-center gap-1 text-xs text-neutral-400">
+                Scheme
+                <select
+                  value={scheme}
+                  onChange={(e) => setScheme(e.target.value)}
+                  className="rounded border border-neutral-700 bg-neutral-900 px-1.5 py-0.5 text-xs text-neutral-200 outline-none focus:border-sky-500"
+                >
+                  <option value="https">https</option>
+                  <option value="http">http</option>
+                </select>
+              </label>
+            )}
+            {hostSuffixField && (
+              <label className="flex items-center gap-1 text-xs text-neutral-400">
+                Host header domain
+                <input
+                  value={hostSuffix}
+                  onChange={(e) => setHostSuffix(e.target.value)}
+                  placeholder="example.com"
+                  className="w-40 rounded border border-neutral-700 bg-neutral-900 px-1.5 py-0.5 font-mono text-xs text-neutral-200 outline-none focus:border-sky-500"
+                />
+              </label>
+            )}
+            {recursiveField && (
+              <label className="flex items-center gap-1.5 text-xs text-neutral-400" title="Fuzz found directories again with the same wordlist. Off by default -- multiplies request volume by however many directories turn up.">
+                <input type="checkbox" checked={recursive} onChange={(e) => setRecursive(e.target.checked)} className="accent-sky-500" />
+                Recursive
+              </label>
+            )}
+            {PRESETS.map((p) => (
+              <button
+                key={p.id}
+                type="button"
+                title={p.description}
+                onClick={() => setPreset(p.id)}
+                className={`rounded border px-2 py-0.5 text-xs ${
+                  preset === p.id ? 'border-sky-500 bg-sky-950/40 text-sky-300' : 'border-neutral-700 bg-neutral-900 text-neutral-400 hover:border-sky-600'
+                }`}
               >
-                <option value="https">https</option>
-                <option value="http">http</option>
-              </select>
-            </label>
-          )}
-          {hostSuffixField && (
-            <label className="flex items-center gap-1 text-xs text-neutral-400">
-              Host header domain
-              <input
-                value={hostSuffix}
-                onChange={(e) => setHostSuffix(e.target.value)}
-                placeholder="example.com"
-                className="w-40 rounded border border-neutral-700 bg-neutral-900 px-1.5 py-0.5 font-mono text-xs text-neutral-200 outline-none focus:border-sky-500"
-              />
-            </label>
-          )}
-          {recursiveField && (
-            <label className="flex items-center gap-1.5 text-xs text-neutral-400" title="Fuzz found directories again with the same wordlist. Off by default -- multiplies request volume by however many directories turn up.">
-              <input type="checkbox" checked={recursive} onChange={(e) => setRecursive(e.target.checked)} className="accent-sky-500" />
-              Recursive
-            </label>
-          )}
-          {PRESETS.map((p) => (
+                {p.label}
+              </button>
+            ))}
             <button
-              key={p.id}
               type="button"
-              title={p.description}
-              onClick={() => setPreset(p.id)}
-              className={`rounded border px-2 py-0.5 text-xs ${
-                preset === p.id ? 'border-sky-500 bg-sky-950/40 text-sky-300' : 'border-neutral-700 bg-neutral-900 text-neutral-400 hover:border-sky-600'
-              }`}
+              onClick={() => setShowTuning((v) => !v)}
+              className="rounded border border-neutral-800 px-2 py-0.5 text-xs text-neutral-500 hover:text-neutral-300"
             >
-              {p.label}
+              {showTuning ? 'Hide tuning ▾' : 'Advanced tuning ▸'}
             </button>
-          ))}
-          <button
-            type="button"
-            onClick={() => setShowTuning((v) => !v)}
-            className="rounded border border-neutral-800 px-2 py-0.5 text-xs text-neutral-500 hover:text-neutral-300"
-          >
-            {showTuning ? 'Hide tuning ▾' : 'Advanced tuning ▸'}
-          </button>
-          <button
-            onClick={start}
-            disabled={starting || selected.size === 0 || (hostSuffixField && !hostSuffix.trim())}
-            className="ml-auto rounded bg-sky-600 px-3 py-1 text-xs font-medium text-white hover:bg-sky-500 disabled:opacity-50"
-          >
-            {starting ? 'Starting…' : `Run (${selected.size})`}
-          </button>
-        </div>
-        {showTuning && (
-          <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-4">
-            <label className="flex flex-col gap-0.5">
-              <span className="text-[10px] font-semibold uppercase tracking-wide text-neutral-500">Threads</span>
-              <input value={threads} onChange={(e) => setThreads(e.target.value)} placeholder="default" className="rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-xs text-neutral-100 outline-none focus:border-sky-500" />
-            </label>
-            <label className="flex flex-col gap-0.5">
-              <span className="text-[10px] font-semibold uppercase tracking-wide text-neutral-500">Timeout (s)</span>
-              <input value={timeoutSeconds} onChange={(e) => setTimeoutSeconds(e.target.value)} placeholder="default" className="rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-xs text-neutral-100 outline-none focus:border-sky-500" />
-            </label>
-            <label className="flex flex-col gap-0.5">
-              <span className="text-[10px] font-semibold uppercase tracking-wide text-neutral-500">Rate limit (req/s)</span>
-              <input value={rateLimit} onChange={(e) => setRateLimit(e.target.value)} placeholder="unlimited" className="rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-xs text-neutral-100 outline-none focus:border-sky-500" />
-            </label>
-            <label className="flex flex-col gap-0.5">
-              <span className="text-[10px] font-semibold uppercase tracking-wide text-neutral-500">Wordlist file</span>
-              <input value={wordlist} onChange={(e) => setWordlist(e.target.value)} placeholder="category default" className="rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-xs text-neutral-100 outline-none focus:border-sky-500" />
-            </label>
+            <button
+              onClick={start}
+              disabled={starting || selected.size === 0 || (hostSuffixField && !hostSuffix.trim())}
+              className="ml-auto rounded bg-sky-600 px-3 py-1 text-xs font-medium text-white hover:bg-sky-500 disabled:opacity-50"
+            >
+              {starting ? 'Starting…' : `Run (${selected.size})`}
+            </button>
           </div>
-        )}
-        {message && <p className="mt-2 text-xs text-neutral-500">{message}</p>}
+          <JobTemplatePicker
+            tool={tool}
+            current={{
+              preset: preset === 'custom' ? undefined : preset,
+              threads: threads ? Number(threads) : undefined,
+              timeoutSeconds: timeoutSeconds ? Number(timeoutSeconds) : undefined,
+              rateLimit: rateLimit ? Number(rateLimit) : undefined,
+              wordlist: wordlist.trim() || undefined,
+              scheme: schemeField ? scheme : undefined,
+              hostSuffix: hostSuffixField ? hostSuffix.trim() || undefined : undefined,
+              recursive: recursiveField ? recursive : undefined,
+            }}
+            onApply={(options) => {
+              setPreset(options.preset ?? 'custom')
+              setThreads(options.threads ? String(options.threads) : '')
+              setTimeoutSeconds(options.timeoutSeconds ? String(options.timeoutSeconds) : '')
+              setRateLimit(options.rateLimit ? String(options.rateLimit) : '')
+              setWordlist(options.wordlist ?? '')
+              if (schemeField && options.scheme) setScheme(options.scheme)
+              if (hostSuffixField) setHostSuffix(options.hostSuffix ?? '')
+              if (recursiveField) setRecursive(options.recursive ?? false)
+            }}
+          />
+          {showTuning && (
+            <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-4">
+              <label className="flex flex-col gap-0.5">
+                <span className="text-[10px] font-semibold uppercase tracking-wide text-neutral-500">Threads</span>
+                <input value={threads} onChange={(e) => setThreads(e.target.value)} placeholder="default" className="rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-xs text-neutral-100 outline-none focus:border-sky-500" />
+              </label>
+              <label className="flex flex-col gap-0.5">
+                <span className="text-[10px] font-semibold uppercase tracking-wide text-neutral-500">Timeout (s)</span>
+                <input value={timeoutSeconds} onChange={(e) => setTimeoutSeconds(e.target.value)} placeholder="default" className="rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-xs text-neutral-100 outline-none focus:border-sky-500" />
+              </label>
+              <label className="flex flex-col gap-0.5">
+                <span className="text-[10px] font-semibold uppercase tracking-wide text-neutral-500">Rate limit (req/s)</span>
+                <input value={rateLimit} onChange={(e) => setRateLimit(e.target.value)} placeholder="unlimited" className="rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-xs text-neutral-100 outline-none focus:border-sky-500" />
+              </label>
+              <label className="flex flex-col gap-0.5">
+                <span className="text-[10px] font-semibold uppercase tracking-wide text-neutral-500">Wordlist file</span>
+                <input value={wordlist} onChange={(e) => setWordlist(e.target.value)} placeholder="category default" className="rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-xs text-neutral-100 outline-none focus:border-sky-500" />
+              </label>
+              <CredentialPicker credentials={credentials} selected={credentialId} onSelect={setCredentialId} className="col-span-2 sm:col-span-4" />
+            </div>
+          )}
+          {message && <p className="mt-2 text-xs text-neutral-500">{message}</p>}
+        </CollapsibleFormPanel>
       </div>
 
-      {jobs.length > 0 && (
-        <div className="shrink-0 border-b border-neutral-800">
-          <JobHistory jobs={jobs} statusOf={statusOf} onCancel={onCancel} />
-        </div>
-      )}
+      {jobs.length > 0 && <JobHistory jobs={jobs} statusOf={statusOf} onCancel={onCancel} panelKey={tool} />}
 
       <div className="flex flex-1 overflow-hidden">
-        <TargetProgressPanel targets={targetProgress()} />
+        <TargetProgressPanel targets={targetProgress()} tabKey={tool} />
         <div className="flex-1 overflow-hidden">
           <ResultsTable findings={findings} caseId={caseId} facetPlacement="right" selectable onPromote={onPromote} deriveTargetValue={deriveTargetValue} />
         </div>

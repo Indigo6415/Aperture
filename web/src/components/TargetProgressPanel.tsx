@@ -3,6 +3,10 @@ import { STATUS_META } from '../statusMeta'
 import { formatEta } from '../eta'
 import { copyToClipboard, useContextMenu } from '../contextMenu'
 import { sendToJwtScanner } from '../jwtHandoff'
+import { sendToProbe } from '../probeHandoff'
+import { sendToSecretScan } from '../secretScanHandoff'
+import { sendToRepeater } from '../repeaterHandoff'
+import { useAutoExpandOnce, useCollapsible } from '../collapsible'
 
 export interface TargetProgress {
   key: string
@@ -29,13 +33,40 @@ export interface TargetProgress {
 // permanently indeterminate the moment any one of them included a
 // feroxbuster node. Rendered as a sidebar (stacked rows) between the tool
 // tab's launcher and its results table.
-export function TargetProgressPanel({ targets }: { targets: TargetProgress[] }) {
+//
+// Collapses to a slim icon rail (just the status dots, no labels) so an
+// idle or finished job's breakdown doesn't permanently take a quarter of
+// the results table's width -- expands on click, and auto-expands itself
+// once the first time any target starts running (so a user who left it
+// collapsed doesn't miss that a job just started). Persisted per-tab via
+// useCollapsible so a user's preference sticks.
+export function TargetProgressPanel({ targets, tabKey }: { targets: TargetProgress[]; tabKey: string }) {
+  const [open, setOpen] = useCollapsible(`targetProgress.${tabKey}`, true)
+  useAutoExpandOnce(targets.some((t) => t.status === 'running'), setOpen)
+
   if (targets.length === 0) return null
+
+  if (!open) {
+    return (
+      <aside className="flex w-8 shrink-0 flex-col items-center gap-1.5 overflow-y-auto border-r border-neutral-800 bg-neutral-950 py-2">
+        <button onClick={() => setOpen(true)} title={`Show ${targets.length} target${targets.length === 1 ? '' : 's'}`} className="text-neutral-600 hover:text-neutral-300">
+          ▸
+        </button>
+        {targets.map((t) => (
+          <span key={t.key} title={tooltipFor(t)} className="inline-block h-1.5 w-1.5 shrink-0 rounded-full" style={{ background: STATUS_META[t.status].dot }} />
+        ))}
+      </aside>
+    )
+  }
+
   return (
     <aside className="flex w-64 shrink-0 flex-col overflow-y-auto border-r border-neutral-800 bg-neutral-950">
-      <h2 className="border-b border-neutral-800 px-3 py-2 text-xs font-semibold uppercase tracking-wide text-neutral-500">
-        Targets ({targets.length})
-      </h2>
+      <div className="flex items-center gap-2 border-b border-neutral-800 px-3 py-2">
+        <h2 className="flex-1 text-xs font-semibold uppercase tracking-wide text-neutral-500">Targets ({targets.length})</h2>
+        <button onClick={() => setOpen(false)} title="Collapse" className="shrink-0 text-neutral-600 hover:text-neutral-300">
+          ▾
+        </button>
+      </div>
       <div className="flex flex-col divide-y divide-neutral-900">
         {targets.map((t) => (
           <TargetRow key={t.key} t={t} />
@@ -77,6 +108,9 @@ function TargetRow({ t }: { t: TargetProgress }) {
         openMenu(e, [
           { label: 'Copy target', onSelect: () => copyToClipboard(t.target, 'Copied target') },
           { label: 'Send to JWT Scanner', onSelect: () => sendToJwtScanner(t.target) },
+          { label: 'Send to Probe', onSelect: () => sendToProbe(t.target) },
+          { label: 'Send to Secret Scanner', onSelect: () => sendToSecretScan(t.target) },
+          { label: 'Send to Repeater', onSelect: () => sendToRepeater(t.target) },
         ])
       }}
       title={tooltipFor(t)}

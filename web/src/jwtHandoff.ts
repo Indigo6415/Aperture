@@ -1,3 +1,5 @@
+import { toAbsoluteUrl } from './url'
+
 // jwtHandoff lets any "Send to JWT Scanner" context-menu item (added from
 // deep inside CaseView/ResultsTable/HierarchyView/etc.) reach the
 // currently-open case's JWT Scanner tab without threading a callback
@@ -18,20 +20,15 @@ type Listener = (req: JwtScannerRequest) => void
 let listeners: Listener[] = []
 let seq = 0
 
-// toProbeUrl turns a bare hostname/IP (as stored in Target.value, a
-// HierarchyView host, a GraphCanvas target node, ...) into something the
-// JWT scanner's "protected route to probe" field can send a request to.
-// A value that already looks like a URL is left untouched.
-function toProbeUrl(value: string): string {
-  return /^[a-z][a-z0-9+.-]*:\/\//i.test(value) ? value : `https://${value}/`
-}
-
 // sendToJwtScanner is called from any right-click "Send to JWT Scanner"
 // menu item; CaseView's subscriber switches to its JWT Scanner tab and
-// prefills the URL field.
+// prefills the URL field. toAbsoluteUrl turns a bare hostname/IP (as stored
+// in Target.value, a HierarchyView host, a GraphCanvas target node, ...)
+// into something the JWT scanner's "protected route to probe" field can
+// send a request to -- a value that already looks like a URL is untouched.
 export function sendToJwtScanner(value: string) {
   seq += 1
-  const req: JwtScannerRequest = { url: toProbeUrl(value), seq }
+  const req: JwtScannerRequest = { url: toAbsoluteUrl(value), seq }
   for (const l of listeners) l(req)
 }
 

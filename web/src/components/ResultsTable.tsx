@@ -7,6 +7,9 @@ import { api, screenshotPreviewEnabled } from '../api'
 import { FacetFilterBar, type FacetDimension } from './FacetFilterBar'
 import { copyToClipboard, useContextMenu } from '../contextMenu'
 import { sendToJwtScanner } from '../jwtHandoff'
+import { sendToProbe } from '../probeHandoff'
+import { sendToSecretScan } from '../secretScanHandoff'
+import { sendToRepeater } from '../repeaterHandoff'
 
 type SortKey = 'url' | 'statusCode' | 'extension' | 'contentLength' | 'words' | 'lines' | 'sourceTool'
 
@@ -242,6 +245,9 @@ export function ResultsTable({
                         { label: 'Copy URL', onSelect: () => copyToClipboard(f.url, 'Copied URL') },
                         { label: 'Open in new tab', onSelect: () => window.open(f.url, '_blank', 'noopener,noreferrer') },
                         { label: 'Send to JWT Scanner', onSelect: () => sendToJwtScanner(f.url) },
+                        { label: 'Send to Probe', onSelect: () => sendToProbe(f.url) },
+                        { label: 'Send to Secret Scanner', onSelect: () => sendToSecretScan(f.url) },
+                        { label: 'Send to Repeater', onSelect: () => sendToRepeater(f.url, f.method || 'GET') },
                         'separator',
                         { label: isExpanded ? 'Collapse details' : 'Expand details', onSelect: () => setExpanded(isExpanded ? null : key) },
                       ])

@@ -84,17 +84,24 @@ func init() {
 // header value (virtual-host discovery, typically the Host header) --
 // wherever ffuf itself expects it.
 type FFufConfig struct {
-	URL           string            `json:"url"`
-	Wordlist      string            `json:"wordlist"`
-	Extensions    []string          `json:"extensions,omitempty"`
-	Headers       map[string]string `json:"headers,omitempty"`
-	Method        string            `json:"method,omitempty"`
-	Threads       int               `json:"threads,omitempty"`
-	MatchCodes    string            `json:"matchCodes,omitempty"` // ffuf -mc value; defaults to "all" so downstream filter nodes see everything
-	Timeout       int               `json:"timeoutSeconds,omitempty"`
-	RateLimit     int               `json:"rateLimit,omitempty"`     // ffuf -rate: requests/sec across the whole run; 0 = unlimited
-	AutoCalibrate bool              `json:"autoCalibrate,omitempty"` // ffuf -ac: filter out responses matching a baseline probed with randomized input -- essential for vhost fuzzing, where the default vhost answers every Host header near-identically
-	ExtraArgs     []string          `json:"extraArgs,omitempty"`
+	URL             string            `json:"url"`
+	Wordlist        string            `json:"wordlist"`
+	Extensions      []string          `json:"extensions,omitempty"`
+	Headers         map[string]string `json:"headers,omitempty"`
+	Body            string            `json:"body,omitempty"` // ffuf -d: raw POST/PUT body, FUZZ substituted the same as it is in URL/headers
+	Method          string            `json:"method,omitempty"`
+	Threads         int               `json:"threads,omitempty"`
+	MatchCodes      string            `json:"matchCodes,omitempty"`  // ffuf -mc value; defaults to "all" so downstream filter nodes see everything
+	FilterCodes     string            `json:"filterCodes,omitempty"` // ffuf -fc: status codes to exclude, applied after -mc
+	MatchSize       string            `json:"matchSize,omitempty"`   // ffuf -ms
+	FilterSize      string            `json:"filterSize,omitempty"`  // ffuf -fs
+	Timeout         int               `json:"timeoutSeconds,omitempty"`
+	RateLimit       int               `json:"rateLimit,omitempty"`       // ffuf -rate: requests/sec across the whole run; 0 = unlimited
+	Delay           string            `json:"delay,omitempty"`           // ffuf -p: per-request delay in seconds, either a fixed value ("0.5") or a jittered range ("0.1-0.5")
+	Proxy           string            `json:"proxy,omitempty"`           // ffuf -x: upstream HTTP(S) proxy URL, e.g. for routing through Burp
+	AutoCalibrate   bool              `json:"autoCalibrate,omitempty"`   // ffuf -ac: filter out responses matching a baseline probed with randomized input -- essential for vhost fuzzing, where the default vhost answers every Host header near-identically
+	FollowRedirects bool              `json:"followRedirects,omitempty"` // ffuf -r
+	ExtraArgs       []string          `json:"extraArgs,omitempty"`
 }
 
 // fuzzHeader returns the name of the first header whose value contains the
@@ -179,6 +186,18 @@ func (a *FFufAdapter) Run(ctx context.Context, config json.RawMessage, meta RunM
 	if cfg.Method != "" {
 		args = append(args, "-X", cfg.Method)
 	}
+	if cfg.Body != "" {
+		args = append(args, "-d", cfg.Body)
+	}
+	if cfg.FilterCodes != "" {
+		args = append(args, "-fc", cfg.FilterCodes)
+	}
+	if cfg.MatchSize != "" {
+		args = append(args, "-ms", cfg.MatchSize)
+	}
+	if cfg.FilterSize != "" {
+		args = append(args, "-fs", cfg.FilterSize)
+	}
 	if cfg.Threads > 0 {
 		args = append(args, "-t", strconv.Itoa(cfg.Threads))
 	}
@@ -188,11 +207,20 @@ func (a *FFufAdapter) Run(ctx context.Context, config json.RawMessage, meta RunM
 	if cfg.RateLimit > 0 {
 		args = append(args, "-rate", strconv.Itoa(cfg.RateLimit))
 	}
+	if cfg.Delay != "" {
+		args = append(args, "-p", cfg.Delay)
+	}
+	if cfg.Proxy != "" {
+		args = append(args, "-x", cfg.Proxy)
+	}
 	if len(cfg.Extensions) > 0 {
 		args = append(args, "-e", strings.Join(cfg.Extensions, ","))
 	}
 	if cfg.AutoCalibrate {
 		args = append(args, "-ac")
+	}
+	if cfg.FollowRedirects {
+		args = append(args, "-r")
 	}
 	for k, v := range cfg.Headers {
 		args = append(args, "-H", fmt.Sprintf("%s: %s", k, v))
