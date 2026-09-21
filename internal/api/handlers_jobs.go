@@ -31,6 +31,22 @@ const (
 	// ToolIdentify runs passive recon (internal/recon) directly rather than
 	// an engine.Flow -- see runIdentifyJob in identify.go.
 	ToolIdentify = "identify"
+	// ToolSubfinder/ToolAmass are additional, purely passive OSINT-source
+	// subdomain-enumeration methods alongside ToolFFufSubdomain's
+	// wordlist-based guessing (see adapters.AmassConfig's doc comment for
+	// why amass always runs passive here).
+	ToolSubfinder = "subfinder"
+	ToolAmass     = "amass"
+	// ToolKatana is a crawl-based content-discovery method alongside
+	// ToolFeroxbuster's wordlist-based guessing.
+	ToolKatana = "katana"
+	// ToolHttpx/ToolWhatWeb are bulk HTTP probing/fingerprinting methods,
+	// each launched (like every other tool here) as one source node per
+	// target rather than truly batched into a single process -- simpler and
+	// consistent with every other tool's per-target progress/status
+	// tracking, at the cost of httpx/whatweb's own bulk-run efficiency.
+	ToolHttpx   = "httpx"
+	ToolWhatWeb = "whatweb"
 )
 
 // FFufJobOptions carries every field specific to ToolFFufCustom -- an almost
@@ -199,6 +215,57 @@ func (s *Server) buildToolFlow(tool string, targets []string, req startJobReques
 				ExtraArgs: req.FFuf.ExtraArgs,
 			})
 			return engine.KindFFuf, "ffuf: " + target, cfg
+		}), nil
+
+	case ToolSubfinder:
+		return buildFanoutFlow("Subfinder", targets, func(i int, target string) (engine.NodeKind, string, json.RawMessage) {
+			cfg, _ := json.Marshal(adapters.SubfinderConfig{
+				Domain: target, Threads: opts.Threads, Timeout: opts.TimeoutSeconds, RateLimit: opts.RateLimit,
+			})
+			return engine.KindSubfinder, "subfinder: " + target, cfg
+		}), nil
+
+	case ToolAmass:
+		return buildFanoutFlow("Amass", targets, func(i int, target string) (engine.NodeKind, string, json.RawMessage) {
+			cfg, _ := json.Marshal(adapters.AmassConfig{Domain: target, RateLimit: opts.RateLimit})
+			return engine.KindAmass, "amass: " + target, cfg
+		}), nil
+
+	case ToolKatana:
+		return buildFanoutFlow("Katana", targets, func(i int, target string) (engine.NodeKind, string, json.RawMessage) {
+			base := target
+			if !strings.Contains(base, "://") {
+				base = scheme + "://" + base
+			}
+			cfg, _ := json.Marshal(adapters.KatanaConfig{
+				URL: base + "/", Headers: credHeaders, Timeout: opts.TimeoutSeconds, RateLimit: opts.RateLimit,
+			})
+			return engine.KindKatana, "katana: " + target, cfg
+		}), nil
+
+	case ToolHttpx:
+		return buildFanoutFlow("Httpx", targets, func(i int, target string) (engine.NodeKind, string, json.RawMessage) {
+			base := target
+			if !strings.Contains(base, "://") {
+				base = scheme + "://" + base
+			}
+			cfg, _ := json.Marshal(adapters.HttpxConfig{
+				Targets: []string{base}, Headers: credHeaders,
+				Threads: opts.Threads, Timeout: opts.TimeoutSeconds, RateLimit: opts.RateLimit,
+			})
+			return engine.KindHttpx, "httpx: " + target, cfg
+		}), nil
+
+	case ToolWhatWeb:
+		return buildFanoutFlow("WhatWeb", targets, func(i int, target string) (engine.NodeKind, string, json.RawMessage) {
+			base := target
+			if !strings.Contains(base, "://") {
+				base = scheme + "://" + base
+			}
+			cfg, _ := json.Marshal(adapters.WhatWebConfig{
+				Targets: []string{base}, Headers: credHeaders, Threads: opts.Threads,
+			})
+			return engine.KindWhatWeb, "whatweb: " + target, cfg
 		}), nil
 
 	default:
@@ -405,6 +472,44 @@ func (s *Server) jobNodeDetails(job store.Job) []JobNodeDetail {
 				NodeID: n.ID, Target: cfg.URL, Wordlist: filepath.Base(cfg.Wordlist),
 				Extensions: cfg.Extensions, Candidates: candidateCount(cfg.Wordlist, cfg.Extensions),
 				Threads: cfg.Threads, TimeoutSeconds: cfg.Timeout, RateLimit: cfg.RateLimit,
+			})
+		case engine.KindSubfinder:
+			var cfg adapters.SubfinderConfig
+			if json.Unmarshal(n.Config, &cfg) != nil {
+				continue
+			}
+			details = append(details, JobNodeDetail{
+				NodeID: n.ID, Target: cfg.Domain, Threads: cfg.Threads, TimeoutSeconds: cfg.Timeout, RateLimit: cfg.RateLimit,
+			})
+		case engine.KindAmass:
+			var cfg adapters.AmassConfig
+			if json.Unmarshal(n.Config, &cfg) != nil {
+				continue
+			}
+			details = append(details, JobNodeDetail{NodeID: n.ID, Target: cfg.Domain, RateLimit: cfg.RateLimit})
+		case engine.KindKatana:
+			var cfg adapters.KatanaConfig
+			if json.Unmarshal(n.Config, &cfg) != nil {
+				continue
+			}
+			details = append(details, JobNodeDetail{
+				NodeID: n.ID, Target: cfg.URL, TimeoutSeconds: cfg.Timeout, RateLimit: cfg.RateLimit,
+			})
+		case engine.KindHttpx:
+			var cfg adapters.HttpxConfig
+			if json.Unmarshal(n.Config, &cfg) != nil || len(cfg.Targets) == 0 {
+				continue
+			}
+			details = append(details, JobNodeDetail{
+				NodeID: n.ID, Target: cfg.Targets[0], Threads: cfg.Threads, TimeoutSeconds: cfg.Timeout, RateLimit: cfg.RateLimit,
+			})
+		case engine.KindWhatWeb:
+			var cfg adapters.WhatWebConfig
+			if json.Unmarshal(n.Config, &cfg) != nil || len(cfg.Targets) == 0 {
+				continue
+			}
+			details = append(details, JobNodeDetail{
+				NodeID: n.ID, Target: cfg.Targets[0], Threads: cfg.Threads,
 			})
 		}
 	}

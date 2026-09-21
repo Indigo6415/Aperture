@@ -32,6 +32,7 @@ import {
   IconActivity,
   IconChart,
   IconCrosshair,
+  IconFolder,
   IconFolderSearch,
   IconGlobe,
   IconKey,
@@ -81,6 +82,11 @@ type Tab =
   | 'ffuf-subdomain'
   | 'ffuf-vhost'
   | 'ffuf-custom'
+  | 'subfinder'
+  | 'amass'
+  | 'katana'
+  | 'httpx'
+  | 'whatweb'
   | 'graph'
   | 'jwtscan'
   | 'probe'
@@ -98,6 +104,11 @@ const TAB_META: Record<Tab, { label: string; icon: IconType }> = {
   'ffuf-subdomain': { label: 'Subdomain Scanner', icon: IconGlobe },
   'ffuf-vhost': { label: 'VHost Scanner', icon: IconServer },
   'ffuf-custom': { label: 'FFuF', icon: IconLightning },
+  subfinder: { label: 'Subfinder', icon: IconGlobe },
+  amass: { label: 'Amass', icon: IconSitemap },
+  katana: { label: 'Katana Crawler', icon: IconFolder },
+  httpx: { label: 'Httpx Prober', icon: IconServer },
+  whatweb: { label: 'WhatWeb', icon: IconChart },
   jwtscan: { label: 'JWT Scanner', icon: IconShieldKey },
   probe: { label: 'Probe', icon: IconCrosshair },
   secrets: { label: 'Secrets', icon: IconLock },
@@ -120,8 +131,13 @@ const PINNED_TABS: Tab[] = ['targets', 'credentials']
 
 const NAV_GROUPS: NavGroup[] = [
   { id: 'identify', label: 'Identify', icon: IconRadar, tabs: ['identify'] },
-  { id: 'scanners', label: 'Scanners', icon: IconScan, tabs: ['feroxbuster', 'ffuf-subdomain', 'ffuf-vhost'] },
-  { id: 'tools', label: 'Tools', icon: IconWrench, tabs: ['ffuf-custom', 'jwtscan', 'probe', 'secrets', 'repeater'] },
+  {
+    id: 'scanners',
+    label: 'Scanners',
+    icon: IconScan,
+    tabs: ['feroxbuster', 'ffuf-subdomain', 'ffuf-vhost', 'subfinder', 'amass', 'katana'],
+  },
+  { id: 'tools', label: 'Tools', icon: IconWrench, tabs: ['ffuf-custom', 'httpx', 'whatweb', 'jwtscan', 'probe', 'secrets', 'repeater'] },
   { id: 'intelligence', label: 'Intelligence', icon: IconChart, tabs: ['risk', 'graph', 'activity'] },
 ]
 
@@ -342,6 +358,11 @@ export function CaseView({ caseId }: { caseId: string }) {
       jobsOfTool('ffuf-subdomain').length === 0 ? STATUS_DOT.pending : jobsOfTool('ffuf-subdomain').some((j) => statusOf(j) === 'running') ? STATUS_DOT.running : STATUS_DOT.done,
     'ffuf-vhost': jobsOfTool('ffuf-vhost').length === 0 ? STATUS_DOT.pending : jobsOfTool('ffuf-vhost').some((j) => statusOf(j) === 'running') ? STATUS_DOT.running : STATUS_DOT.done,
     'ffuf-custom': jobsOfTool('ffuf-custom').length === 0 ? STATUS_DOT.pending : jobsOfTool('ffuf-custom').some((j) => statusOf(j) === 'running') ? STATUS_DOT.running : STATUS_DOT.done,
+    subfinder: jobsOfTool('subfinder').length === 0 ? STATUS_DOT.pending : jobsOfTool('subfinder').some((j) => statusOf(j) === 'running') ? STATUS_DOT.running : STATUS_DOT.done,
+    amass: jobsOfTool('amass').length === 0 ? STATUS_DOT.pending : jobsOfTool('amass').some((j) => statusOf(j) === 'running') ? STATUS_DOT.running : STATUS_DOT.done,
+    katana: jobsOfTool('katana').length === 0 ? STATUS_DOT.pending : jobsOfTool('katana').some((j) => statusOf(j) === 'running') ? STATUS_DOT.running : STATUS_DOT.done,
+    httpx: jobsOfTool('httpx').length === 0 ? STATUS_DOT.pending : jobsOfTool('httpx').some((j) => statusOf(j) === 'running') ? STATUS_DOT.running : STATUS_DOT.done,
+    whatweb: jobsOfTool('whatweb').length === 0 ? STATUS_DOT.pending : jobsOfTool('whatweb').some((j) => statusOf(j) === 'running') ? STATUS_DOT.running : STATUS_DOT.done,
     graph: STATUS_DOT.done,
     jwtscan: STATUS_DOT.done,
     probe: STATUS_DOT.done,
@@ -358,6 +379,11 @@ export function CaseView({ caseId }: { caseId: string }) {
     'ffuf-subdomain': findingsOfTool('ffuf-subdomain').length,
     'ffuf-vhost': findingsOfTool('ffuf-vhost').length,
     'ffuf-custom': findingsOfTool('ffuf-custom').length,
+    subfinder: findingsOfTool('subfinder').length,
+    amass: findingsOfTool('amass').length,
+    katana: findingsOfTool('katana').length,
+    httpx: findingsOfTool('httpx').length,
+    whatweb: findingsOfTool('whatweb').length,
     graph: null,
     jwtscan: null,
     probe: null,
@@ -526,6 +552,66 @@ export function CaseView({ caseId }: { caseId: string }) {
             />
           </div>
 
+          <div className={`h-full ${tab === 'subfinder' ? '' : 'hidden'}`}>
+            <ToolTab
+              caseId={caseId}
+              tool="subfinder"
+              targets={targets}
+              credentials={credentials}
+              jobs={jobsOfTool('subfinder')}
+              findings={findingsOfTool('subfinder')}
+              statusOf={statusOf}
+              nodeStatus={nodeStatus}
+              jobProgress={jobProgress}
+              nodeStartedAtRef={nodeStartedAtRef}
+              onStart={addJob}
+              onCancel={cancelJob}
+              onPromote={(values) => promoteFromTool('subfinder', values)}
+              wordlistField={false}
+              credentialField={false}
+            />
+          </div>
+
+          <div className={`h-full ${tab === 'amass' ? '' : 'hidden'}`}>
+            <ToolTab
+              caseId={caseId}
+              tool="amass"
+              targets={targets}
+              credentials={credentials}
+              jobs={jobsOfTool('amass')}
+              findings={findingsOfTool('amass')}
+              statusOf={statusOf}
+              nodeStatus={nodeStatus}
+              jobProgress={jobProgress}
+              nodeStartedAtRef={nodeStartedAtRef}
+              onStart={addJob}
+              onCancel={cancelJob}
+              onPromote={(values) => promoteFromTool('amass', values)}
+              wordlistField={false}
+              credentialField={false}
+            />
+          </div>
+
+          <div className={`h-full ${tab === 'katana' ? '' : 'hidden'}`}>
+            <ToolTab
+              caseId={caseId}
+              tool="katana"
+              targets={targets}
+              credentials={credentials}
+              jobs={jobsOfTool('katana')}
+              findings={findingsOfTool('katana')}
+              statusOf={statusOf}
+              nodeStatus={nodeStatus}
+              jobProgress={jobProgress}
+              nodeStartedAtRef={nodeStartedAtRef}
+              onStart={addJob}
+              onCancel={cancelJob}
+              onPromote={(values) => promoteFromTool('katana', values)}
+              schemeField
+              wordlistField={false}
+            />
+          </div>
+
           <div className={`h-full ${tab === 'ffuf-custom' ? '' : 'hidden'}`}>
             <FfufTab
               caseId={caseId}
@@ -540,6 +626,46 @@ export function CaseView({ caseId }: { caseId: string }) {
               onStart={addJob}
               onCancel={cancelJob}
               onPromote={(values) => promoteFromTool('ffuf-custom', values)}
+            />
+          </div>
+
+          <div className={`h-full ${tab === 'httpx' ? '' : 'hidden'}`}>
+            <ToolTab
+              caseId={caseId}
+              tool="httpx"
+              targets={targets}
+              credentials={credentials}
+              jobs={jobsOfTool('httpx')}
+              findings={findingsOfTool('httpx')}
+              statusOf={statusOf}
+              nodeStatus={nodeStatus}
+              jobProgress={jobProgress}
+              nodeStartedAtRef={nodeStartedAtRef}
+              onStart={addJob}
+              onCancel={cancelJob}
+              onPromote={(values) => promoteFromTool('httpx', values)}
+              schemeField
+              wordlistField={false}
+            />
+          </div>
+
+          <div className={`h-full ${tab === 'whatweb' ? '' : 'hidden'}`}>
+            <ToolTab
+              caseId={caseId}
+              tool="whatweb"
+              targets={targets}
+              credentials={credentials}
+              jobs={jobsOfTool('whatweb')}
+              findings={findingsOfTool('whatweb')}
+              statusOf={statusOf}
+              nodeStatus={nodeStatus}
+              jobProgress={jobProgress}
+              nodeStartedAtRef={nodeStartedAtRef}
+              onStart={addJob}
+              onCancel={cancelJob}
+              onPromote={(values) => promoteFromTool('whatweb', values)}
+              schemeField
+              wordlistField={false}
             />
           </div>
 
@@ -1088,6 +1214,8 @@ function ToolTab({
   schemeField,
   hostSuffixField,
   recursiveField,
+  wordlistField = true,
+  credentialField = true,
 }: {
   caseId: string
   tool: Tool
@@ -1106,6 +1234,16 @@ function ToolTab({
   schemeField?: boolean
   hostSuffixField?: boolean
   recursiveField?: boolean
+  // wordlistField hides the wordlist-file tuning input for tools that
+  // don't fuzz off a wordlist at all (subfinder/amass/katana/httpx/
+  // whatweb) -- true (shown) for every wordlist-driven tool that predates
+  // this flag.
+  wordlistField?: boolean
+  // credentialField hides the saved-credential picker for tools that never
+  // issue an authenticated request to the target at all (subfinder/amass,
+  // which only ever query third-party OSINT sources) -- true (shown) for
+  // every tool that predates this flag.
+  credentialField?: boolean
 }) {
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [starting, setStarting] = useState(false)
@@ -1131,7 +1269,11 @@ function ToolTab({
   const [launcherOpen, setLauncherOpen] = useCollapsible(`launcher.${tool}`, true)
   useAutoCollapseOnce(jobs.length > 0, setLauncherOpen)
 
-  const nodePrefix = tool === 'feroxbuster' ? 'feroxbuster' : 'ffuf'
+  // Every fanout tool's source node IDs are "<kind>-<index>" (see
+  // buildFanoutFlow) where kind is the engine.NodeKind the tool maps to --
+  // one-to-one with the tool name itself except the three ffuf-* tools,
+  // which all share the single "ffuf" adapter/node kind.
+  const nodePrefix = tool === 'feroxbuster' ? 'feroxbuster' : tool.startsWith('ffuf') ? 'ffuf' : tool
 
   const start = async () => {
     if (selected.size === 0) return
@@ -1301,11 +1443,15 @@ function ToolTab({
                 <span className="text-[10px] font-semibold uppercase tracking-wide text-neutral-500">Rate limit (req/s)</span>
                 <input value={rateLimit} onChange={(e) => setRateLimit(e.target.value)} placeholder="unlimited" className="rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-xs text-neutral-100 outline-none focus:border-sky-500" />
               </label>
-              <label className="flex flex-col gap-0.5">
-                <span className="text-[10px] font-semibold uppercase tracking-wide text-neutral-500">Wordlist file</span>
-                <input value={wordlist} onChange={(e) => setWordlist(e.target.value)} placeholder="category default" className="rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-xs text-neutral-100 outline-none focus:border-sky-500" />
-              </label>
-              <CredentialPicker credentials={credentials} selected={credentialId} onSelect={setCredentialId} className="col-span-2 sm:col-span-4" />
+              {wordlistField && (
+                <label className="flex flex-col gap-0.5">
+                  <span className="text-[10px] font-semibold uppercase tracking-wide text-neutral-500">Wordlist file</span>
+                  <input value={wordlist} onChange={(e) => setWordlist(e.target.value)} placeholder="category default" className="rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-xs text-neutral-100 outline-none focus:border-sky-500" />
+                </label>
+              )}
+              {credentialField && (
+                <CredentialPicker credentials={credentials} selected={credentialId} onSelect={setCredentialId} className="col-span-2 sm:col-span-4" />
+              )}
             </div>
           )}
           {message && <p className="mt-2 text-xs text-neutral-500">{message}</p>}

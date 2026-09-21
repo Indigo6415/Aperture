@@ -3,10 +3,11 @@
 # Aperture installer for macOS/Linux.
 #
 # Installs -- or reinstalls/upgrades, if already present -- every
-# dependency Aperture needs (Go, Node.js, ffuf, feroxbuster, nuclei, and,
-# best-effort, a headless-Chrome-compatible browser for screenshots/PDF
-# report export), then builds the frontend and the aperture binary from
-# this checkout and installs everything into one directory on PATH.
+# dependency Aperture needs (Go, Node.js, ffuf, feroxbuster, nuclei,
+# subfinder, amass, httpx, katana, best-effort WhatWeb, and, best-effort, a
+# headless-Chrome-compatible browser for screenshots/PDF report export),
+# then builds the frontend and the aperture binary from this checkout and
+# installs everything into one directory on PATH.
 #
 # Usage: ./install.sh
 # Override the install location with: APERTURE_INSTALL_DIR=/some/dir ./install.sh
@@ -168,6 +169,46 @@ install_nuclei() {
   ok "nuclei $("$INSTALL_DIR/nuclei" -version 2>&1 | head -n1) installed to $INSTALL_DIR/nuclei"
 }
 
+install_subfinder() {
+  info "Installing subfinder (latest) via go install..."
+  GOBIN="$INSTALL_DIR" go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+  ok "subfinder $("$INSTALL_DIR/subfinder" -version 2>&1 | head -n1) installed to $INSTALL_DIR/subfinder"
+}
+
+install_amass() {
+  info "Installing amass (latest) via go install..."
+  GOBIN="$INSTALL_DIR" go install github.com/owasp-amass/amass/v4/cmd/amass@latest
+  ok "amass $("$INSTALL_DIR/amass" -version 2>&1 | head -n1) installed to $INSTALL_DIR/amass"
+}
+
+install_httpx() {
+  info "Installing httpx (latest) via go install..."
+  GOBIN="$INSTALL_DIR" go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+  ok "httpx $("$INSTALL_DIR/httpx" -version 2>&1 | head -n1) installed to $INSTALL_DIR/httpx"
+}
+
+install_katana() {
+  info "Installing katana (latest) via go install..."
+  GOBIN="$INSTALL_DIR" go install github.com/projectdiscovery/katana/cmd/katana@latest
+  ok "katana $("$INSTALL_DIR/katana" -version 2>&1 | head -n1) installed to $INSTALL_DIR/katana"
+}
+
+install_whatweb() {
+  info "Checking for WhatWeb..."
+  if command -v whatweb &>/dev/null; then
+    ok "whatweb already installed"
+    return
+  fi
+  # WhatWeb is a Ruby tool with no `go install`-style single-binary release,
+  # so -- like install_headless_browser -- this is best-effort via whatever
+  # system package manager is available rather than a hard requirement.
+  if ! pkg_install "whatweb" "whatweb" "whatweb" "whatweb" "whatweb" "whatweb"; then
+    warn "WhatWeb not found and automatic install did not succeed -- install it manually (e.g. 'gem install whatweb' or https://github.com/urbanadventurer/WhatWeb) if you want the WhatWeb tab to work; every other tool is unaffected."
+    return
+  fi
+  command -v whatweb &>/dev/null && ok "whatweb installed" || warn "WhatWeb install command succeeded but no 'whatweb' binary was found on PATH afterward."
+}
+
 # chrome_binary_names lists the executable names install_headless_browser
 # checks for -- kept in sync with adapters.chromeBinaries (internal/adapters
 # /screenshot.go), since both are looking for the same thing.
@@ -257,6 +298,11 @@ ensure_node
 install_ffuf
 install_feroxbuster
 install_nuclei
+install_subfinder
+install_amass
+install_httpx
+install_katana
+install_whatweb
 install_headless_browser
 build_frontend
 build_aperture
@@ -280,6 +326,11 @@ printf '  node        %s\n' "$(node -v)"
 printf '  ffuf        %s\n' "$("$INSTALL_DIR/ffuf" -V 2>&1 | head -n1)"
 printf '  feroxbuster %s\n' "$("$INSTALL_DIR/feroxbuster" -V)"
 printf '  nuclei      %s\n' "$("$INSTALL_DIR/nuclei" -version 2>&1 | head -n1)"
+printf '  subfinder   %s\n' "$("$INSTALL_DIR/subfinder" -version 2>&1 | head -n1)"
+printf '  amass       %s\n' "$("$INSTALL_DIR/amass" -version 2>&1 | head -n1)"
+printf '  httpx       %s\n' "$("$INSTALL_DIR/httpx" -version 2>&1 | head -n1)"
+printf '  katana      %s\n' "$("$INSTALL_DIR/katana" -version 2>&1 | head -n1)"
+printf '  whatweb     %s\n' "$(command -v whatweb &>/dev/null && echo "installed" || echo "not installed -- WhatWeb tab unavailable")"
 printf '  browser     %s\n' "${FOUND_BROWSER:-none found -- screenshots/PDF report export unavailable}"
 printf '  aperture    %s\n' "$INSTALL_DIR/aperture"
 echo

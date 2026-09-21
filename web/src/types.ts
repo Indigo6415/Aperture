@@ -150,7 +150,17 @@ export interface Target {
 
 // Tool identifies which job a case can run -- mirrors the tool constants in
 // internal/api/handlers_jobs.go.
-export type Tool = 'feroxbuster' | 'ffuf-subdomain' | 'ffuf-vhost' | 'ffuf-custom' | 'identify'
+export type Tool =
+  | 'feroxbuster'
+  | 'ffuf-subdomain'
+  | 'ffuf-vhost'
+  | 'ffuf-custom'
+  | 'identify'
+  | 'subfinder'
+  | 'amass'
+  | 'katana'
+  | 'httpx'
+  | 'whatweb'
 
 // JobOptionsPreset mirrors internal/engine.ScanOptions' Preset field --
 // "aggressive"/"normal"/"stealth" fill in Threads/TimeoutSeconds/RateLimit

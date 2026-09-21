@@ -3,9 +3,12 @@
     Aperture installer for Windows.
 .DESCRIPTION
     Installs -- or reinstalls/upgrades, if already present -- every
-    dependency Aperture needs (Go, Node.js, ffuf, feroxbuster), then builds
-    the frontend and the aperture binary from this checkout and installs
-    everything into one directory on PATH. No admin rights required.
+    dependency Aperture needs (Go, Node.js, ffuf, feroxbuster, subfinder,
+    amass, httpx, katana), then builds the frontend and the aperture binary
+    from this checkout and installs everything into one directory on PATH.
+    No admin rights required. WhatWeb (Ruby-based, no Windows-friendly
+    single-binary release) is not installed by this script -- see the
+    summary printed at the end for how to add it manually.
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File install.ps1
 #>
@@ -129,6 +132,38 @@ function Install-Feroxbuster {
     Write-Ok "feroxbuster installed to $InstallDir\feroxbuster.exe"
 }
 
+function Install-Subfinder {
+    Write-Info "Installing subfinder (latest) via go install..."
+    $env:GOBIN = $InstallDir
+    go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+    Remove-Item Env:\GOBIN
+    Write-Ok "subfinder installed to $InstallDir\subfinder.exe"
+}
+
+function Install-Amass {
+    Write-Info "Installing amass (latest) via go install..."
+    $env:GOBIN = $InstallDir
+    go install github.com/owasp-amass/amass/v4/cmd/amass@latest
+    Remove-Item Env:\GOBIN
+    Write-Ok "amass installed to $InstallDir\amass.exe"
+}
+
+function Install-Httpx {
+    Write-Info "Installing httpx (latest) via go install..."
+    $env:GOBIN = $InstallDir
+    go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+    Remove-Item Env:\GOBIN
+    Write-Ok "httpx installed to $InstallDir\httpx.exe"
+}
+
+function Install-Katana {
+    Write-Info "Installing katana (latest) via go install..."
+    $env:GOBIN = $InstallDir
+    go install github.com/projectdiscovery/katana/cmd/katana@latest
+    Remove-Item Env:\GOBIN
+    Write-Ok "katana installed to $InstallDir\katana.exe"
+}
+
 function Build-Frontend {
     Write-Info "Building frontend..."
     Push-Location (Join-Path $RepoRoot "web")
@@ -164,12 +199,20 @@ Ensure-Go
 Ensure-Node
 Install-Ffuf
 Install-Feroxbuster
+Install-Subfinder
+Install-Amass
+Install-Httpx
+Install-Katana
 Build-Frontend
 Build-Aperture
 Ensure-Path
 
 $FfufExe = Join-Path $InstallDir "ffuf.exe"
 $FeroxExe = Join-Path $InstallDir "feroxbuster.exe"
+$SubfinderExe = Join-Path $InstallDir "subfinder.exe"
+$AmassExe = Join-Path $InstallDir "amass.exe"
+$HttpxExe = Join-Path $InstallDir "httpx.exe"
+$KatanaExe = Join-Path $InstallDir "katana.exe"
 $ApertureExe = Join-Path $InstallDir "aperture.exe"
 
 Write-Host ""
@@ -178,6 +221,11 @@ Write-Host "  go          $(go version)"
 Write-Host "  node        $(node -v)"
 Write-Host "  ffuf        $(& $FfufExe -V 2>&1 | Select-Object -First 1)"
 Write-Host "  feroxbuster $(& $FeroxExe -V)"
+Write-Host "  subfinder   $(& $SubfinderExe -version 2>&1 | Select-Object -First 1)"
+Write-Host "  amass       $(& $AmassExe -version 2>&1 | Select-Object -First 1)"
+Write-Host "  httpx       $(& $HttpxExe -version 2>&1 | Select-Object -First 1)"
+Write-Host "  katana      $(& $KatanaExe -version 2>&1 | Select-Object -First 1)"
 Write-Host "  aperture    $ApertureExe"
 Write-Host ""
+Write-Info "WhatWeb was not installed (Ruby-based, no Windows-friendly single-binary release) -- install it manually (e.g. via WSL, or 'gem install whatweb') if you want the WhatWeb tab to work; every other tool is unaffected."
 Write-Info "Run 'aperture' to start (open a new terminal first if PATH was just updated)."
