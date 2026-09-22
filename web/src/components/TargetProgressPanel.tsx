@@ -1,6 +1,7 @@
+import { useEffect, useState } from 'react'
 import type { NodeStatus } from '../types'
 import { STATUS_META } from '../statusMeta'
-import { formatEta } from '../eta'
+import { formatEta, formatDuration } from '../eta'
 import { copyToClipboard, useContextMenu } from '../contextMenu'
 import { sendToJwtScanner } from '../jwtHandoff'
 import { sendToProbe } from '../probeHandoff'
@@ -15,6 +16,11 @@ export interface TargetProgress {
   done: number
   total: number
   etaSeconds: number | null
+  // When this node started running (ms epoch), if known -- backs the
+  // elapsed-time display an indeterminate-total row (katana, subfinder,
+  // amass, feroxbuster's recursive pass) falls back to in place of a
+  // percentage/ETA, which total==0 makes impossible to compute.
+  startedAt?: number | null
   // Scan config for this target's node, when known (see
   // internal/api.JobNodeDetail) -- undefined for a node the job response
   // didn't carry details for (e.g. identify jobs have no flow at all).
@@ -101,6 +107,19 @@ function TargetRow({ t }: { t: TargetProgress }) {
   // the first tick lands (e.g. a still-queued or just-started node).
   const candidates = t.total > 0 ? t.total : t.candidates
 
+  // Ticks once a second while this row is running and its total is
+  // unknowable (katana's crawl, subfinder/amass's enumeration, feroxbuster's
+  // recursive pass) so the elapsed-time readout below keeps moving even
+  // when no new finding/progress event has landed to force a re-render on
+  // its own.
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (t.status !== 'running' || pct !== null) return
+    const id = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(id)
+  }, [t.status, pct])
+  const elapsedSeconds = t.startedAt ? (now - t.startedAt) / 1000 : null
+
   return (
     <div
       onContextMenu={(e) => {
@@ -145,8 +164,17 @@ function TargetRow({ t }: { t: TargetProgress }) {
             />
           </div>
           <span className="shrink-0 whitespace-nowrap text-neutral-500">
-            {pct !== null ? `${pct}% (${t.done.toLocaleString()}/${t.total.toLocaleString()})` : t.done.toLocaleString()}
+            {pct !== null
+              ? `${pct}% (${t.done.toLocaleString()}/${t.total.toLocaleString()})`
+              : `${t.done.toLocaleString()} found`}
           </span>
+          {/* An indeterminate row has no percentage/ETA to show (total is
+              unknowable), so elapsed running time fills that space instead --
+              e.g. katana's crawl, where "how many hits so far" alone doesn't
+              say whether it's about to finish or still has minutes to go. */}
+          {pct === null && elapsedSeconds !== null && (
+            <span className="shrink-0 whitespace-nowrap text-neutral-600">{formatDuration(elapsedSeconds)}</span>
+          )}
           {t.etaSeconds !== null && <span className="shrink-0 whitespace-nowrap text-neutral-600">{formatEta(t.etaSeconds)}</span>}
         </div>
       ) : (

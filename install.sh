@@ -199,14 +199,56 @@ install_whatweb() {
     ok "whatweb already installed"
     return
   fi
-  # WhatWeb is a Ruby tool with no `go install`-style single-binary release,
-  # so -- like install_headless_browser -- this is best-effort via whatever
-  # system package manager is available rather than a hard requirement.
-  if ! pkg_install "whatweb" "whatweb" "whatweb" "whatweb" "whatweb" "whatweb"; then
-    warn "WhatWeb not found and automatic install did not succeed -- install it manually (e.g. 'gem install whatweb' or https://github.com/urbanadventurer/WhatWeb) if you want the WhatWeb tab to work; every other tool is unaffected."
+  # WhatWeb has no `go install`-style single-binary release and, unlike
+  # every other pkg_install call in this script, no package-manager path
+  # that actually works for it either: it isn't published as a rubygem at
+  # all ("gem install whatweb" -- what this script used to suggest --
+  # fails outright), and its old Homebrew formula was pulled from
+  # homebrew-core, so `brew install whatweb` now fails on macOS too. The
+  # one install path its own README still documents as reliable is a
+  # straight git checkout run with `ruby` -- so that's what this does,
+  # same as install_feroxbuster fetching a release archive directly
+  # instead of going through a package manager.
+  if ! command -v ruby &>/dev/null; then
+    warn "Ruby not found -- WhatWeb needs it and there's no way to install Ruby itself here; install Ruby manually (e.g. 'brew install ruby') and re-run this script if you want the WhatWeb tab to work; every other tool is unaffected."
     return
   fi
-  command -v whatweb &>/dev/null && ok "whatweb installed" || warn "WhatWeb install command succeeded but no 'whatweb' binary was found on PATH afterward."
+  if ! command -v git &>/dev/null; then
+    warn "git not found -- can't fetch WhatWeb's source; install git and re-run this script if you want the WhatWeb tab to work."
+    return
+  fi
+
+  local src="$INSTALL_DIR/whatweb-src"
+  if [[ -d "$src/.git" ]]; then
+    git -C "$src" pull --ff-only -q || warn "Failed to update the existing WhatWeb checkout at $src -- using what's there."
+  elif ! git clone --depth 1 -q https://github.com/urbanadventurer/WhatWeb.git "$src"; then
+    warn "Failed to clone WhatWeb from GitHub -- install it manually (https://github.com/urbanadventurer/WhatWeb) if you want the WhatWeb tab to work."
+    return
+  fi
+
+  # addressable is WhatWeb's one dependency that isn't already part of the
+  # Ruby standard library (ipaddr/json ship with Ruby itself) -- installed
+  # per-user so it doesn't need sudo/root. A plain install is tried first;
+  # on a Ruby old enough that the current addressable/public_suffix won't
+  # install (e.g. macOS's bundled Ruby 2.6), the last versions of each that
+  # still support it are pinned instead.
+  if ! ruby -e "require 'addressable'" &>/dev/null; then
+    if ! gem install --user-install addressable &>/dev/null; then
+      gem install --user-install public_suffix -v 5.1.1 &>/dev/null
+      gem install --user-install addressable -v 2.8.7 &>/dev/null
+    fi
+  fi
+  if ! ruby -e "require 'addressable'" &>/dev/null; then
+    warn "Could not install WhatWeb's 'addressable' gem dependency automatically -- install it manually ('gem install addressable') and re-run this script if you want the WhatWeb tab to work."
+    return
+  fi
+
+  cat >"$INSTALL_DIR/whatweb" <<WRAPPER
+#!/usr/bin/env bash
+exec ruby "$src/whatweb" "\$@"
+WRAPPER
+  chmod +x "$INSTALL_DIR/whatweb"
+  command -v whatweb &>/dev/null && ok "whatweb installed to $INSTALL_DIR/whatweb" || warn "WhatWeb wrapper written to $INSTALL_DIR/whatweb but isn't resolving on PATH yet."
 }
 
 # chrome_binary_names lists the executable names install_headless_browser

@@ -318,8 +318,15 @@ export function CaseView({ caseId }: { caseId: string }) {
 
   const findingsOfTool = (tool: Tool): Finding[] => {
     const byKey = new Map<string, Finding>()
+    // Subfinder's second stage (see internal/api.buildSubfinderFlow) re-emits
+    // an already-seen host as a fresh Finding once httpx has actually probed
+    // it, entirely superseding the bare "found it" placeholder subfinder
+    // itself emitted first -- keyed by URL alone here (not URL+status, like
+    // every other tool below) so the real probe result replaces the
+    // placeholder in the table instead of both showing up as separate rows.
+    const keyOf = tool === 'subfinder' ? (f: Finding) => f.url : (f: Finding) => `${f.url}|${f.statusCode}`
     for (const job of jobsOfTool(tool)) {
-      for (const f of runFindings[job.id] ?? []) byKey.set(`${f.url}|${f.statusCode}`, f)
+      for (const f of runFindings[job.id] ?? []) byKey.set(keyOf(f), f)
     }
     return [...byKey.values()]
   }
@@ -589,6 +596,7 @@ export function CaseView({ caseId }: { caseId: string }) {
               onPromote={(values) => promoteFromTool('amass', values)}
               wordlistField={false}
               credentialField={false}
+              disabledMessage="The amass binary itself just hangs and produces nothing on every run right now, regardless of flags -- disabled for the moment. Will be fixed soon."
             />
           </div>
 
@@ -1216,6 +1224,7 @@ function ToolTab({
   recursiveField,
   wordlistField = true,
   credentialField = true,
+  disabledMessage,
 }: {
   caseId: string
   tool: Tool
@@ -1244,6 +1253,11 @@ function ToolTab({
   // which only ever query third-party OSINT sources) -- true (shown) for
   // every tool that predates this flag.
   credentialField?: boolean
+  // disabledMessage, when set, replaces this tab's launcher with a static
+  // notice and blocks starting a new job entirely -- for a tool that's
+  // known broken right now rather than one the user just hasn't run yet.
+  // Past jobs/results (if any) still render below it as usual.
+  disabledMessage?: string
 }) {
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [starting, setStarting] = useState(false)
@@ -1318,16 +1332,30 @@ function ToolTab({
         const startedAt = nodeStartedAtRef.current[key] ?? null
         const detail = job.nodes?.find((n) => n.nodeId === nodeId)
         rows.push({
-          key, target, status, done, total, etaSeconds: estimateEtaSeconds(done, total, startedAt),
+          key, target, status, done, total, etaSeconds: estimateEtaSeconds(done, total, startedAt), startedAt,
           wordlist: detail?.wordlist, extensions: detail?.extensions, candidates: detail?.candidates,
           threads: detail?.threads, timeoutSeconds: detail?.timeoutSeconds, rateLimit: detail?.rateLimit,
         })
       })
+
+      // Subfinder's second stage: the enumeration nodes above feed a single
+      // shared "verify" node (see internal/api.buildSubfinderFlow) that
+      // isn't one of job.targets, so it needs its own row here instead of
+      // falling out of the forEach above.
+      if (tool === 'subfinder') {
+        const key = `${job.id}:verify`
+        const status: NodeStatus = nodeStatus[key] ?? (jobProgress[key] ? 'running' : jStatus === 'running' ? 'pending' : jStatus)
+        const p = jobProgress[key]
+        const done = p?.done ?? 0
+        const total = p?.total ?? 0
+        const startedAt = nodeStartedAtRef.current[key] ?? null
+        rows.push({ key, target: 'Verify (httpx)', status, done, total, etaSeconds: estimateEtaSeconds(done, total, startedAt), startedAt })
+      }
     }
     return rows
   }
 
-  const canRun = !starting && selected.size > 0 && !(hostSuffixField && !hostSuffix.trim())
+  const canRun = !disabledMessage && !starting && selected.size > 0 && !(hostSuffixField && !hostSuffix.trim())
   const launcherSummary =
     selected.size > 0
       ? `${selected.size} target${selected.size === 1 ? '' : 's'} selected${preset !== 'custom' ? ` · ${preset}` : ''}`
@@ -1336,6 +1364,12 @@ function ToolTab({
   return (
     <div className="flex h-full flex-col overflow-hidden">
       <div className="shrink-0 overflow-y-auto border-b border-neutral-800 p-3">
+        {disabledMessage ? (
+          <div className="flex items-start gap-2 rounded border border-amber-900/50 bg-amber-950/20 px-3 py-2 text-xs text-amber-200">
+            <span className="mt-0.5 shrink-0">⚠</span>
+            <span>{disabledMessage}</span>
+          </div>
+        ) : (
         <CollapsibleFormPanel
           title="Configure"
           open={launcherOpen}
@@ -1456,6 +1490,7 @@ function ToolTab({
           )}
           {message && <p className="mt-2 text-xs text-neutral-500">{message}</p>}
         </CollapsibleFormPanel>
+        )}
       </div>
 
       {jobs.length > 0 && <JobHistory jobs={jobs} statusOf={statusOf} onCancel={onCancel} panelKey={tool} />}

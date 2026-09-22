@@ -131,6 +131,7 @@ func NewServer(st *store.Store, eng *engine.Engine, uiFS fs.FS, wordlistsDir str
 	s.mux.HandleFunc("DELETE /api/wordlists/{name}", s.requireAuth(s.handleDeleteWordlist))
 	s.mux.HandleFunc("PATCH /api/wordlists/{name}/categories", s.requireAuth(s.handleSetWordlistCategories))
 	s.mux.HandleFunc("POST /api/wordlists/{name}/duplicate", s.requireAuth(s.handleDuplicateWordlist))
+	s.mux.HandleFunc("POST /api/wordlists/{name}/rename", s.requireAuth(s.handleRenameWordlist))
 
 	s.mux.HandleFunc("GET /api/runs/{id}", s.requireAuth(s.handleGetRun))
 	s.mux.HandleFunc("GET /api/runs/{id}/findings", s.requireAuth(s.handleListFindings))

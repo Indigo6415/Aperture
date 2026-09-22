@@ -114,8 +114,10 @@ func (e *Engine) Execute(ctx context.Context, flow Flow, runID string, onResult 
 			// A source node (ffuf/feroxbuster/nmap/nuclei) may sit behind
 			// maxConcurrentSourceNodes for a while -- report it as queued,
 			// not running, until runNode actually acquires a slot and
-			// starts the subprocess. Everything else has no such gate.
-			if n.Kind.IsSource() {
+			// starts the subprocess. KindHttpxVerify shares that same gate
+			// despite IsSource() being false for it (see its doc comment in
+			// flow.go). Everything else has no such gate.
+			if n.Kind.IsSource() || n.Kind == KindHttpxVerify {
 				nodeStatus(StatusQueued, "")
 			} else {
 				nodeStatus(StatusRunning, "")
@@ -178,6 +180,19 @@ func (e *Engine) runNode(ctx context.Context, n Node, runID string, in []Edge, e
 		return adapter.Run(ctx, n.Config, adapters.RunMeta{RunID: runID, NodeID: n.ID}, func(f model.Finding) {
 			_ = sendAndEmit(ctx, out, f, emit)
 		}, adapters.Progress(progress))
+	}
+
+	if n.Kind == KindHttpxVerify {
+		// Same slot-then-run treatment as the IsSource() branch above, and
+		// for the same reason -- this still shells out to httpx underneath.
+		select {
+		case e.sourceSem <- struct{}{}:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		defer func() { <-e.sourceSem }()
+		onStatus(StatusRunning, "")
+		return runHttpxVerify(ctx, n, fanIn(ctx, inputs), out, emit, progress, runID)
 	}
 
 	switch n.Kind {

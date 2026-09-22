@@ -186,6 +186,42 @@ func Duplicate(dir, name, newName string, cats []Category) error {
 	return SetCategories(dir, newName, cats)
 }
 
+// Rename changes a wordlist's filename from name to newName, carrying its
+// category assignments over to the new name. The bundled defaults are
+// protected, like Delete, since their fixed filenames are relied on
+// elsewhere (defaultCategoriesFor, CombinedForCategory's fallback, the
+// auto-generated scan flow).
+func Rename(dir, name, newName string) error {
+	if name == DefaultName || name == SubdomainsDefaultName {
+		return fmt.Errorf("wordlists: %s is a built-in default and can't be renamed", name)
+	}
+	srcPath, err := safePath(dir, name)
+	if err != nil {
+		return err
+	}
+	dstPath, err := safePath(dir, newName)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(dstPath); err == nil {
+		return fmt.Errorf("wordlists: %s already exists", newName)
+	}
+	if err := os.Rename(srcPath, dstPath); err != nil {
+		return fmt.Errorf("wordlists: rename: %w", err)
+	}
+
+	m, err := loadCategoryMap(dir)
+	if err != nil {
+		return err
+	}
+	if cats, ok := m[name]; ok {
+		delete(m, name)
+		m[newName] = cats
+		return saveCategoryMap(dir, m)
+	}
+	return nil
+}
+
 // Info describes one wordlist file on disk. Path is the absolute path on
 // the machine running the Aperture server -- ffuf/feroxbuster run there as
 // subprocesses, so it's what a flow's node config needs to point at (the

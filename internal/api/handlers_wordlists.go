@@ -68,6 +68,29 @@ func (s *Server) handleDeleteWordlist(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+type renameWordlistRequest struct {
+	NewName string `json:"newName"`
+}
+
+// handleRenameWordlist renames a wordlist file, carrying its category
+// assignments over to the new name.
+func (s *Server) handleRenameWordlist(w http.ResponseWriter, r *http.Request) {
+	var req renameWordlistRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.NewName == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("newName is required"))
+		return
+	}
+	if err := wordlists.Rename(s.wordlistsDir, r.PathValue("name"), req.NewName); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 type setCategoriesRequest struct {
 	Categories []wordlists.Category `json:"categories"`
 }

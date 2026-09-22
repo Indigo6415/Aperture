@@ -152,6 +152,11 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ newName, categories }),
     }),
+  renameWordlist: (name: string, newName: string) =>
+    req<void>(`/api/wordlists/${encodeURIComponent(name)}/rename`, {
+      method: 'POST',
+      body: JSON.stringify({ newName }),
+    }),
 
   jwtScan: (scanReq: JwtScanRequest) => req<JwtScanResponse>('/api/jwt/scan', { method: 'POST', body: JSON.stringify(scanReq) }),
 

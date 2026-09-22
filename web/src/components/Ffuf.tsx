@@ -1,6 +1,6 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { api } from '../api'
-import type { Credential, Finding, FfufOptions, Job, JobOptions, NodeStatus, RunStatus, Target } from '../types'
+import type { Credential, Finding, FfufOptions, Job, JobOptions, NodeStatus, RunStatus, Target, WordlistInfo } from '../types'
 import { CollapsibleFormPanel } from './CollapsibleFormPanel'
 import { TargetButtons } from './TargetButtons'
 import { TargetProgressPanel, type TargetProgress } from './TargetProgressPanel'
@@ -75,6 +75,7 @@ export function FfufTab({
   const [body, setBody] = useState('')
   const [extensions, setExtensions] = useState('')
   const [wordlist, setWordlist] = useState('')
+  const [wordlists, setWordlists] = useState<WordlistInfo[]>([])
 
   const [matchCodes, setMatchCodes] = useState('')
   const [filterCodes, setFilterCodes] = useState('')
@@ -99,6 +100,10 @@ export function FfufTab({
   // every tool tab in CaseView uses.
   const [launcherOpen, setLauncherOpen] = useCollapsible('launcher.ffuf-custom', true)
   useAutoCollapseOnce(jobs.length > 0, setLauncherOpen)
+
+  useEffect(() => {
+    api.listWordlists().then(setWordlists).catch(() => {})
+  }, [])
 
   const addHeaderRow = () => setHeaderRows((rows) => [...rows, { name: '', value: '' }])
   const updateHeaderRow = (i: number, patch: Partial<HeaderRow>) =>
@@ -267,7 +272,14 @@ export function FfufTab({
           <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
             <label className="flex flex-col gap-0.5">
               <span className="text-[10px] font-semibold uppercase tracking-wide text-neutral-500">Wordlist file</span>
-              <input value={wordlist} onChange={(e) => setWordlist(e.target.value)} placeholder="directories default" className={inputBase} />
+              <select value={wordlist} onChange={(e) => setWordlist(e.target.value)} className={inputBase}>
+                <option value="">Directories category default</option>
+                {wordlists.map((w) => (
+                  <option key={w.name} value={w.name}>
+                    {w.name} ({w.lines.toLocaleString()} lines)
+                  </option>
+                ))}
+              </select>
             </label>
             <label className="flex flex-col gap-0.5">
               <span className="text-[10px] font-semibold uppercase tracking-wide text-neutral-500">Extensions</span>

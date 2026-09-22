@@ -5,11 +5,13 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"regexp"
 	"strconv"
 	"sync"
 
+	"github.com/Indigo6415/Aperture/internal/adapters"
 	"github.com/Indigo6415/Aperture/internal/model"
 )
 
@@ -197,6 +199,71 @@ func runTable(ctx context.Context, node Node, in <-chan model.Finding, out chan<
 		}
 	}
 	return nil
+}
+
+// HttpxVerifyConfig configures an httpx-verify node -- see runHttpxVerify.
+type HttpxVerifyConfig struct {
+	Headers   map[string]string `json:"headers,omitempty"`
+	Threads   int               `json:"threads,omitempty"`
+	Timeout   int               `json:"timeoutSeconds,omitempty"`
+	RateLimit int               `json:"rateLimit,omitempty"`
+}
+
+// runHttpxVerify is subfinder's second stage: subdomain enumeration only
+// ever tells you a name was seen by some OSINT source, not that anything
+// is actually listening there today, so every hostname the upstream
+// node(s) produce is collected here (not forwarded as-is) until their
+// stream closes, then probed in one batched httpx run -- emitting a real
+// status/size/words/lines Finding for every host that's actually alive,
+// and silently dropping the rest, exactly like piping subfinder into
+// httpx on the command line. Hostnames are de-duplicated and stripped down
+// to bare host (no scheme/path) before probing so httpx's own default
+// scheme-negotiation (try https, fall back to http) decides how each one
+// is actually reached, rather than locking every target to whatever
+// scheme the upstream node happened to emit.
+func runHttpxVerify(ctx context.Context, node Node, in <-chan model.Finding, out chan<- model.Finding, emit func(model.Finding), progress func(done, total int), runID string) error {
+	var cfg HttpxVerifyConfig
+	if len(node.Config) > 0 {
+		if err := json.Unmarshal(node.Config, &cfg); err != nil {
+			return fmt.Errorf("httpx-verify: invalid config: %w", err)
+		}
+	}
+
+	seen := map[string]bool{}
+	var targets []string
+	for f := range in {
+		host := f.URL
+		if u, err := url.Parse(f.URL); err == nil && u.Host != "" {
+			host = u.Host
+		}
+		if host == "" || seen[host] {
+			continue
+		}
+		seen[host] = true
+		targets = append(targets, host)
+	}
+	if len(targets) == 0 {
+		if progress != nil {
+			progress(0, 0)
+		}
+		return nil
+	}
+
+	httpxCfg, err := json.Marshal(adapters.HttpxConfig{
+		Targets: targets, Headers: cfg.Headers,
+		Threads: cfg.Threads, Timeout: cfg.Timeout, RateLimit: cfg.RateLimit,
+	})
+	if err != nil {
+		return fmt.Errorf("httpx-verify: marshal config: %w", err)
+	}
+
+	adapter, ok := adapters.Registry["httpx"]
+	if !ok {
+		return fmt.Errorf("httpx-verify: httpx adapter not registered")
+	}
+	return adapter.Run(ctx, httpxCfg, adapters.RunMeta{RunID: runID, NodeID: node.ID}, func(f model.Finding) {
+		_ = sendAndEmit(ctx, out, f, emit)
+	}, adapters.Progress(progress))
 }
 
 // ExportConfig configures where/how an export node writes accumulated

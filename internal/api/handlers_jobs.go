@@ -218,18 +218,15 @@ func (s *Server) buildToolFlow(tool string, targets []string, req startJobReques
 		}), nil
 
 	case ToolSubfinder:
-		return buildFanoutFlow("Subfinder", targets, func(i int, target string) (engine.NodeKind, string, json.RawMessage) {
-			cfg, _ := json.Marshal(adapters.SubfinderConfig{
-				Domain: target, Threads: opts.Threads, Timeout: opts.TimeoutSeconds, RateLimit: opts.RateLimit,
-			})
-			return engine.KindSubfinder, "subfinder: " + target, cfg
-		}), nil
+		return buildSubfinderFlow(targets, opts, credHeaders), nil
 
 	case ToolAmass:
-		return buildFanoutFlow("Amass", targets, func(i int, target string) (engine.NodeKind, string, json.RawMessage) {
-			cfg, _ := json.Marshal(adapters.AmassConfig{Domain: target, RateLimit: opts.RateLimit})
-			return engine.KindAmass, "amass: " + target, cfg
-		}), nil
+		// Disabled for now -- the amass binary itself has been observed to
+		// just hang/produce nothing on every run regardless of flags, so
+		// there's no config fix here; see the Amass tab's own notice for
+		// the user-facing side of this. Rejected here too (not just in the
+		// UI) so a direct API call can't launch it either.
+		return engine.Flow{}, fmt.Errorf("amass: temporarily disabled -- will be fixed soon")
 
 	case ToolKatana:
 		return buildFanoutFlow("Katana", targets, func(i int, target string) (engine.NodeKind, string, json.RawMessage) {
@@ -296,6 +293,39 @@ func buildFanoutFlow(name string, targets []string, nodeFor func(i int, target s
 	edges = append(edges, engine.Edge{ID: "e-merge-table", From: "merge", To: "table"})
 
 	return engine.Flow{Name: name, Nodes: nodes, Edges: edges}
+}
+
+// buildSubfinderFlow is buildFanoutFlow's subfinder-specific variant:
+// subfinder only ever tells you a name exists somewhere in an OSINT
+// source's records, not that anything answers there today, so instead of
+// merge feeding the table sink directly (every other fanout tool's shape),
+// it's rewired through an httpx-verify node first (see
+// engine.runHttpxVerify) -- turning the raw candidate list into real
+// STATUS/SIZE/WORDS/LINES probe results and dropping whatever isn't
+// actually alive.
+func buildSubfinderFlow(targets []string, opts engine.ScanOptions, headers map[string]string) engine.Flow {
+	flow := buildFanoutFlow("Subfinder", targets, func(i int, target string) (engine.NodeKind, string, json.RawMessage) {
+		cfg, _ := json.Marshal(adapters.SubfinderConfig{
+			Domain: target, Threads: opts.Threads, Timeout: opts.TimeoutSeconds, RateLimit: opts.RateLimit,
+		})
+		return engine.KindSubfinder, "subfinder: " + target, cfg
+	})
+
+	for i, ed := range flow.Edges {
+		if ed.From == "merge" && ed.To == "table" {
+			flow.Edges[i].To = "verify"
+			break
+		}
+	}
+	verifyCfg, _ := json.Marshal(engine.HttpxVerifyConfig{
+		Headers: headers, Threads: opts.Threads, Timeout: opts.TimeoutSeconds, RateLimit: opts.RateLimit,
+	})
+	flow.Nodes = append(flow.Nodes, engine.Node{
+		ID: "verify", Kind: engine.KindHttpxVerify, Label: "verify (httpx)", Config: verifyCfg,
+		Position: &engine.Position{X: 470, Y: 120},
+	})
+	flow.Edges = append(flow.Edges, engine.Edge{ID: "e-verify-table", From: "verify", To: "table"})
+	return flow
 }
 
 // handleStartJob launches one tool against one or more targets -- the only

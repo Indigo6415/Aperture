@@ -90,11 +90,23 @@ func (a *HttpxAdapter) Run(ctx context.Context, config json.RawMessage, meta Run
 	// -favicon adds one extra request per target (fetching /favicon.ico);
 	// -cdn/-ip/-cname/-asn-style lookups are otherwise free, reusing data
 	// httpx already has from the probe/DNS resolution it just did.
+	//
+	// -follow-redirects matters more than any single display flag above:
+	// without it, httpx probes exactly the URL it was given and stops --
+	// for a target that 301/302s (bare domain -> www, http -> https, or
+	// straight into a CDN/WAF challenge page), that first hop's tiny
+	// response is *all* -tech-detect ever gets to look at, so a real stack
+	// sitting one redirect away from the front door never gets fingerprinted
+	// and only the redirecting edge (e.g. "Cloudflare") shows up. Following
+	// redirects lets -tech-detect's wappalyzer-based fingerprinting (the
+	// same source Wappalyzer itself draws from) actually see the final
+	// rendered page's headers/HTML, which is where CMS/framework/server-
+	// version signatures usually live.
 	args := []string{
 		"-l", targetFile.Name(), "-json", "-silent",
 		"-status-code", "-content-length", "-content-type", "-title", "-web-server",
 		"-tech-detect", "-location", "-ip", "-cname", "-cdn", "-favicon",
-		"-word-count", "-line-count",
+		"-word-count", "-line-count", "-follow-redirects",
 	}
 	if cfg.Threads > 0 {
 		args = append(args, "-threads", strconv.Itoa(cfg.Threads))

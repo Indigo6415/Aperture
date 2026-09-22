@@ -32,13 +32,17 @@ type Target struct {
 // added if missing so url.Parse behaves predictably, and the rebuilt URL
 // only carries an explicit port when the caller gave one (or gave no scheme
 // at all, in which case the inferred default port is made explicit too).
+// A bare hostname/IP with no scheme (e.g. "target.htb", "10.10.10.10")
+// defaults to https, not http -- almost every real target speaks TLS today,
+// and probing plaintext by default against one that doesn't (or redirects)
+// just wastes every module's request on a 30x/reset instead of the real page.
 func ResolveTarget(raw string) *Target {
-	t := &Target{Raw: raw, Port: 80}
+	t := &Target{Raw: raw, Port: 443}
 
 	hadScheme := strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://")
 	s := raw
 	if !hadScheme {
-		s = "http://" + s
+		s = "https://" + s
 	}
 	s = strings.TrimRight(s, "/")
 
@@ -47,7 +51,7 @@ func ResolveTarget(raw string) *Target {
 		// Not parseable as a URL at all -- treat the raw input as a bare
 		// hostname so the scan still has something to probe.
 		t.Hostname = raw
-		t.URL = "http://" + raw
+		t.URL = "https://" + raw
 		resolveIP(t)
 		return t
 	}

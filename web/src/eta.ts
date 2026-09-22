@@ -14,11 +14,18 @@ export function estimateEtaSeconds(done: number, total: number, startedAt: numbe
 
 // formatEta renders a seconds count as a short human string.
 export function formatEta(seconds: number): string {
-  const s = Math.round(seconds)
-  if (s < 60) return `~${s}s`
+  return `~${formatDuration(seconds)}`
+}
+
+// formatDuration renders a seconds count as a short human string with no
+// "approximately" tilde -- for an already-elapsed duration (e.g. how long a
+// node has been running) rather than an estimate of time remaining.
+export function formatDuration(seconds: number): string {
+  const s = Math.max(0, Math.round(seconds))
+  if (s < 60) return `${s}s`
   const totalMinutes = Math.round(s / 60)
-  if (totalMinutes < 60) return `~${totalMinutes}m`
+  if (totalMinutes < 60) return `${totalMinutes}m`
   const hours = Math.floor(totalMinutes / 60)
   const minutes = totalMinutes % 60
-  return minutes > 0 ? `~${hours}h ${minutes}m` : `~${hours}h`
+  return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`
 }

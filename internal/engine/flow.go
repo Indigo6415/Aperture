@@ -34,6 +34,16 @@ const (
 	KindMerge     NodeKind = "merge"
 	KindTable     NodeKind = "table"
 	KindExport    NodeKind = "export"
+	// KindHttpxVerify is subfinder's second stage (see runHttpxVerify in
+	// nodes.go): unlike every kind above, it has no adapters.Adapter of its
+	// own and isn't a source (IsSource() is false for it, same as
+	// filter/merge/table/export below) -- it consumes the hostnames its
+	// upstream node(s) already produced and, only once that stream closes,
+	// runs one batched httpx pass over all of them, so it needs the same
+	// "wraps an external tool" treatment IsSource() nodes get (queued
+	// status, maxConcurrentSourceNodes gating) without actually being
+	// dispatchable through adapters.Registry.
+	KindHttpxVerify NodeKind = "httpx-verify"
 )
 
 // IsSource reports whether a node kind is a scan node (no inputs, wraps an

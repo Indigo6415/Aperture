@@ -45,6 +45,8 @@ export function Wordlists() {
   const [customName, setCustomName] = useState('')
   const [customUrl, setCustomUrl] = useState('')
   const [error, setError] = useState('')
+  const [renaming, setRenaming] = useState<string | null>(null)
+  const [renameValue, setRenameValue] = useState('')
 
   const refresh = () => api.listWordlists().then(setInstalled)
 
@@ -82,6 +84,37 @@ export function Wordlists() {
       setError(err instanceof Error ? err.message : String(err))
     } finally {
       setBusy(null)
+    }
+  }
+
+  // startRenaming switches a wordlist row into its inline text-input state,
+  // seeded with the current name so the user is editing rather than
+  // starting from a blank field.
+  const startRenaming = (name: string) => {
+    setRenaming(name)
+    setRenameValue(name)
+  }
+
+  // commitRename sends the edited name to the server and closes the inline
+  // editor. A blank or unchanged value just closes the editor without an
+  // API call, so pressing Escape-then-blur or clicking away doesn't rename
+  // anything.
+  const commitRename = async (name: string) => {
+    const newName = renameValue.trim()
+    if (!newName || newName === name) {
+      setRenaming(null)
+      return
+    }
+    setError('')
+    setBusy(name)
+    try {
+      await api.renameWordlist(name, newName)
+      await refresh()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(null)
+      setRenaming(null)
     }
   }
 
@@ -152,27 +185,52 @@ export function Wordlists() {
                 {members.map((w) => (
                   <div
                     key={w.name}
-                    draggable
+                    draggable={renaming !== w.name}
                     onDragStart={(e) => {
                       e.dataTransfer.setData('text/plain', w.name)
                       e.dataTransfer.effectAllowed = 'move'
                     }}
                     className={`flex items-center justify-between gap-2 rounded border border-neutral-700 bg-neutral-900 px-2 py-1.5 ${
-                      busy === w.name ? 'opacity-50' : 'cursor-grab active:cursor-grabbing'
+                      busy === w.name ? 'opacity-50' : renaming === w.name ? '' : 'cursor-grab active:cursor-grabbing'
                     }`}
                   >
-                    <div className="min-w-0">
-                      <p className="truncate font-mono text-xs text-neutral-100">
-                        {w.name}
-                        {w.builtin && (
-                          <span className="ml-1.5 rounded-full border border-neutral-700 px-1 py-px text-[9px] text-neutral-500">built-in</span>
-                        )}
-                      </p>
+                    <div className="min-w-0 flex-1">
+                      {renaming === w.name ? (
+                        <input
+                          autoFocus
+                          value={renameValue}
+                          onChange={(e) => setRenameValue(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') commitRename(w.name)
+                            if (e.key === 'Escape') setRenaming(null)
+                          }}
+                          onBlur={() => commitRename(w.name)}
+                          spellCheck={false}
+                          className="w-full rounded border border-sky-600 bg-neutral-800 px-1 py-0.5 font-mono text-xs text-neutral-100 outline-none"
+                        />
+                      ) : (
+                        <p className="truncate font-mono text-xs text-neutral-100">
+                          {w.name}
+                          {w.builtin && (
+                            <span className="ml-1.5 rounded-full border border-neutral-700 px-1 py-px text-[9px] text-neutral-500">built-in</span>
+                          )}
+                        </p>
+                      )}
                       <p className="text-[10px] text-neutral-500">
                         {w.lines.toLocaleString()} lines · {formatSize(w.size)}
                       </p>
                     </div>
                     <div className="flex shrink-0 items-center gap-1.5">
+                      {!w.builtin && renaming !== w.name && (
+                        <button
+                          onClick={() => startRenaming(w.name)}
+                          disabled={busy === w.name}
+                          title="Rename"
+                          className="text-xs text-neutral-500 hover:text-sky-400 disabled:opacity-40"
+                        >
+                          ✎
+                        </button>
+                      )}
                       <button
                         onClick={() => duplicate(w.name)}
                         disabled={busy === w.name}
