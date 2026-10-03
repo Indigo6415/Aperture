@@ -4,7 +4,7 @@
 .DESCRIPTION
     Installs -- or reinstalls/upgrades, if already present -- every
     dependency Aperture needs (Go, Node.js, ffuf, feroxbuster, subfinder,
-    amass, httpx, katana), then builds the frontend and the aperture binary
+    amass, httpx, katana, retire.js), then builds the frontend and the aperture binary
     from this checkout and installs everything into one directory on PATH.
     No admin rights required. WhatWeb (Ruby-based, no Windows-friendly
     single-binary release) is not installed by this script -- see the
@@ -164,6 +164,22 @@ function Install-Katana {
     Write-Ok "katana installed to $InstallDir\katana.exe"
 }
 
+function Install-Retire {
+    Write-Info "Installing retire.js (latest) via npm..."
+    # retire.js powers the Domain Scan tab's first module (flags
+    # known-vulnerable/outdated JS libraries). It's an npm package, not a
+    # Go module, so this goes through npm's own global install rather than
+    # GOBIN like the tools above -- best-effort, same posture as WhatWeb
+    # below: Domain Scan still loads without it, it just reports retire's
+    # module as unavailable.
+    try {
+        npm install -g retire | Out-Null
+        Write-Ok "retire.js installed"
+    } catch {
+        Write-Warning2 "Failed to install retire.js via npm -- install it manually ('npm install -g retire') if you want Domain Scan's retire.js module to work; every other tool is unaffected."
+    }
+}
+
 function Build-Frontend {
     Write-Info "Building frontend..."
     Push-Location (Join-Path $RepoRoot "web")
@@ -203,6 +219,7 @@ Install-Subfinder
 Install-Amass
 Install-Httpx
 Install-Katana
+Install-Retire
 Build-Frontend
 Build-Aperture
 Ensure-Path
@@ -225,6 +242,7 @@ Write-Host "  subfinder   $(& $SubfinderExe -version 2>&1 | Select-Object -First
 Write-Host "  amass       $(& $AmassExe -version 2>&1 | Select-Object -First 1)"
 Write-Host "  httpx       $(& $HttpxExe -version 2>&1 | Select-Object -First 1)"
 Write-Host "  katana      $(& $KatanaExe -version 2>&1 | Select-Object -First 1)"
+Write-Host "  retire.js   $(if (Get-Command retire -ErrorAction SilentlyContinue) { retire --version 2>&1 | Select-Object -First 1 } else { 'not installed -- Domain Scan retire.js module unavailable' })"
 Write-Host "  aperture    $ApertureExe"
 Write-Host ""
 Write-Info "WhatWeb was not installed (Ruby-based, no Windows-friendly single-binary release) -- install it manually (e.g. via WSL, or 'gem install whatweb') if you want the WhatWeb tab to work; every other tool is unaffected."

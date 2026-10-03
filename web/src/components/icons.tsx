@@ -173,11 +173,95 @@ export const IconWarning = (p: IconProps) =>
 export const IconActivity = (p: IconProps) =>
   base(p, <path d="M3 12h4l2-7 4 14 2-7h6" />)
 
+export const IconUnlock = (p: IconProps) =>
+  base(
+    p,
+    <>
+      <rect x="5" y="11" width="14" height="9" rx="1.5" />
+      <path d="M8 11V7a4 4 0 0 1 7.5-1.8" />
+    </>,
+  )
+
 export const IconGlobe = (p: IconProps) =>
   base(
     p,
     <>
       <circle cx="12" cy="12" r="8" />
       <path d="M4 12h16M12 4a13 13 0 0 1 0 16 13 13 0 0 1 0-16Z" />
+    </>,
+  )
+
+export const IconBug = (p: IconProps) =>
+  base(
+    p,
+    <>
+      <rect x="8" y="8" width="8" height="10" rx="4" />
+      <path d="M12 8V6M9.5 8.5 7 6M14.5 8.5 17 6M4 12h4M16 12h4M5 17l3-1.5M19 17l-3-1.5M5 8l3 1.5M19 8l-3 1.5" />
+    </>,
+  )
+
+// IconMailQuestion is an envelope with a "?" badge -- the Password Reset
+// Scanner tab's icon, standing in for a "forgot password" request-an-email
+// flow. The "?" is a filled <text> glyph rather than a hand-drawn path,
+// unlike every other icon here, since a stroked question-mark curve at this
+// size reads as illegible noise.
+export const IconMailQuestion = (p: IconProps) =>
+  base(
+    p,
+    <>
+      <rect x="2.5" y="5" width="16" height="13" rx="2" />
+      <path d="m2.5 6.5 8 5.5 8-5.5" />
+      <circle cx="18.5" cy="16.5" r="4.5" fill="currentColor" stroke="none" />
+      <text x="18.5" y="19.3" fontSize="6.5" fontWeight="700" textAnchor="middle" fill="#171717" stroke="none">
+        ?
+      </text>
+    </>,
+  )
+
+// IconBraces is a pair of curly braces -- the GraphQL Enumeration tab's
+// icon, standing in for a query/schema document the way "{}" reads in any
+// GraphQL client or spec doc.
+export const IconBraces = (p: IconProps) =>
+  base(
+    p,
+    <path d="M8 4c-2 0-2.5 1-2.5 2.5v2c0 1.2-.5 2-1.5 2.5 1 .5 1.5 1.3 1.5 2.5v2C5.5 19 6 20 8 20M16 4c2 0 2.5 1 2.5 2.5v2c0 1.2.5 2 1.5 2.5-1 .5-1.5 1.3-1.5 2.5v2c0 1.5-.5 2.5-2.5 2.5" />,
+  )
+
+// IconSend is a paper airplane -- the Tester tab's icon, standing in for
+// "send this request" the way a chat/mail app's send button does.
+export const IconSend = (p: IconProps) =>
+  base(p, <path d="M21 3 3 10.5l7.5 2.99L13.5 21 21 3Zm0 0-10.49 10.49" />)
+
+// IconCookie is a round cookie with a few "chips" -- the Cookie Vault tab's
+// icon.
+export const IconCookie = (p: IconProps) =>
+  base(
+    p,
+    <>
+      <path d="M20.5 11.5a8.5 8.5 0 1 1-9-9c-.2 1.3.6 2.6 1.9 2.9a2.3 2.3 0 0 0 2.8-1.6c1.4.9 2.3 2.4 2.4 4.1a2.1 2.1 0 1 0 1.9 3.6Z" />
+      <circle cx="8.5" cy="11.5" r="1" fill="currentColor" stroke="none" />
+      <circle cx="12" cy="16" r="1" fill="currentColor" stroke="none" />
+      <circle cx="15.5" cy="12.5" r="1" fill="currentColor" stroke="none" />
+    </>,
+  )
+
+// IconCode is a "</>" bracket glyph -- the XSS Scanner tab's icon, standing
+// in for injected markup/script the way IconBraces stands in for GraphQL's
+// own query syntax.
+export const IconCode = (p: IconProps) => base(p, <path d="M9.5 6 4 12l5.5 6M14.5 6 20 12l-5.5 6" />)
+
+// IconRouteTree is a root node branching into leaves -- the API Enumerator
+// tab's icon, standing in for the grouped route tree the tool's own
+// results view renders.
+export const IconRouteTree = (p: IconProps) =>
+  base(
+    p,
+    <>
+      <circle cx="5" cy="6" r="1.6" />
+      <path d="M5 7.6V12M5 12h5M5 12v5.4" />
+      <circle cx="12" cy="12" r="1.6" />
+      <path d="M12 13.6V17" />
+      <circle cx="19" cy="17.5" r="1.6" />
+      <circle cx="12" cy="18.6" r="1.6" />
     </>,
   )

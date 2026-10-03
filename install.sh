@@ -4,8 +4,9 @@
 #
 # Installs -- or reinstalls/upgrades, if already present -- every
 # dependency Aperture needs (Go, Node.js, ffuf, feroxbuster, nuclei,
-# subfinder, amass, httpx, katana, best-effort WhatWeb, and, best-effort, a
-# headless-Chrome-compatible browser for screenshots/PDF report export),
+# subfinder, amass, httpx, katana, retire.js, best-effort WhatWeb, and,
+# best-effort, a headless-Chrome-compatible browser for screenshots/PDF
+# report export),
 # then builds the frontend and the aperture binary from this checkout and
 # installs everything into one directory on PATH.
 #
@@ -193,6 +194,22 @@ install_katana() {
   ok "katana $("$INSTALL_DIR/katana" -version 2>&1 | head -n1) installed to $INSTALL_DIR/katana"
 }
 
+install_retire() {
+  info "Installing retire.js (latest) via npm..."
+  # retire.js (https://github.com/RetireJS/retire.js) powers the Domain
+  # Scan tab's first module: it flags known-vulnerable/outdated JS
+  # libraries. It's an npm package, not a Go module or standalone release,
+  # so `npm install -g` (into ensure_node's already-verified npm) is the
+  # straightforward path here rather than a manual download like
+  # install_feroxbuster's. Best-effort: the Domain Scan tab still loads
+  # without it, it just reports retire's own module as unavailable.
+  if ! npm install -g retire &>/dev/null; then
+    warn "Failed to install retire.js via npm -- install it manually ('npm install -g retire') if you want Domain Scan's retire.js module to work; every other tool is unaffected."
+    return
+  fi
+  ok "retire.js $(retire --version 2>&1 | head -n1) installed"
+}
+
 install_whatweb() {
   info "Checking for WhatWeb..."
   if command -v whatweb &>/dev/null; then
@@ -344,6 +361,7 @@ install_subfinder
 install_amass
 install_httpx
 install_katana
+install_retire
 install_whatweb
 install_headless_browser
 build_frontend
@@ -372,6 +390,7 @@ printf '  subfinder   %s\n' "$("$INSTALL_DIR/subfinder" -version 2>&1 | head -n1
 printf '  amass       %s\n' "$("$INSTALL_DIR/amass" -version 2>&1 | head -n1)"
 printf '  httpx       %s\n' "$("$INSTALL_DIR/httpx" -version 2>&1 | head -n1)"
 printf '  katana      %s\n' "$("$INSTALL_DIR/katana" -version 2>&1 | head -n1)"
+printf '  retire.js   %s\n' "$(command -v retire &>/dev/null && retire --version 2>&1 | head -n1 || echo "not installed -- Domain Scan's retire.js module unavailable")"
 printf '  whatweb     %s\n' "$(command -v whatweb &>/dev/null && echo "installed" || echo "not installed -- WhatWeb tab unavailable")"
 printf '  browser     %s\n' "${FOUND_BROWSER:-none found -- screenshots/PDF report export unavailable}"
 printf '  aperture    %s\n' "$INSTALL_DIR/aperture"

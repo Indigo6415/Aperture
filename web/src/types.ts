@@ -1,5 +1,10 @@
 // Mirrors internal/model.Finding and internal/engine.Flow's JSON shapes.
 
+// TriageStatus mirrors internal/model.TriageStatus -- a finding's place in
+// the operator's own review workflow, set after the fact (see
+// api.updateFindingTriage), never by the tool that produced the finding.
+export type TriageStatus = 'new' | 'confirmed' | 'false_positive' | 'reported'
+
 export interface Finding {
   id: string
   url: string
@@ -16,7 +21,21 @@ export interface Finding {
   runId: string
   tags?: string[]
   timestamp: string
+  triageStatus: TriageStatus
+  triageNote?: string
+  // Detail fields: the rule behind a result (nuclei), its own rating, the matcher
+  // that fired, a repeat command, and how sure the check is.
+  template?: string
+  severity?: string
+  matcher?: string
+  reproduce?: string
+  confidence?: Confidence
 }
+
+// Confidence is how strongly a check supports its claim. "confirmed" means the
+// behavior was reproduced or observed directly; "likely" means a signature or
+// inference matched; "heuristic" is a lead to check by hand.
+export type Confidence = 'confirmed' | 'likely' | 'heuristic'
 
 export type ToolInfo = {
   name: string
@@ -37,8 +56,31 @@ export interface Run {
 export type NodeStatus = 'pending' | 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled'
 
 export interface RunEvent {
-  type: 'finding' | 'status' | 'progress' | 'check' | 'module' | 'done'
+  type:
+    | 'finding'
+    | 'status'
+    | 'progress'
+    | 'check'
+    | 'module'
+    | 'domainModule'
+    | 'apiEnumPhase'
+    | 'apiEnumRoute'
+    | 'plan'
+    | 'checkStart'
+    | 'checkDone'
+    | 'phase'
+    | 'done'
   nodeId?: string
+  // Set on a "plan" event: checks a streamed scan has registered (see
+  // internal/scanprogress). checkId is set on "checkStart"/"checkDone";
+  // findings on "checkDone" (message carries its error, if any). A "phase"
+  // event carries its text in message. result is set on a streamed scan's
+  // terminal "done" event -- the scanner's full response, untyped here since
+  // each caller knows which response it asked for.
+  checks?: ScanCheckInfo[]
+  checkId?: string
+  findings?: number
+  result?: unknown
   finding?: Finding
   check?: Check
   status?: NodeStatus
@@ -54,6 +96,42 @@ export interface RunEvent {
   module?: ProbeModuleResult
   probeTarget?: ProbeTarget
   probeHealth?: ProbeHealth
+  // Set on a "domainModule" event: one domain scan module just finished
+  // (see DomainScanModuleResult above). domainTarget is set alongside
+  // status on a domain scan's terminal "done" event.
+  domainModule?: DomainScanModuleResult
+  domainTarget?: DomainScanTarget
+  // Set on an "apiEnumPhase" event: coarse phase progress (spec discovery,
+  // GraphQL, crawl, brute force, characterization). Set on an
+  // "apiEnumRoute" event: one route just finished characterization -- the
+  // UI accumulates these into its route tree the same way Probe
+  // accumulates "module" events. apiEnumTarget/Schema/Graphql/
+  // InjectionPoints/Stats are set alongside status on an API enum run's
+  // terminal "done" event.
+  apiEnumPhase?: ApiEnumPhaseEvent
+  apiEnumRoute?: ApiRoute
+  apiEnumTarget?: ApiEnumTarget
+  apiEnumSchema?: ApiSchemaInfo
+  apiEnumGraphql?: ApiGraphqlSummary
+  apiEnumInjectionPoints?: ApiInjectionPoint[]
+  apiEnumStats?: ApiEnumStats
+}
+
+// ScanCheckInfo is one check a streamed scan has registered (see
+// internal/scanprogress.Check): id is stable for the run and what later
+// checkStart/checkDone events refer back to; label names it for display;
+// group is the category it belongs to, when the scanner gives one.
+export interface ScanCheckInfo {
+  id: string
+  label: string
+  group?: string
+}
+
+// ScanStartResult is the response to starting any streamed scan (a POST to
+// a scanner's /scan endpoint): the ID its progress is watched by, over
+// GET /ws/scans/{id} (see watchScan in api.ts).
+export interface ScanStartResult {
+  scanId: string
 }
 
 // --- Cases (a named container of targets + jobs run against them) ---
@@ -134,18 +212,44 @@ export interface CaseSummary extends Case {
   running: boolean
 }
 
-// TargetKind is a UI hint only -- the backend never branches on it.
-export type TargetKind = 'domain' | 'subdomain' | 'url' | 'ip' | 'other'
+// TargetListKind is a UI hint only -- the backend never branches on it.
+export type TargetListKind = 'domain' | 'directory' | 'file' | 'url' | 'other'
+
+// TargetList is a named, user-created collection of targets within a case
+// (domains, directories, files, login-form URLs, ...) -- every Target
+// belongs to exactly one of these, like a Spotify playlist.
+export interface TargetList {
+  id: string
+  caseId: string
+  name: string
+  kind: TargetListKind
+  createdAt: string
+}
 
 export interface Target {
   id: string
   caseId: string
+  listId: string
+  // listName/listKind are denormalized onto the target by the backend so
+  // callers can group/tab targets by list without a second request.
+  listName: string
+  listKind: TargetListKind
   value: string
-  kind?: TargetKind
   sourceTool?: string
   sourceJobId?: string
   notes?: string
   createdAt: string
+}
+
+// TargetPingResult is one target's answer from the list ping endpoint. alive
+// means the host sent back any HTTP response; otherwise error says why not.
+export interface TargetPingResult {
+  targetId: string
+  value: string
+  alive: boolean
+  statusCode?: number
+  url?: string
+  error?: string
 }
 
 // Tool identifies which job a case can run -- mirrors the tool constants in
@@ -157,10 +261,8 @@ export type Tool =
   | 'ffuf-custom'
   | 'identify'
   | 'subfinder'
-  | 'amass'
   | 'katana'
-  | 'httpx'
-  | 'whatweb'
+  | 'nuclei'
 
 // JobOptionsPreset mirrors internal/engine.ScanOptions' Preset field --
 // "aggressive"/"normal"/"stealth" fill in Threads/TimeoutSeconds/RateLimit
@@ -280,6 +382,7 @@ export interface AuthUser {
 export interface SettingsInfo {
   dnsdumpsterApiKeySet: boolean
   nvdApiKeySet: boolean
+  hibpApiKeySet: boolean
 }
 
 // --- JWT scanner (mirrors internal/jwtscan) ---
@@ -334,6 +437,10 @@ export interface JwtScanRequest {
   // persisted to that case's scan history (see CaseScan below) instead of
   // only ever existing in this tab.
   caseId?: string
+  // callback optionally names a callback server picked from the Callback
+  // button above the form -- enables the kid-SSRF/jku/x5u tests (see
+  // JwtTestResult), which are otherwise reported as skipped.
+  callback?: CallbackSelection
 }
 
 // --- Probe scanner (mirrors internal/probescan) ---
@@ -363,6 +470,7 @@ export interface ProbeFinding {
   evidence?: string
   method?: string
   statusCode?: number
+  confidence?: Confidence
 }
 
 export type ProbeSeverity = 'info' | 'low' | 'medium' | 'high' | 'critical'
@@ -404,22 +512,91 @@ export interface ProbeScanStartResult {
   scanId: string
 }
 
+// --- Domain scan (mirrors internal/domainscan) -- Aperture's "master"
+// vulnerability/misconfiguration scanner: unlike Probe (which checks
+// individual paths on an already-known route), every module here is a
+// whole external tool -- retire.js first -- pointed at an entire domain,
+// responsible for its own crawling. See internal/domainscan's package doc
+// comment for the full reasoning. ---
+
+export interface DomainScanFinding {
+  label: string
+  url?: string
+  detail?: string
+  evidence?: string
+  severity: ProbeSeverity
+}
+
+export interface DomainScanModuleResult {
+  id: string
+  name: string
+  severity: ProbeSeverity
+  findings: DomainScanFinding[]
+  // error is set when the module's own tool couldn't run at all (most
+  // commonly not installed) -- distinct from running cleanly and finding
+  // nothing.
+  error?: string
+}
+
+export interface DomainScanTarget {
+  raw: string
+  url: string
+  hostname: string
+  ip?: string
+  port: number
+}
+
+export interface DomainScanResponse {
+  target: DomainScanTarget
+  modules: DomainScanModuleResult[]
+}
+
+export interface DomainScanRequest {
+  target: string
+  credentialId?: string
+  crawlDepth?: number
+  maxPages?: number
+  // caseId -- see JwtScanRequest.caseId's doc comment.
+  caseId?: string
+}
+
+// DomainScanModuleInfo is one registered module's identity with no
+// findings yet -- from GET /api/domainscan/modules, same role as
+// ProbeModuleInfo.
+export interface DomainScanModuleInfo {
+  id: string
+  name: string
+}
+
+// DomainScanStartResult is the response to starting an async domain scan --
+// see watchDomainScan in api.ts for how scanId is then used to stream
+// per-module progress.
+export interface DomainScanStartResult {
+  scanId: string
+}
+
 // --- Secret scanner (mirrors internal/secretscan -- Aperture's Go/tsx port
 // of Snitch) ---
 
 export type SecretMatchMethod = 'regex' | 'entropy'
+export type SecretMatchEngine = 'core' | 'secretfinder'
 
 export interface SecretMatch {
   type: string
   method: SecretMatchMethod
   value: string
   location: string
+  engine: SecretMatchEngine
 }
 
 export interface SecretScanRequest {
   url: string
   recursionDepth?: number
   entropy?: boolean
+  // secretFinderEngine also matches against SecretFinderPatterns (a second,
+  // broader pattern library ported from the SecretFinder tool) -- off by
+  // default, same "opt-in, noisier" posture as entropy.
+  secretFinderEngine?: boolean
   headers?: Record<string, string>
   credentialId?: string
   // caseId -- see JwtScanRequest.caseId's doc comment.
@@ -430,48 +607,6 @@ export interface SecretScanResponse {
   pagesScanned: string[]
   scriptsScanned: string[]
   matches: SecretMatch[]
-}
-
-// --- Manual request repeater (mirrors internal/repeater) ---
-
-export type BodyEncoding = 'utf8' | 'base64'
-
-export interface RepeaterRequest {
-  method: string
-  url: string
-  headers?: Record<string, string>
-  body?: string
-  followRedirects?: boolean
-  credentialId?: string
-  // caseId optionally scopes this send to a case: when set, the request
-  // and its response are recorded to that case's Repeater history (see
-  // RepeaterHistoryEntry below).
-  caseId?: string
-}
-
-// RepeaterHistoryEntry mirrors internal/api's repeaterEntryResponse -- one
-// past Repeater send recorded for a case.
-export interface RepeaterHistoryEntry {
-  id: string
-  caseId: string
-  method: string
-  url: string
-  requestHeaders?: Record<string, string>
-  requestBody?: string
-  response: RepeaterResponse
-  createdAt: string
-}
-
-export interface RepeaterResponse {
-  statusCode: number
-  status: string
-  headers: Record<string, string>
-  body: string
-  bodyEncoding: BodyEncoding
-  contentLength: number
-  durationMs: number
-  raw: string
-  error?: string
 }
 
 // --- Credential vault (mirrors internal/store.Credential) ---
@@ -486,7 +621,33 @@ export interface Credential {
   headers?: Record<string, string>
   cookie?: string
   notes?: string
+  // Username/password/loginUrl are optional and, together, make this a
+  // "test credential": a valid login the operator can trigger via
+  // api.createCredentialSession, which performs the login and overwrites
+  // headers/cookie above with the resulting session -- see
+  // handleCreateCredentialSession.
+  username?: string
+  password?: string
+  loginUrl?: string
+  loginMethod?: string
+  usernameField?: string
+  passwordField?: string
+  tokenField?: string
+  sessionAt?: string
   createdAt: string
+}
+
+// --- Cookie vault (mirrors internal/api.cookieVaultEntry) ---
+
+// CookieVaultEntry is one domain known to a case, plus whatever Cookie
+// header is currently saved to be sent automatically with every request
+// this case makes against it (empty when nothing's saved yet). Unlike a
+// Credential, this is never picked per-request -- it's always on for its
+// domain, which is what makes authenticated scans against that domain work
+// without re-selecting a credential every time.
+export interface CookieVaultEntry {
+  domain: string
+  cookie?: string
 }
 
 // --- Job launch templates (mirrors internal/store.JobTemplate) ---
@@ -503,24 +664,33 @@ export interface JobTemplate {
   createdAt: string
 }
 
-// --- Case activity timeline (mirrors internal/store.Activity) ---
-
-export interface ActivityEvent {
-  id: string
-  caseId: string
-  kind: string
-  message: string
-  createdAt: string
-}
-
 // --- Persisted scan history (mirrors internal/store.CaseScan) ---
 
-export type ScanTool = 'probe' | 'jwt' | 'secrets'
+export type ScanTool =
+  | 'probe'
+  | 'jwt'
+  | 'secrets'
+  | 'breach'
+  | 'breach-crawl'
+  | 'domainscan'
+  | 'bypass403'
+  | 'pwreset'
+  | 'graphqlenum'
+  | 'corsscan'
+  | 'openredirect'
+  | 'ssrf'
+  | 'csrf'
+  | 'sstiscan'
+  | 'xss'
+  | 'tester'
+  | 'apienum'
 
-// CaseScan is one Probe/JWT/Secret Scanner run persisted for a case (only
-// when that scan was launched with a case selected -- see ScanTool
-// request types' own caseId field). severity is on the same
-// info/low/medium/high/critical scale ProbeSeverity already uses.
+// CaseScan is one scan-tool run persisted for a case (only when that scan
+// was launched with a case selected -- see each ScanTool request type's own
+// caseId field). severity is on the same info/low/medium/high/critical
+// scale ProbeSeverity already uses. data carries the tool's raw JSON
+// response -- omitted from the case-wide list view (see
+// store.ListCaseScans), only populated by GET /api/scans/{id}.
 export interface CaseScan {
   id: string
   caseId: string
@@ -528,5 +698,722 @@ export interface CaseScan {
   tool: ScanTool
   severity: ProbeSeverity
   summary: string
+  data?: string
   createdAt: string
+}
+
+// --- Tester (mirrors internal/tester + internal/api's tester handler) ---
+// The Tester is the manual request replay/edit tool every scanner's
+// findings can be sent to (see web/src/testerHandoff.ts) -- pick any
+// finding, land in the Tester with its exact captured request already
+// loaded, then replay/edit/resend and inspect the raw response.
+
+export interface TesterRequest {
+  method: string
+  url: string
+  headers?: Record<string, string>
+  body?: string
+  followRedirects?: boolean
+  credentialId?: string
+  // caseId optionally scopes this send to a case: when set, the result is
+  // persisted to that case's scan history under tool "tester" (see
+  // CaseScan above) instead of only ever existing in this tab.
+  caseId?: string
+}
+
+export interface TesterResponse {
+  statusCode: number
+  status: string
+  headers: Record<string, string>
+  body: string
+  bodyEncoding: 'utf8' | 'base64'
+  contentLength: number
+  durationMs: number
+  raw: string
+  error?: string
+}
+
+// --- Breach check (mirrors internal/breach + internal/api's breach-check
+// handler) ---
+
+// Breach is one breach an email address appeared in, per HaveIBeenPwned.
+export interface Breach {
+  name: string
+  title: string
+  domain?: string
+  breachDate?: string
+  pwnCount?: number
+  dataClasses?: string[]
+  isVerified: boolean
+  isSensitive: boolean
+}
+
+export interface BreachEmailResult {
+  email: string
+  breaches: Breach[]
+  error?: string
+}
+
+export interface BreachCheckRequest {
+  emails: string[]
+  caseId?: string
+}
+
+export interface BreachCheckResponse {
+  results: BreachEmailResult[]
+}
+
+// BreachCrawlRequest/Response mirror SecretScanRequest/SecretScanResponse
+// -- the crawl-for-emails endpoint runs the very same crawl (see
+// internal/breach.CrawlForEmails), one target per request.
+export interface BreachCrawlRequest {
+  url: string
+  recursionDepth?: number
+  headers?: Record<string, string>
+  credentialId?: string
+  caseId?: string
+}
+
+export interface BreachCrawlResponse {
+  pagesScanned: string[]
+  scriptsScanned: string[]
+  emails: string[]
+  emailSources: Record<string, string[]>
+}
+
+// --- 403 bypass engine (mirrors internal/bypass403) ---
+
+export interface Bypass403Request {
+  url: string
+  headers?: Record<string, string>
+  credentialId?: string
+  caseId?: string
+}
+
+export interface Bypass403Baseline {
+  url: string
+  statusCode: number
+  contentLength: number
+  blocked: boolean
+  reason?: string
+}
+
+export interface Bypass403Attempt {
+  id: string
+  category: 'path' | 'header' | 'method' | 'protocol' | 'archive'
+  description: string
+  method: string
+  target: string
+  headers?: Record<string, string>
+  statusCode: number
+  contentLength: number
+  bodySnippet?: string
+  bypassed: boolean
+  error?: string
+}
+
+export interface Bypass403Response {
+  baseline: Bypass403Baseline
+  attempts: Bypass403Attempt[]
+  bypassCount: number
+}
+
+// --- Forgot-password scanner (mirrors internal/pwreset) ---
+
+export interface PwResetRequest {
+  url: string
+  method?: 'POST' | 'GET'
+  contentType?: 'form' | 'json'
+  identifierField?: string
+  knownIdentifier?: string
+  unknownIdentifier?: string
+  extraFields?: Record<string, string>
+  formUrl?: string
+  credentialId?: string
+  headers?: Record<string, string>
+  caseId?: string
+}
+
+export interface PwResetBaseline {
+  url: string
+  method: string
+  statusCode: number
+  contentLength: number
+}
+
+// CapturedRequest is the exact request a scanner's check sent, mirrored
+// field-for-field from each Go scanner's own CapturedRequest type
+// (corsscan/ssrf/openredirect/pwreset/graphqlenum/csrf) -- attached to a
+// finding so "Send to Tester" (see testerHandoff.ts) can replay precisely
+// what triggered it, rather than just the module's target URL with a bare
+// GET.
+export interface CapturedRequest {
+  method?: string
+  url: string
+  headers?: Record<string, string>
+  body?: string
+}
+
+// PwResetFinding/PwResetModuleResult are structurally identical to
+// ProbeFinding/ProbeModuleResult (see internal/pwreset.Finding's doc
+// comment for why the Go types aren't shared) -- kept as their own named
+// types anyway so PwReset.tsx's imports read as what they are.
+export interface PwResetFinding {
+  label: string
+  detail?: string
+  evidence?: string
+  method?: string
+  statusCode?: number
+  request?: CapturedRequest
+}
+
+export interface PwResetModuleResult {
+  id: string
+  name: string
+  severity: ProbeSeverity
+  findings: PwResetFinding[]
+}
+
+export interface PwResetResponse {
+  baseline: PwResetBaseline
+  modules: PwResetModuleResult[]
+}
+
+// --- GraphQL enumeration scanner (mirrors internal/graphqlenum) ---
+
+export interface GraphqlEnumRequest {
+  url: string
+  credentialId?: string
+  headers?: Record<string, string>
+  caseId?: string
+}
+
+export interface GraphqlEnumBaseline {
+  url: string
+  statusCode: number
+  confirmed: boolean
+  typeName?: string
+}
+
+export interface GraphqlFieldSummary {
+  name: string
+  description?: string
+  args?: string[]
+  returnType?: string
+  isDeprecated?: boolean
+}
+
+export interface GraphqlTypeSummary {
+  name: string
+  kind: string
+  description?: string
+  fieldCount: number
+}
+
+export interface GraphqlSchema {
+  via: string
+  queryType?: string
+  mutationType?: string
+  subscriptionType?: string
+  typeCount: number
+  queries?: GraphqlFieldSummary[]
+  mutations?: GraphqlFieldSummary[]
+  subscriptions?: GraphqlFieldSummary[]
+  types?: GraphqlTypeSummary[]
+  truncated?: boolean
+}
+
+// GraphqlEnumFinding/GraphqlEnumModuleResult are structurally identical to
+// PwResetFinding/PwResetModuleResult (see internal/graphqlenum.Finding's
+// doc comment for why the Go types aren't shared) -- kept as their own
+// named types anyway so GraphqlEnum.tsx's imports read as what they are.
+export interface GraphqlEnumFinding {
+  label: string
+  detail?: string
+  evidence?: string
+  method?: string
+  statusCode?: number
+  request?: CapturedRequest
+}
+
+export interface GraphqlEnumModuleResult {
+  id: string
+  name: string
+  severity: ProbeSeverity
+  findings: GraphqlEnumFinding[]
+}
+
+export interface GraphqlEnumResponse {
+  baseline: GraphqlEnumBaseline
+  schema?: GraphqlSchema
+  modules: GraphqlEnumModuleResult[]
+}
+
+// --- API Enumerator (mirrors internal/apienum): finds API endpoints
+// through an exposed OpenAPI/Swagger spec, GraphQL introspection, a
+// same-origin crawl, JS bundle mining, and a wordlist brute force, then
+// characterizes each one (methods accepted, auth requirement, content-type
+// negotiation, a response-shape fingerprint) and flags parameters worth a
+// closer look into a staged, never-auto-attacked injection-point list. ---
+
+export type ApiParamLocation = 'query' | 'body' | 'header' | 'path'
+
+export interface ApiParam {
+  name: string
+  location: ApiParamLocation
+  typeGuess: string
+  sample?: string
+  flagged: boolean
+  reason?: string
+}
+
+export interface ApiMethodProbe {
+  method: string
+  allowed: boolean
+  statusCode: number
+  contentType?: string
+  bodyShape?: string
+  responseBytes: number
+}
+
+export interface ApiAuthProbe {
+  unauthenticatedStatus: number
+  authenticatedStatus?: number
+  requiresAuth: boolean
+}
+
+// ApiRouteSource is where a route was first discovered -- drives both the
+// tree's grouping and the confirmed/uncertain split (see ApiRoute.confirmed).
+export type ApiRouteSource = 'spec' | 'graphql' | 'crawl' | 'js' | 'bruteforce'
+
+export interface ApiRoute {
+  id: string
+  path: string
+  group: string
+  source: ApiRouteSource
+  confirmed: boolean
+  methods: ApiMethodProbe[]
+  auth: ApiAuthProbe
+  params: ApiParam[]
+  contentTypesAccepted?: string[]
+  rateLimitHeaders?: Record<string, string>
+  paginated?: boolean
+}
+
+export interface ApiInjectionPoint {
+  endpoint: string
+  method: string
+  param: string
+  location: ApiParamLocation
+  typeGuess: string
+  sample?: string
+  reason: string
+}
+
+export interface ApiSchemaInfo {
+  found: boolean
+  kind?: string
+  url?: string
+  routeCount?: number
+}
+
+export interface ApiGraphqlSummary {
+  found: boolean
+  url?: string
+  introspectionOn?: boolean
+  typeCount?: number
+  queries?: string[]
+  mutations?: string[]
+}
+
+export interface ApiEnumStats {
+  routesFound: number
+  confirmedRoutes: number
+  uncertainRoutes: number
+  requestsSent: number
+  injectionPoints: number
+}
+
+export interface ApiEnumTarget {
+  raw: string
+  url: string
+  hostname: string
+  ip?: string
+  port: number
+}
+
+export interface ApiEnumResponse {
+  target: ApiEnumTarget
+  schema?: ApiSchemaInfo
+  graphql?: ApiGraphqlSummary
+  routes: ApiRoute[]
+  injectionPoints: ApiInjectionPoint[]
+  stats: ApiEnumStats
+}
+
+export interface ApiEnumRequest {
+  target: string
+  preset?: JobOptionsPreset
+  credentialId?: string
+  crawlDepth?: number
+  maxPages?: number
+  extraWordlist?: string[]
+  // caseId -- see JwtScanRequest.caseId's doc comment.
+  caseId?: string
+}
+
+// ApiEnumPhaseEvent mirrors apienum.PhaseEvent -- one coarse progress
+// update streamed over the run's WebSocket (see RunEvent.apiEnumPhase).
+export interface ApiEnumPhaseEvent {
+  phase: 'spec' | 'graphql' | 'crawl' | 'bruteforce' | 'characterize'
+  done: number
+  total: number
+}
+
+// ApiEnumStartResult is the response to starting an async API enum run --
+// see watchApiEnumScan in api.ts for how scanId is then used to stream
+// live phase/route progress.
+export interface ApiEnumStartResult {
+  scanId: string
+}
+
+// --- CORS misconfiguration scanner (mirrors internal/corsscan) ---
+
+export interface CorsScanRequest {
+  url: string
+  method?: string
+  credentialId?: string
+  headers?: Record<string, string>
+  caseId?: string
+}
+
+export interface CorsScanBaseline {
+  url: string
+  method: string
+  statusCode: number
+  allowOriginPresent: boolean
+  allowOrigin?: string
+}
+
+// CorsScanFinding/CorsScanModuleResult are structurally identical to
+// PwResetFinding/PwResetModuleResult -- kept as their own named types for
+// the same reason (see internal/corsscan.Finding's doc comment).
+export interface CorsScanFinding {
+  label: string
+  detail?: string
+  evidence?: string
+  method?: string
+  statusCode?: number
+  request?: CapturedRequest
+}
+
+export interface CorsScanModuleResult {
+  id: string
+  name: string
+  severity: ProbeSeverity
+  findings: CorsScanFinding[]
+}
+
+export interface CorsScanResponse {
+  baseline: CorsScanBaseline
+  modules: CorsScanModuleResult[]
+}
+
+// --- Open redirect scanner (mirrors internal/openredirect) ---
+
+export interface OpenRedirectRequest {
+  url: string
+  params?: string[]
+  credentialId?: string
+  headers?: Record<string, string>
+  caseId?: string
+  // callback optionally names a callback server picked from the Callback
+  // button above the form -- when set, every payload module also tries a
+  // live, pollable poison host instead of just the scanner's own static
+  // placeholder.
+  callback?: CallbackSelection
+  // followRedirects walks each redirect chain (up to a fixed hop limit) when
+  // looking for the callback. Omitted means on, matching the server default.
+  followRedirects?: boolean
+}
+
+export interface OpenRedirectBaseline {
+  url: string
+  statusCode: number
+  location?: string
+}
+
+export interface OpenRedirectFinding {
+  label: string
+  detail?: string
+  evidence?: string
+  method?: string
+  statusCode?: number
+  request?: CapturedRequest
+}
+
+export interface OpenRedirectModuleResult {
+  id: string
+  name: string
+  severity: ProbeSeverity
+  findings: OpenRedirectFinding[]
+}
+
+export interface OpenRedirectResponse {
+  baseline: OpenRedirectBaseline
+  modules: OpenRedirectModuleResult[]
+  paramsTested: string[]
+  // probesSent is every distinct request the run fired (baseline excluded).
+  // Optional: scans saved before this field existed won't have it.
+  probesSent?: number
+  followRedirects?: boolean
+}
+
+// --- SSRF scanner (mirrors internal/ssrf) ---
+
+export interface SsrfRequest {
+  url: string
+  params?: string[]
+  credentialId?: string
+  headers?: Record<string, string>
+  caseId?: string
+  autoDiscover?: boolean
+  recursionDepth?: number
+  maxPages?: number
+  // callback optionally names a callback server picked from the Callback
+  // button above the form -- when set, the OOB-callback module points every
+  // parameter at that one shared, long-lived server (with a per-parameter
+  // identifier) instead of minting a fresh throwaway token per parameter.
+  callback?: CallbackSelection
+}
+
+export interface SsrfBaseline {
+  url: string
+  statusCode: number
+}
+
+export interface SsrfFinding {
+  label: string
+  detail?: string
+  evidence?: string
+  method?: string
+  statusCode?: number
+  request?: CapturedRequest
+}
+
+export interface SsrfModuleResult {
+  id: string
+  name: string
+  severity: ProbeSeverity
+  findings: SsrfFinding[]
+}
+
+export interface SsrfResponse {
+  baseline: SsrfBaseline
+  modules: SsrfModuleResult[]
+  paramsTested: string[]
+}
+
+// --- XSS scanner (mirrors internal/xss) ---
+
+export interface XssRequest {
+  url: string
+  params?: string[]
+  credentialId?: string
+  headers?: Record<string, string>
+  caseId?: string
+  recursionDepth?: number
+  maxPages?: number
+}
+
+export interface XssBaseline {
+  url: string
+  statusCode: number
+}
+
+export interface XssFinding {
+  label: string
+  detail?: string
+  evidence?: string
+  method?: string
+  statusCode?: number
+  request?: CapturedRequest
+}
+
+export interface XssModuleResult {
+  id: string
+  name: string
+  severity: ProbeSeverity
+  findings: XssFinding[]
+}
+
+export interface XssResponse {
+  baseline: XssBaseline
+  modules: XssModuleResult[]
+  pagesScanned: string[]
+  pointsTested: number
+}
+
+// --- CSRF sweep (mirrors internal/csrf) ---
+
+export interface CsrfScanRequest {
+  url: string
+  recursionDepth?: number
+  maxPages?: number
+  credentialId?: string
+  headers?: Record<string, string>
+  caseId?: string
+  // apiUrl/apiMethod/apiBody opt into the one active check this scanner has
+  // (see internal/csrf.Request's doc comment): replays apiBody against
+  // apiUrl under application/json and then again, unchanged, under
+  // text/plain, to check whether a JSON-only Content-Type requirement is
+  // actually enforced server-side. Skipped entirely when apiUrl/apiBody is
+  // blank.
+  apiUrl?: string
+  apiMethod?: string
+  apiBody?: string
+}
+
+// CsrfFinding carries no method/statusCode -- unlike every other scanner's
+// Finding, most of internal/csrf never issues a check-specific request
+// (every crawl-derived module is pure post-processing of the one crawl
+// pass); request there is only ever a plain GET on the page/cookie a
+// finding was seen on. The one exception is the content-type-csrf-bypass
+// module's finding, whose request is the actual text/plain replay that
+// triggered it (method/headers/body all populated).
+export interface CsrfFinding {
+  label: string
+  detail?: string
+  evidence?: string
+  request?: CapturedRequest
+}
+
+export interface CsrfModuleResult {
+  id: string
+  name: string
+  severity: ProbeSeverity
+  findings: CsrfFinding[]
+}
+
+export interface CsrfScanResponse {
+  pagesScanned: string[]
+  formsFound: number
+  modules: CsrfModuleResult[]
+}
+
+// --- SSTI scanner (mirrors internal/sstiscan) ---
+
+export interface SstiScanRequest {
+  url: string
+  params?: string[]
+  credentialId?: string
+  headers?: Record<string, string>
+  caseId?: string
+  recursionDepth?: number
+  maxPages?: number
+  // callback optionally names a callback server picked from the Callback
+  // button above the form -- when set, the out-of-band RCE module points
+  // every injection point at that one shared, long-lived server (with a
+  // per-point identifier) instead of minting a fresh throwaway token per
+  // point.
+  callback?: CallbackSelection
+}
+
+export interface SstiScanBaseline {
+  url: string
+  statusCode: number
+}
+
+export interface SstiScanFinding {
+  label: string
+  detail?: string
+  evidence?: string
+  method?: string
+  statusCode?: number
+  request?: CapturedRequest
+}
+
+export interface SstiScanModuleResult {
+  id: string
+  name: string
+  severity: ProbeSeverity
+  findings: SstiScanFinding[]
+}
+
+export interface SstiScanResponse {
+  baseline: SstiScanBaseline
+  modules: SstiScanModuleResult[]
+  pagesScanned: string[]
+  pointsTested: number
+}
+
+// --- Out-of-band collaborator listener (mirrors internal/collaborator +
+// internal/api/handlers_collaborator.go) ---
+
+export interface CollaboratorConfig {
+  domain: string
+  answerIp: string
+  dnsAddr: string
+}
+
+export interface CollaboratorConfigResponse extends CollaboratorConfig {
+  dnsActive: boolean
+  dnsError?: string
+}
+
+export interface CollaboratorInteraction {
+  id: string
+  protocol: 'http' | 'dns'
+  timestamp: string
+  remoteAddr: string
+  method?: string
+  path?: string
+  query?: string
+  headers?: Record<string, string>
+  body?: string
+  queryName?: string
+  queryType?: string
+  // identifier is the caller-chosen label that precedes the token itself in
+  // whatever address was hit (e.g. "ssrf-webhook_url") -- lets one shared,
+  // long-lived token be reused across many concurrent tests while each hit
+  // still says which one caused it. Empty for a bare "/collab/<token>" hit.
+  identifier?: string
+}
+
+export interface CollaboratorNewTokenResponse {
+  token: string
+  httpCallback: string
+  dnsHostname?: string
+  dnsAvailable: boolean
+}
+
+// WebhookSiteToken mirrors collaborator.WebhookSiteToken -- webhook.site as
+// an alternative callback provider alongside Aperture's own listener above,
+// for a quick link (plus webhook.site's own hosted view of it) with zero
+// configuration.
+export interface WebhookSiteToken {
+  uuid: string
+  url: string
+  viewUrl: string
+}
+
+// ActiveCallbackServer mirrors collaborator.Session -- one entry in a
+// scanner's Callback picker dropdown (see CallbackPicker.tsx), minted from
+// either the Collaborator tab or the picker's own "+ New" action.
+export interface ActiveCallbackServer {
+  token: string
+  provider: 'aperture' | 'webhooksite'
+  label: string
+  httpCallback: string
+  dnsHostname?: string
+  viewUrl?: string
+  createdAt: string
+}
+
+// CallbackSelection mirrors collaborator.Ref -- which ActiveCallbackServer a
+// scanner's request opted into (see CallbackPicker.tsx), included verbatim
+// as a scan request's own "callback" field.
+export interface CallbackSelection {
+  provider: 'aperture' | 'webhooksite'
+  token: string
 }

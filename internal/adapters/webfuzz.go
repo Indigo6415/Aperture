@@ -4,18 +4,21 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"github.com/Indigo6415/Aperture/internal/netgov"
 	"io"
+	"log"
 	"math/big"
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/Indigo6415/Aperture/internal/fingerprint"
 	"github.com/Indigo6415/Aperture/internal/model"
 	"github.com/Indigo6415/Aperture/internal/wordlists"
 )
@@ -24,13 +27,10 @@ func init() {
 	register(&WebFuzzAdapter{})
 }
 
-// WebFuzzConfig is the node-configurable shape for a webfuzz run --
-// Aperture's own fuzzer/directory-buster, used by every auto-generated flow
-// (content discovery, subdomain bruteforce, vhost bruteforce) in place of
-// the external ffuf/feroxbuster binaries (see ffuf.go/feroxbuster.go --
-// still registered, just unused by anything auto-generated now). FUZZ must
-// appear either in URL (content/subdomain discovery) or in a header value
-// (virtual-host discovery), same convention ffuf used.
+// WebFuzzConfig is the node-configurable shape for a webfuzz run. webfuzz is
+// Aperture's own fuzzer and is selectable as a job tool (ToolWebFuzz). FUZZ
+// must appear either in URL (content and subdomain discovery) or in a header
+// value (virtual-host discovery), the same convention ffuf uses.
 type WebFuzzConfig struct {
 	URL           string            `json:"url"`
 	Wordlist      string            `json:"wordlist"`
@@ -136,15 +136,10 @@ func (a *WebFuzzAdapter) Run(ctx context.Context, config json.RawMessage, meta R
 		meta:     meta,
 		emit:     emit,
 		progress: progress,
-		client: &http.Client{
-			Transport: &http.Transport{
-				TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
-				MaxIdleConnsPerHost: threads * 2,
-			},
-			// Report a redirect's own status rather than following it --
-			// matches ffuf/feroxbuster's default behavior.
-			CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse },
-		},
+		// Per-request timeouts come from the job context (see doRequest), so
+		// the client itself has none. Redirects are not followed, matching
+		// ffuf and feroxbuster's default of reporting a redirect's own status.
+		client:         netgov.NewClient(0, false),
 		threads:        threads,
 		timeout:        timeout,
 		method:         method,
@@ -189,6 +184,12 @@ func (a *WebFuzzAdapter) Run(ctx context.Context, config json.RawMessage, meta R
 		bases = next
 	}
 
+	// Surface request failures in the server log. A run where most requests
+	// failed usually means the target is blocking or unreachable, which the
+	// operator needs to know even though no finding was produced.
+	if run.failed > 0 {
+		log.Printf("webfuzz: %d of %d requests failed (timeouts, resets, or refused connections) for %s", run.failed, run.done, cfg.URL)
+	}
 	return nil
 }
 
@@ -215,6 +216,9 @@ type webFuzzRun struct {
 	done    int
 	total   int
 	visited map[string]bool // recursion dedup, across every level of this run
+	// failed counts requests that errored (timeouts, resets, refused). They are
+	// reported once at the end of the run instead of silently dropped.
+	failed int
 }
 
 func (f *webFuzzRun) reportProgress() {
@@ -237,7 +241,9 @@ type webfuzzResult struct {
 	contentType   string
 	redirectLoc   string
 	headers       map[string]string
-	err           error // request-level failure (timeout, connection refused, ...) -- counted toward done, never emitted
+	// obs is the body fingerprint used for catch-all comparison.
+	obs fingerprint.Observation
+	err error // request-level failure (timeout, connection refused, ...) -- counted toward done, never emitted
 }
 
 // runLevel runs the full wordlist x extensions sweep against every base in
@@ -247,9 +253,9 @@ type webfuzzResult struct {
 // open-ended opportunistic recursion. It returns the URLs recursion should
 // expand into next (empty/nil when Recursive is false or nothing qualified).
 func (f *webFuzzRun) runLevel(ctx context.Context, bases []string) ([]string, error) {
-	var baselines map[string][]webfuzzSignature
+	var baselines map[string]*fingerprint.Profile
 	if f.cfg.AutoCalibrate {
-		baselines = make(map[string][]webfuzzSignature, len(bases))
+		baselines = make(map[string]*fingerprint.Profile, len(bases))
 		for _, base := range bases {
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
@@ -297,9 +303,10 @@ func (f *webFuzzRun) runLevel(ctx context.Context, bases []string) ([]string, er
 			f.reportProgress()
 		}
 		if res.err != nil {
+			f.failed++
 			continue
 		}
-		if matchesBaseline(baselines[res.job.base], res) {
+		if baselines[res.job.base].Matches(res.obs) {
 			continue
 		}
 		resultURL := f.resultURL(res.job.base, res.job.word)
@@ -319,7 +326,7 @@ func (f *webFuzzRun) runLevel(ctx context.Context, bases []string) ([]string, er
 			RunID:         f.meta.RunID,
 			Timestamp:     time.Now(),
 		})
-		if f.cfg.Recursive && isDirLike(res.statusCode) {
+		if f.cfg.Recursive && isDirectoryHit(res, resultURL) {
 			next := strings.TrimRight(resultURL, "/") + "/FUZZ"
 			if !f.visited[next] {
 				f.visited[next] = true
@@ -401,12 +408,17 @@ func (f *webFuzzRun) doRequest(ctx context.Context, job webfuzzJob) webfuzzResul
 	if err != nil {
 		return webfuzzResult{job: job, err: err}
 	}
+	// Substitute this job's word into a FUZZ header, then apply every header
+	// through netgov.ApplyHeaders. Setting Host via req.Header.Set does
+	// nothing in Go, which silently broke header-based vhost fuzzing.
+	reqHeaders := make(map[string]string, len(f.cfg.Headers))
 	for k, v := range f.cfg.Headers {
 		if f.headerHasFuzz && k == f.fuzzHeaderName {
 			v = strings.Replace(v, "FUZZ", job.word, 1)
 		}
-		req.Header.Set(k, v)
+		reqHeaders[k] = v
 	}
+	netgov.ApplyHeaders(req, reqHeaders)
 
 	resp, err := f.client.Do(req)
 	if err != nil {
@@ -426,6 +438,12 @@ func (f *webFuzzRun) doRequest(ctx context.Context, job webfuzzJob) webfuzzResul
 		headers[k] = resp.Header.Get(k)
 	}
 
+	// Fingerprint the body for catch-all comparison. Simhash only reads the
+	// first chunk, which is enough to identify a page, but Length must keep the
+	// real size: otherwise every page over the cap would look the same size.
+	obs := fingerprint.Observe(resp.StatusCode, resp.Header.Get("Content-Type"), body[:min(len(body), observationBodyCap)])
+	obs.Length = size
+
 	return webfuzzResult{
 		job:           job,
 		statusCode:    resp.StatusCode,
@@ -435,6 +453,7 @@ func (f *webFuzzRun) doRequest(ctx context.Context, job webfuzzJob) webfuzzResul
 		contentType:   resp.Header.Get("Content-Type"),
 		redirectLoc:   resp.Header.Get("Location"),
 		headers:       headers,
+		obs:           obs,
 	}
 }
 
@@ -454,8 +473,6 @@ func (f *webFuzzRun) resultURL(base, word string) string {
 	return u.String()
 }
 
-func isDirLike(status int) bool { return status >= 200 && status < 400 }
-
 func countWordsLines(body []byte) (words, lines int) {
 	if len(body) == 0 {
 		return 0, 0
@@ -463,21 +480,18 @@ func countWordsLines(body []byte) (words, lines int) {
 	return len(strings.Fields(string(body))), strings.Count(string(body), "\n") + 1
 }
 
-// webfuzzSignature is one autocalibration baseline entry -- a
-// (status, size) pair recorded from a probe with a random, guaranteed-not-
-// real word, so genuine wordlist hits that just happen to produce the same
-// response (a wildcard vhost/catch-all directory) can be filtered out.
-type webfuzzSignature struct {
-	status        int
-	contentLength int
-}
+// observationBodyCap bounds how much of a response body is fingerprinted.
+// Identity is carried by the start of a page, so a larger read adds cost
+// without adding discrimination.
+const observationBodyCap = 64 << 10
 
-// calibrate probes base with a handful of random nonsense words before its
-// real sweep starts, mirroring ffuf -ac's intent well enough for the two
-// use cases that set AutoCalibrate (subdomain/vhost bruteforce), both of
-// which only ever pass one base per level.
-func (f *webFuzzRun) calibrate(ctx context.Context, base string) []webfuzzSignature {
-	var sigs []webfuzzSignature
+// calibrate probes base with random nonsense words before its real sweep
+// starts, mirroring ffuf -ac's intent. The answers become a catch-all profile:
+// a hit whose body looks like those answers is the host's soft-404, not a
+// discovery. Samples that disagree with each other produce an unstable profile,
+// which never filters anything.
+func (f *webFuzzRun) calibrate(ctx context.Context, base string) *fingerprint.Profile {
+	var samples []fingerprint.Observation
 	for i := 0; i < webFuzzCalibrationProbes; i++ {
 		word, err := randomWord()
 		if err != nil {
@@ -487,16 +501,24 @@ func (f *webFuzzRun) calibrate(ctx context.Context, base string) []webfuzzSignat
 		if res.err != nil {
 			continue
 		}
-		sigs = append(sigs, webfuzzSignature{status: res.statusCode, contentLength: res.contentLength})
+		samples = append(samples, res.obs)
 	}
-	return sigs
+	return fingerprint.NewProfile(samples)
 }
 
-func matchesBaseline(sigs []webfuzzSignature, res webfuzzResult) bool {
-	for _, s := range sigs {
-		if s.status == res.statusCode && s.contentLength == res.contentLength {
-			return true
-		}
+// isDirectoryHit reports whether a hit is a directory worth walking into.
+// Recursing into every 2xx/3xx, as before, walked into plain files such as
+// robots.txt. A directory is a redirect to its slash form, a forbidden path
+// (existing directories are often 403), or an extensionless path that answered
+// with content.
+func isDirectoryHit(res webfuzzResult, resultURL string) bool {
+	switch res.statusCode {
+	case http.StatusMovedPermanently, http.StatusFound, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+		return strings.HasSuffix(res.redirectLoc, "/")
+	case http.StatusForbidden:
+		return true
+	case http.StatusOK:
+		return strings.HasSuffix(resultURL, "/") || !strings.Contains(path.Base(resultURL), ".")
 	}
 	return false
 }

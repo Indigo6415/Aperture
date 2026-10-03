@@ -1,15 +1,19 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 
+	"github.com/Indigo6415/Aperture/internal/collaborator"
 	"github.com/Indigo6415/Aperture/internal/jwtscan"
+	"github.com/Indigo6415/Aperture/internal/scanprogress"
 	"github.com/Indigo6415/Aperture/internal/store"
 	"github.com/Indigo6415/Aperture/internal/wordlists"
+	"time"
 )
 
 // jwtScanRequest is the request body for POST /api/jwt/scan -- one field
@@ -33,7 +37,16 @@ type jwtScanRequest struct {
 	// CaseID optionally scopes this scan to a case -- see
 	// probeScanRequest.CaseID's doc comment.
 	CaseID string `json:"caseId,omitempty"`
+	// Callback optionally names a callback server the operator picked from
+	// their own Callback picker (see collaborator.Ref) -- enables the
+	// kid-SSRF/jku/x5u tests (see jwtscan.OOBConfig), which are otherwise
+	// reported as skipped.
+	Callback *collaborator.Ref `json:"callback,omitempty"`
 }
+
+// jwtScanTimeout bounds a JWT run. The tests themselves do not take a context,
+// so this only stops a run the streamed-scan runner would otherwise wait on.
+const jwtScanTimeout = 2 * time.Minute
 
 // handleJWTScan runs a full JWT misconfiguration scan (jwtscan.RunScan)
 // against req.URL using req.Token, synchronously, and returns every test's
@@ -70,6 +83,7 @@ func (s *Server) handleJWTScan(w http.ResponseWriter, r *http.Request) {
 		}
 		req.Headers = mergedCredentialHeaders(cred, req.Headers)
 	}
+	req.Headers = s.applyDomainCookie(req.CaseID, req.URL, req.Headers)
 
 	var extraSecrets []string
 	if req.Wordlist != "" {
@@ -86,31 +100,43 @@ func (s *Server) handleJWTScan(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	resp, err := jwtscan.RunScan(jwtscan.ScanRequest{
-		URL: req.URL, Token: req.Token, Method: req.Method, Cookie: req.Cookie,
-		ExtraHeaders: req.Headers, PubKeyPEM: req.PubKeyPEM, ExtraSecrets: extraSecrets,
-	})
-	if err != nil {
-		writeError(w, http.StatusBadGateway, err)
-		return
+	oob := jwtscan.OOBConfig{Registry: s.collab}
+	if req.Callback != nil {
+		oob.Token, oob.Provider = req.Callback.Token, req.Callback.Provider
+		if req.Callback.Provider == "webhooksite" {
+			oob.CallbackURL = collaborator.WebhookSiteCallbackURL(req.Callback.Token)
+		} else {
+			oob.CallbackURL = fmt.Sprintf("%s://%s/collab/%s", schemeOf(r), r.Host, req.Callback.Token)
+		}
 	}
 
-	if req.CaseID != "" {
-		vulnerable := 0
-		for _, t := range resp.Results {
-			if t.Status == jwtscan.StatusVulnerable {
-				vulnerable++
+	s.queueScan(w, streamedScan{
+		caseID:  req.CaseID,
+		target:  req.URL,
+		tool:    "jwt",
+		timeout: jwtScanTimeout,
+		run: func(ctx context.Context, rep scanprogress.Reporter) (scanOutcome, error) {
+			resp, err := jwtscan.RunScan(jwtscan.ScanRequest{
+				URL: req.URL, Token: req.Token, Method: req.Method, Cookie: req.Cookie,
+				ExtraHeaders: req.Headers, PubKeyPEM: req.PubKeyPEM, ExtraSecrets: extraSecrets,
+				Progress: rep,
+			}, oob)
+			if err != nil {
+				return scanOutcome{}, err
 			}
-		}
-		severity := "info"
-		if vulnerable > 0 {
-			severity = "critical"
-		}
-		summary := fmt.Sprintf("%d/%d test(s) vulnerable", vulnerable, len(resp.Results))
-		if data, err := json.Marshal(resp); err == nil {
-			s.saveCaseScan(req.CaseID, req.URL, "jwt", severity, summary, data)
-		}
-	}
 
-	writeJSON(w, http.StatusOK, resp)
+			vulnerable := 0
+			for _, t := range resp.Results {
+				if t.Status == jwtscan.StatusVulnerable {
+					vulnerable++
+				}
+			}
+			severity := "info"
+			if vulnerable > 0 {
+				severity = "critical"
+			}
+			summary := fmt.Sprintf("%d/%d test(s) vulnerable", vulnerable, len(resp.Results))
+			return scanOutcome{result: resp, severity: severity, summary: summary}, nil
+		},
+	})
 }

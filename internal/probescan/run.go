@@ -4,6 +4,9 @@ import (
 	"context"
 	"sort"
 	"sync"
+
+	"github.com/Indigo6415/Aperture/internal/fingerprint"
+	"github.com/Indigo6415/Aperture/internal/scanprogress"
 )
 
 // defaultConcurrency bounds how many probe requests are ever in flight at
@@ -23,6 +26,9 @@ const defaultConcurrency = 16
 type Options struct {
 	Concurrency int
 	Headers     map[string]string
+	// Progress, when set, receives one check per module as it starts and
+	// finishes. Nil means nobody is watching.
+	Progress scanprogress.Reporter `json:"-"`
 }
 
 // registeredModules is every check category, ported one-for-one from a
@@ -92,11 +98,24 @@ func RunScanStreaming(ctx context.Context, rawTarget string, opts Options, onMod
 	t := ResolveTarget(rawTarget)
 	health := checkHealth(ctx, t)
 
+	rep := scanprogress.Or(opts.Progress)
+	checks := make([]scanprogress.Check, len(registeredModules))
+	for i, m := range registeredModules {
+		checks[i] = scanprogress.Check{ID: m.id, Label: m.name}
+	}
+	rep.Plan(checks...)
+
 	conc := opts.Concurrency
 	if conc <= 0 {
 		conc = defaultConcurrency
 	}
 	client := newProbeClient(conc, opts.Headers)
+	// Build the catch-all profile before any module runs, so every module
+	// judges its hits against the same baseline. A failure here only means
+	// nothing gets filtered as a soft-404; the scan itself still proceeds.
+	if profile, err := fingerprint.BuildProfile(ctx, client.follow, t.URL, opts.Headers); err == nil {
+		client.profile = profile
+	}
 
 	results := make([]ModuleResult, len(registeredModules))
 	var wg sync.WaitGroup
@@ -107,6 +126,7 @@ func RunScanStreaming(ctx context.Context, rawTarget string, opts Options, onMod
 		wg.Add(1)
 		go func(i int, m moduleDef) {
 			defer wg.Done()
+			rep.Start(m.id)
 			findings := m.run(ctx, t, client)
 			if findings == nil {
 				// A nil slice would otherwise serialize to JSON `null`
@@ -114,6 +134,7 @@ func RunScanStreaming(ctx context.Context, rawTarget string, opts Options, onMod
 				// always-present array (see ProbeModuleResult.findings).
 				findings = []Finding{}
 			}
+			rep.Done(m.id, len(findings), nil)
 			res := ModuleResult{ID: m.id, Name: m.name, Severity: m.severity, Findings: findings}
 			results[i] = res
 			if onModule != nil {

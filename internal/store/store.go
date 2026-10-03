@@ -90,6 +90,8 @@ CREATE TABLE IF NOT EXISTS findings (
 	source_tool TEXT NOT NULL,
 	tags TEXT,
 	timestamp DATETIME NOT NULL,
+	triage_status TEXT NOT NULL DEFAULT 'new',
+	triage_note TEXT,
 	PRIMARY KEY (id, node_id)
 );
 CREATE INDEX IF NOT EXISTS idx_findings_run_id ON findings(run_id);
@@ -107,16 +109,35 @@ CREATE TABLE IF NOT EXISTS cases (
 	updated_at DATETIME NOT NULL
 );
 
--- A target is any host/URL/IP the user has explicitly added to a case,
--- either typed by hand or promoted from a job's results (see
--- api.handlePromoteTargets). UNIQUE(case_id, value) makes promoting an
--- already-known value a harmless no-op via INSERT OR IGNORE rather than a
--- duplicate row.
+-- A target list is a named, user-created collection of targets within a
+-- case -- domains, directories, files, login-form URLs, or whatever else
+-- the user wants to group separately (like a Spotify playlist). Every
+-- target belongs to exactly one list; kind is a UI hint (icon/placeholder)
+-- only, same as targets.kind was before this table existed.
+CREATE TABLE IF NOT EXISTS target_lists (
+	id TEXT PRIMARY KEY,
+	case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+	name TEXT NOT NULL,
+	kind TEXT NOT NULL DEFAULT 'other',
+	created_at DATETIME NOT NULL,
+	UNIQUE(case_id, name)
+);
+CREATE INDEX IF NOT EXISTS idx_target_lists_case_id ON target_lists(case_id);
+
+-- A target is any host/URL/IP/directory/file the user has explicitly added
+-- to a case, either typed by hand or promoted from a job's results (see
+-- api.handlePromoteTargets), filed under exactly one target_lists row.
+-- UNIQUE(case_id, value) makes promoting an already-known value a harmless
+-- no-op via INSERT OR IGNORE rather than a duplicate row -- as a
+-- consequence a value already saved under one list can't also be saved
+-- under a second list within the same case, which is an acceptable
+-- limitation for what this is (a pentesting scratchpad, not a tagging
+-- system).
 CREATE TABLE IF NOT EXISTS targets (
 	id TEXT PRIMARY KEY,
 	case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+	list_id TEXT REFERENCES target_lists(id) ON DELETE CASCADE,
 	value TEXT NOT NULL,
-	kind TEXT,
 	source_tool TEXT,
 	source_job_id TEXT,
 	notes TEXT,
@@ -208,13 +229,23 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
 
--- A saved auth bundle (headers/cookie) a user can apply to Repeater/JWT
+-- A saved auth bundle (headers/cookie) a user can apply to JWT
 -- Scanner/Probe/Secret Scanner instead of re-pasting the same
 -- Authorization header or session cookie into each tool every time. Scoped
 -- to a case (an engagement's credentials rarely make sense reused in
 -- another one) -- unlike settings' app-wide API keys, values here ARE
 -- returned in full on every read: this is a single-operator local tool and
 -- the whole point is reusing what's stored, not hiding it from its owner.
+--
+-- username/password/login_url (+ username_field/password_field/
+-- token_field) are optional: when set, this row is a "test credential" --
+-- a valid login the operator has authorization to use -- and
+-- POST /api/credentials/{id}/session (see handleCreateCredentialSession)
+-- performs that login and writes the resulting Set-Cookie/bearer token
+-- back into headers/cookie above, so every scanner that already applies
+-- this credential via mergedCredentialHeaders picks up the live session
+-- with no changes of its own. session_created_at records when that last
+-- succeeded, purely for display.
 CREATE TABLE IF NOT EXISTS credentials (
 	id TEXT PRIMARY KEY,
 	case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
@@ -222,10 +253,32 @@ CREATE TABLE IF NOT EXISTS credentials (
 	headers TEXT,
 	cookie TEXT,
 	notes TEXT,
+	username TEXT,
+	password TEXT,
+	login_url TEXT,
+	login_method TEXT,
+	username_field TEXT,
+	password_field TEXT,
+	token_field TEXT,
+	session_created_at DATETIME,
 	created_at DATETIME NOT NULL,
 	UNIQUE(case_id, name)
 );
 CREATE INDEX IF NOT EXISTS idx_credentials_case_id ON credentials(case_id);
+
+-- A per-domain Cookie header applied automatically to every request a case
+-- makes against that domain, so an authenticated session doesn't have to be
+-- picked via a Credential on every single tool call -- unlike credentials
+-- (explicit, chosen per request), this is implicit and always-on for its
+-- domain. One row per (case, domain); domain is stored lowercased.
+CREATE TABLE IF NOT EXISTS domain_cookies (
+	case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+	domain TEXT NOT NULL,
+	cookie TEXT NOT NULL,
+	updated_at DATETIME NOT NULL,
+	PRIMARY KEY (case_id, domain)
+);
+CREATE INDEX IF NOT EXISTS idx_domain_cookies_case_id ON domain_cookies(case_id);
 
 -- A named, reusable bundle of job-launch options (preset/threads/timeout/
 -- rate/wordlist/scheme/hostSuffix/recursive, plus ffuf-custom's own
@@ -242,18 +295,6 @@ CREATE TABLE IF NOT EXISTS job_templates (
 	UNIQUE(tool, name)
 );
 
--- A chronological log of notable actions taken within a case (targets
--- added/removed, jobs started/finished, credentials saved, reports
--- exported) -- a lightweight engagement record, not a full audit trail.
-CREATE TABLE IF NOT EXISTS case_activity (
-	id TEXT PRIMARY KEY,
-	case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
-	kind TEXT NOT NULL,
-	message TEXT NOT NULL,
-	created_at DATETIME NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_case_activity_case_id ON case_activity(case_id);
-
 -- One row per Probe/JWT/Secret Scanner run launched with a case selected --
 -- unlike case_checks (one row per case+target+kind, overwritten on re-run),
 -- this keeps every run so a case's scan history is never silently
@@ -264,34 +305,134 @@ CREATE TABLE IF NOT EXISTS case_scans (
 	id TEXT PRIMARY KEY,
 	case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
 	target TEXT NOT NULL,
-	tool TEXT NOT NULL, -- 'probe' | 'jwt' | 'secrets'
+	tool TEXT NOT NULL, -- 'probe' | 'jwt' | 'secrets' | 'breach' | 'breach-crawl' | 'domainscan' | 'bypass403' | 'pwreset' | 'graphqlenum'
 	severity TEXT NOT NULL, -- worst finding severity, on the same info/low/medium/high/critical scale as probescan
 	summary TEXT NOT NULL,
 	data TEXT NOT NULL,
 	created_at DATETIME NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_case_scans_case_id ON case_scans(case_id);
-
--- One row per Repeater request sent with a case selected -- every one of
--- Repeater's "one explicit request, one response" sends is otherwise gone
--- the moment the tab is closed (see internal/repeater's own doc comment),
--- so a case-scoped history lets a manual test from earlier in an
--- engagement be revisited or replayed instead of re-typed from memory.
-CREATE TABLE IF NOT EXISTS repeater_history (
-	id TEXT PRIMARY KEY,
-	case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
-	method TEXT NOT NULL,
-	url TEXT NOT NULL,
-	request_headers TEXT,
-	request_body TEXT,
-	response TEXT NOT NULL,
-	created_at DATETIME NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_repeater_history_case_id ON repeater_history(case_id);
 `
 	_, err := s.db.Exec(schema)
 	if err != nil {
 		return fmt.Errorf("store: migrate: %w", err)
+	}
+	// findings predates triage_status/triage_note -- CREATE TABLE IF NOT
+	// EXISTS above only applies that shape to a brand new database, so an
+	// existing one needs these two columns added by hand, once.
+	if err := s.ensureColumn("findings", "triage_status", "TEXT NOT NULL DEFAULT 'new'"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("findings", "triage_note", "TEXT"); err != nil {
+		return err
+	}
+	// targets predates target_lists -- give every pre-existing target a
+	// home list so it doesn't vanish from the Targets tab once lists become
+	// mandatory there. The index has to wait until the column actually
+	// exists -- CREATE INDEX isn't guarded by IF NOT EXISTS the way ADD
+	// COLUMN would need to be, so it can't live in the schema string above
+	// (that runs unconditionally, before ensureColumn has a chance to add
+	// list_id to a pre-existing targets table).
+	// Template-level detail and confidence. Added after the first release, so
+	// existing databases get them through ensureColumn.
+	for _, col := range []string{"template", "severity", "matcher", "reproduce", "confidence"} {
+		if err := s.ensureColumn("findings", col, "TEXT"); err != nil {
+			return err
+		}
+	}
+	if err := s.ensureColumn("targets", "list_id", "TEXT REFERENCES target_lists(id) ON DELETE CASCADE"); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_targets_list_id ON targets(list_id)`); err != nil {
+		return fmt.Errorf("store: migrate: %w", err)
+	}
+	if err := s.backfillTargetLists(); err != nil {
+		return err
+	}
+	// credentials predates the test-credential/session fields -- add them
+	// for a pre-existing database the same way list_id was added above.
+	for _, col := range []struct{ name, decl string }{
+		{"username", "TEXT"},
+		{"password", "TEXT"},
+		{"login_url", "TEXT"},
+		{"login_method", "TEXT"},
+		{"username_field", "TEXT"},
+		{"password_field", "TEXT"},
+		{"token_field", "TEXT"},
+		{"session_created_at", "DATETIME"},
+	} {
+		if err := s.ensureColumn("credentials", col.name, col.decl); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// backfillTargetLists gives every target left over from before target_lists
+// existed a home: one new "Domains" list per case (matching the
+// domains-only behavior every target had before this feature), so nothing
+// already saved silently disappears from the Targets tab. A no-op once
+// every target already has a list_id.
+func (s *Store) backfillTargetLists() error {
+	rows, err := s.db.Query(`SELECT DISTINCT case_id FROM targets WHERE list_id IS NULL OR list_id = ''`)
+	if err != nil {
+		return fmt.Errorf("store: backfill target lists: %w", err)
+	}
+	var caseIDs []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return fmt.Errorf("store: backfill target lists: %w", err)
+		}
+		caseIDs = append(caseIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	rows.Close()
+
+	for _, caseID := range caseIDs {
+		listID, err := s.getOrCreateTargetList(caseID, "Domains", "domain")
+		if err != nil {
+			return fmt.Errorf("store: backfill target lists: %w", err)
+		}
+		if _, err := s.db.Exec(`UPDATE targets SET list_id = ? WHERE case_id = ? AND (list_id IS NULL OR list_id = '')`, listID, caseID); err != nil {
+			return fmt.Errorf("store: backfill target lists: %w", err)
+		}
+	}
+	return nil
+}
+
+// ensureColumn adds column to table (via ALTER TABLE ... ADD COLUMN decl) if
+// it isn't already present -- SQLite has no "ADD COLUMN IF NOT EXISTS", and
+// re-running the bare ALTER on every startup would fail once the column
+// already exists.
+func (s *Store) ensureColumn(table, column, decl string) error {
+	rows, err := s.db.Query(fmt.Sprintf(`PRAGMA table_info(%s)`, table))
+	if err != nil {
+		return fmt.Errorf("store: inspect %s: %w", table, err)
+	}
+	defer rows.Close()
+
+	var name string
+	var cid, notNull, pk int
+	var dfltValue sql.NullString
+	var colType string
+	for rows.Next() {
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltValue, &pk); err != nil {
+			return fmt.Errorf("store: inspect %s: %w", table, err)
+		}
+		if name == column {
+			return rows.Err()
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	if _, err := s.db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, column, decl)); err != nil {
+		return fmt.Errorf("store: add column %s.%s: %w", table, column, err)
 	}
 	return nil
 }
@@ -404,11 +545,12 @@ func (s *Store) SaveFinding(runID, nodeID string, f model.Finding) error {
 	// merge, table, ...), so (id, node_id) is the natural primary key: one
 	// row per finding per node it reached. OR IGNORE covers the rare case
 	// of the same finding reaching one node twice via a diamond-shaped
-	// graph with dedup disabled.
+	// graph with dedup disabled. triage_status is left at its schema default
+	// ('new') here -- only UpdateFindingTriage ever sets it to anything else.
 	_, err = s.db.Exec(`
-		INSERT OR IGNORE INTO findings (id, run_id, node_id, url, status_code, content_length, words, lines, content_type, redirect_location, method, headers, source_tool, tags, timestamp)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, f.ID, runID, nodeID, f.URL, f.StatusCode, f.ContentLength, f.Words, f.Lines, f.ContentType, f.RedirectLoc, f.Method, string(headers), f.SourceTool, string(tags), f.Timestamp)
+		INSERT OR IGNORE INTO findings (id, run_id, node_id, url, status_code, content_length, words, lines, content_type, redirect_location, method, headers, source_tool, tags, timestamp, template, severity, matcher, reproduce, confidence)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, f.ID, runID, nodeID, f.URL, f.StatusCode, f.ContentLength, f.Words, f.Lines, f.ContentType, f.RedirectLoc, f.Method, string(headers), f.SourceTool, string(tags), f.Timestamp, f.Template, f.Severity, f.Matcher, f.Reproduce, f.Confidence)
 	if err != nil {
 		return fmt.Errorf("store: save finding: %w", err)
 	}
@@ -418,7 +560,7 @@ func (s *Store) SaveFinding(runID, nodeID string, f model.Finding) error {
 // ListFindings returns every finding recorded for a run, optionally
 // restricted to one node (pass "" for nodeID to get all of them).
 func (s *Store) ListFindings(runID, nodeID string) ([]model.Finding, error) {
-	query := `SELECT id, run_id, node_id, url, status_code, content_length, words, lines, content_type, redirect_location, method, headers, source_tool, tags, timestamp FROM findings WHERE run_id = ?`
+	query := `SELECT id, run_id, node_id, url, status_code, content_length, words, lines, content_type, redirect_location, method, headers, source_tool, tags, timestamp, triage_status, triage_note, template, severity, matcher, reproduce, confidence FROM findings WHERE run_id = ?`
 	args := []any{runID}
 	if nodeID != "" {
 		query += ` AND node_id = ?`
@@ -436,13 +578,15 @@ func (s *Store) ListFindings(runID, nodeID string) ([]model.Finding, error) {
 	for rows.Next() {
 		var f model.Finding
 		var headers, tags sql.NullString
-		var contentType, redirectLoc, method sql.NullString
-		if err := rows.Scan(&f.ID, &f.RunID, &f.SourceNodeID, &f.URL, &f.StatusCode, &f.ContentLength, &f.Words, &f.Lines, &contentType, &redirectLoc, &method, &headers, &f.SourceTool, &tags, &f.Timestamp); err != nil {
+		var contentType, redirectLoc, method, triageNote, template, severity, matcher, reproduce, confidence sql.NullString
+		if err := rows.Scan(&f.ID, &f.RunID, &f.SourceNodeID, &f.URL, &f.StatusCode, &f.ContentLength, &f.Words, &f.Lines, &contentType, &redirectLoc, &method, &headers, &f.SourceTool, &tags, &f.Timestamp, &f.TriageStatus, &triageNote, &template, &severity, &matcher, &reproduce, &confidence); err != nil {
 			return nil, fmt.Errorf("store: scan finding: %w", err)
 		}
 		f.ContentType = contentType.String
 		f.RedirectLoc = redirectLoc.String
 		f.Method = method.String
+		f.TriageNote = triageNote.String
+		f.Template, f.Severity, f.Matcher, f.Reproduce, f.Confidence = template.String, severity.String, matcher.String, reproduce.String, confidence.String
 		if headers.Valid && headers.String != "" && headers.String != "null" {
 			_ = json.Unmarshal([]byte(headers.String), &f.Headers)
 		}
@@ -452,6 +596,23 @@ func (s *Store) ListFindings(runID, nodeID string) ([]model.Finding, error) {
 		out = append(out, f)
 	}
 	return out, rows.Err()
+}
+
+// UpdateFindingTriage sets a finding's operator-assigned triage status/note,
+// identified by its ID alone (not id+node_id, findings' actual primary key)
+// -- every row sharing that ID is the same logical finding as it passed
+// through the flow's later nodes (see SaveFinding's doc comment), and a
+// triage decision applies to all of them at once so it reads the same
+// regardless of which node's copy a caller happens to have fetched.
+func (s *Store) UpdateFindingTriage(id string, status model.TriageStatus, note string) error {
+	res, err := s.db.Exec(`UPDATE findings SET triage_status = ?, triage_note = ? WHERE id = ?`, string(status), note, id)
+	if err != nil {
+		return fmt.Errorf("store: update finding triage: %w", err)
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // --- Cases ---
@@ -525,17 +686,145 @@ func (s *Store) DeleteCase(id string) error {
 	return nil
 }
 
+// --- Target Lists ---
+
+// TargetList is a named, user-created collection of targets within a case
+// -- see the CREATE TABLE comment above. Kind is a UI hint only (the
+// backend never branches on it), same as Target.Kind used to be before
+// this type existed.
+type TargetList struct {
+	ID        string    `json:"id"`
+	CaseID    string    `json:"caseId"`
+	Name      string    `json:"name"`
+	Kind      string    `json:"kind"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+func (s *Store) CreateTargetList(l TargetList) error {
+	_, err := s.db.Exec(`
+		INSERT INTO target_lists (id, case_id, name, kind, created_at)
+		VALUES (?, ?, ?, ?, ?)
+	`, l.ID, l.CaseID, l.Name, l.Kind, time.Now())
+	if err != nil {
+		return fmt.Errorf("store: create target list: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ListTargetLists(caseID string) ([]TargetList, error) {
+	rows, err := s.db.Query(`
+		SELECT id, case_id, name, kind, created_at FROM target_lists WHERE case_id = ? ORDER BY created_at ASC
+	`, caseID)
+	if err != nil {
+		return nil, fmt.Errorf("store: list target lists: %w", err)
+	}
+	defer rows.Close()
+
+	out := []TargetList{}
+	for rows.Next() {
+		var l TargetList
+		if err := rows.Scan(&l.ID, &l.CaseID, &l.Name, &l.Kind, &l.CreatedAt); err != nil {
+			return nil, fmt.Errorf("store: target list row: %w", err)
+		}
+		out = append(out, l)
+	}
+	return out, rows.Err()
+}
+
+// GetTargetListByID looks up one target list by its own id -- used to
+// validate that a listId a request carries actually belongs to the case
+// it's being used against, and to report back a freshly created/renamed
+// list.
+func (s *Store) GetTargetListByID(id string) (TargetList, error) {
+	var l TargetList
+	err := s.db.QueryRow(`SELECT id, case_id, name, kind, created_at FROM target_lists WHERE id = ?`, id).
+		Scan(&l.ID, &l.CaseID, &l.Name, &l.Kind, &l.CreatedAt)
+	if err == sql.ErrNoRows {
+		return TargetList{}, fmt.Errorf("store: target list %s: %w", id, ErrNotFound)
+	}
+	if err != nil {
+		return TargetList{}, fmt.Errorf("store: get target list: %w", err)
+	}
+	return l, nil
+}
+
+// getOrCreateTargetList returns the id of the case's list with this exact
+// name, creating it first if it doesn't exist yet -- used by
+// backfillTargetLists to find-or-make each case's default "Domains" list.
+func (s *Store) getOrCreateTargetList(caseID, name, kind string) (string, error) {
+	var id string
+	err := s.db.QueryRow(`SELECT id FROM target_lists WHERE case_id = ? AND name = ?`, caseID, name).Scan(&id)
+	if err == nil {
+		return id, nil
+	}
+	if err != sql.ErrNoRows {
+		return "", fmt.Errorf("store: get or create target list: %w", err)
+	}
+	id = randomID()
+	if _, err := s.db.Exec(`
+		INSERT INTO target_lists (id, case_id, name, kind, created_at) VALUES (?, ?, ?, ?, ?)
+	`, id, caseID, name, kind, time.Now()); err != nil {
+		return "", fmt.Errorf("store: get or create target list: %w", err)
+	}
+	return id, nil
+}
+
+func (s *Store) RenameTargetList(id, name string) error {
+	res, err := s.db.Exec(`UPDATE target_lists SET name = ? WHERE id = ?`, name, id)
+	if err != nil {
+		return fmt.Errorf("store: rename target list: %w", err)
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// DeleteTargetList removes a list and (via ON DELETE CASCADE) every target
+// filed under it.
+func (s *Store) DeleteTargetList(id string) error {
+	_, err := s.db.Exec(`DELETE FROM target_lists WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("store: delete target list: %w", err)
+	}
+	return nil
+}
+
 // --- Targets ---
 
+// Target's ListName/ListKind are filled in by a join against target_lists
+// wherever a target is read (List/GetByValue/GetByID) -- they aren't
+// columns of the targets table itself, just a convenience so callers (the
+// frontend's tab-based target pickers in particular) don't need to cross-
+// reference a separate target lists response to know which list/kind a
+// target belongs to.
 type Target struct {
 	ID          string    `json:"id"`
 	CaseID      string    `json:"caseId"`
+	ListID      string    `json:"listId"`
+	ListName    string    `json:"listName"`
+	ListKind    string    `json:"listKind"`
 	Value       string    `json:"value"`
-	Kind        string    `json:"kind,omitempty"`
 	SourceTool  string    `json:"sourceTool,omitempty"`
 	SourceJobID string    `json:"sourceJobId,omitempty"`
 	Notes       string    `json:"notes,omitempty"`
 	CreatedAt   time.Time `json:"createdAt"`
+}
+
+const targetSelectCols = `
+	t.id, t.case_id, t.list_id, tl.name, tl.kind, t.value, t.source_tool, t.source_job_id, t.notes, t.created_at
+	FROM targets t
+	JOIN target_lists tl ON tl.id = t.list_id
+`
+
+func scanTarget(row interface{ Scan(...any) error }) (Target, error) {
+	var t Target
+	var sourceTool, sourceJobID, notes sql.NullString
+	err := row.Scan(&t.ID, &t.CaseID, &t.ListID, &t.ListName, &t.ListKind, &t.Value, &sourceTool, &sourceJobID, &notes, &t.CreatedAt)
+	t.SourceTool = sourceTool.String
+	t.SourceJobID = sourceJobID.String
+	t.Notes = notes.String
+	return t, err
 }
 
 // AddTarget records a target, or does nothing if this case already has one
@@ -544,9 +833,9 @@ type Target struct {
 // rather than an error the caller has to special-case.
 func (s *Store) AddTarget(t Target) error {
 	_, err := s.db.Exec(`
-		INSERT OR IGNORE INTO targets (id, case_id, value, kind, source_tool, source_job_id, notes, created_at)
+		INSERT OR IGNORE INTO targets (id, case_id, list_id, value, source_tool, source_job_id, notes, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, t.ID, t.CaseID, t.Value, t.Kind, t.SourceTool, t.SourceJobID, t.Notes, time.Now())
+	`, t.ID, t.CaseID, t.ListID, t.Value, t.SourceTool, t.SourceJobID, t.Notes, time.Now())
 	if err != nil {
 		return fmt.Errorf("store: add target: %w", err)
 	}
@@ -554,10 +843,7 @@ func (s *Store) AddTarget(t Target) error {
 }
 
 func (s *Store) ListTargets(caseID string) ([]Target, error) {
-	rows, err := s.db.Query(`
-		SELECT id, case_id, value, kind, source_tool, source_job_id, notes, created_at
-		FROM targets WHERE case_id = ? ORDER BY created_at ASC
-	`, caseID)
+	rows, err := s.db.Query(`SELECT `+targetSelectCols+`WHERE t.case_id = ? ORDER BY t.created_at ASC`, caseID)
 	if err != nil {
 		return nil, fmt.Errorf("store: list targets: %w", err)
 	}
@@ -565,15 +851,10 @@ func (s *Store) ListTargets(caseID string) ([]Target, error) {
 
 	out := []Target{}
 	for rows.Next() {
-		var t Target
-		var kind, sourceTool, sourceJobID, notes sql.NullString
-		if err := rows.Scan(&t.ID, &t.CaseID, &t.Value, &kind, &sourceTool, &sourceJobID, &notes, &t.CreatedAt); err != nil {
+		t, err := scanTarget(rows)
+		if err != nil {
 			return nil, fmt.Errorf("store: target row: %w", err)
 		}
-		t.Kind = kind.String
-		t.SourceTool = sourceTool.String
-		t.SourceJobID = sourceJobID.String
-		t.Notes = notes.String
 		out = append(out, t)
 	}
 	return out, rows.Err()
@@ -583,46 +864,27 @@ func (s *Store) ListTargets(caseID string) ([]Target, error) {
 // promotion to report back the (possibly pre-existing) target a value
 // resolved to.
 func (s *Store) GetTargetByValue(caseID, value string) (Target, error) {
-	var t Target
-	var kind, sourceTool, sourceJobID, notes sql.NullString
-	err := s.db.QueryRow(`
-		SELECT id, case_id, value, kind, source_tool, source_job_id, notes, created_at
-		FROM targets WHERE case_id = ? AND value = ?
-	`, caseID, value).Scan(&t.ID, &t.CaseID, &t.Value, &kind, &sourceTool, &sourceJobID, &notes, &t.CreatedAt)
+	t, err := scanTarget(s.db.QueryRow(`SELECT `+targetSelectCols+`WHERE t.case_id = ? AND t.value = ?`, caseID, value))
 	if err == sql.ErrNoRows {
 		return Target{}, fmt.Errorf("store: target %s/%s: %w", caseID, value, ErrNotFound)
 	}
 	if err != nil {
 		return Target{}, fmt.Errorf("store: get target by value: %w", err)
 	}
-	t.Kind = kind.String
-	t.SourceTool = sourceTool.String
-	t.SourceJobID = sourceJobID.String
-	t.Notes = notes.String
 	return t, nil
 }
 
 // GetTargetByID looks up one target by its own id -- used by
-// handleDeleteTarget (whose route only carries the target id, not its
-// case) to know which case's activity log a deletion should be recorded
-// against before the row is gone.
+// handleDeleteTarget (whose route only carries the target id) to tell a
+// missing target apart from a successful delete.
 func (s *Store) GetTargetByID(id string) (Target, error) {
-	var t Target
-	var kind, sourceTool, sourceJobID, notes sql.NullString
-	err := s.db.QueryRow(`
-		SELECT id, case_id, value, kind, source_tool, source_job_id, notes, created_at
-		FROM targets WHERE id = ?
-	`, id).Scan(&t.ID, &t.CaseID, &t.Value, &kind, &sourceTool, &sourceJobID, &notes, &t.CreatedAt)
+	t, err := scanTarget(s.db.QueryRow(`SELECT `+targetSelectCols+`WHERE t.id = ?`, id))
 	if err == sql.ErrNoRows {
 		return Target{}, fmt.Errorf("store: target %s: %w", id, ErrNotFound)
 	}
 	if err != nil {
 		return Target{}, fmt.Errorf("store: get target by id: %w", err)
 	}
-	t.Kind = kind.String
-	t.SourceTool = sourceTool.String
-	t.SourceJobID = sourceJobID.String
-	t.Notes = notes.String
 	return t, nil
 }
 
@@ -989,13 +1251,25 @@ func (s *Store) HasCaseScreenshot(caseID, target string) (bool, error) {
 // schema comment above credentials for why values are returned in full
 // rather than redacted the way settings' app-wide API keys are.
 type Credential struct {
-	ID        string            `json:"id"`
-	CaseID    string            `json:"caseId"`
-	Name      string            `json:"name"`
-	Headers   map[string]string `json:"headers,omitempty"`
-	Cookie    string            `json:"cookie,omitempty"`
-	Notes     string            `json:"notes,omitempty"`
-	CreatedAt time.Time         `json:"createdAt"`
+	ID      string            `json:"id"`
+	CaseID  string            `json:"caseId"`
+	Name    string            `json:"name"`
+	Headers map[string]string `json:"headers,omitempty"`
+	Cookie  string            `json:"cookie,omitempty"`
+	Notes   string            `json:"notes,omitempty"`
+	// Username/Password/LoginURL mark this as a "test credential" -- see
+	// the credentials table's schema comment above -- and are only ever
+	// used by handleCreateCredentialSession to perform the login that
+	// populates Headers/Cookie; scanners never see them directly.
+	Username      string     `json:"username,omitempty"`
+	Password      string     `json:"password,omitempty"`
+	LoginURL      string     `json:"loginUrl,omitempty"`
+	LoginMethod   string     `json:"loginMethod,omitempty"`
+	UsernameField string     `json:"usernameField,omitempty"`
+	PasswordField string     `json:"passwordField,omitempty"`
+	TokenField    string     `json:"tokenField,omitempty"`
+	SessionAt     *time.Time `json:"sessionAt,omitempty"`
+	CreatedAt     time.Time  `json:"createdAt"`
 }
 
 func (s *Store) SaveCredential(c Credential) error {
@@ -1004,18 +1278,48 @@ func (s *Store) SaveCredential(c Credential) error {
 		return fmt.Errorf("store: marshal credential headers: %w", err)
 	}
 	_, err = s.db.Exec(`
-		INSERT INTO credentials (id, case_id, name, headers, cookie, notes, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, c.ID, c.CaseID, c.Name, string(headersJSON), c.Cookie, c.Notes, time.Now())
+		INSERT INTO credentials (
+			id, case_id, name, headers, cookie, notes,
+			username, password, login_url, login_method, username_field, password_field, token_field,
+			created_at
+		)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, c.ID, c.CaseID, c.Name, string(headersJSON), c.Cookie, c.Notes,
+		c.Username, c.Password, c.LoginURL, c.LoginMethod, c.UsernameField, c.PasswordField, c.TokenField,
+		time.Now())
 	if err != nil {
 		return fmt.Errorf("store: save credential: %w", err)
 	}
 	return nil
 }
 
+// UpdateCredentialSession overwrites a credential's live headers/cookie
+// with the result of a fresh login (see handleCreateCredentialSession) and
+// stamps session_created_at, so a scanner picking this credential up right
+// after gets the new session and the vault can show when it was last
+// refreshed.
+func (s *Store) UpdateCredentialSession(id string, headers map[string]string, cookie string) error {
+	headersJSON, err := json.Marshal(headers)
+	if err != nil {
+		return fmt.Errorf("store: marshal credential headers: %w", err)
+	}
+	res, err := s.db.Exec(`
+		UPDATE credentials SET headers = ?, cookie = ?, session_created_at = ? WHERE id = ?
+	`, string(headersJSON), cookie, time.Now(), id)
+	if err != nil {
+		return fmt.Errorf("store: update credential session: %w", err)
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return fmt.Errorf("store: credential %s: %w", id, ErrNotFound)
+	}
+	return nil
+}
+
 func (s *Store) ListCredentials(caseID string) ([]Credential, error) {
 	rows, err := s.db.Query(`
-		SELECT id, case_id, name, headers, cookie, notes, created_at
+		SELECT id, case_id, name, headers, cookie, notes,
+			username, password, login_url, login_method, username_field, password_field, token_field, session_created_at,
+			created_at
 		FROM credentials WHERE case_id = ? ORDER BY created_at ASC
 	`, caseID)
 	if err != nil {
@@ -1035,7 +1339,12 @@ func (s *Store) ListCredentials(caseID string) ([]Credential, error) {
 }
 
 func (s *Store) GetCredential(id string) (Credential, error) {
-	row := s.db.QueryRow(`SELECT id, case_id, name, headers, cookie, notes, created_at FROM credentials WHERE id = ?`, id)
+	row := s.db.QueryRow(`
+		SELECT id, case_id, name, headers, cookie, notes,
+			username, password, login_url, login_method, username_field, password_field, token_field, session_created_at,
+			created_at
+		FROM credentials WHERE id = ?
+	`, id)
 	c, err := scanCredential(row)
 	if err == sql.ErrNoRows {
 		return Credential{}, fmt.Errorf("store: credential %s: %w", id, ErrNotFound)
@@ -1063,7 +1372,13 @@ type credentialScanner interface {
 func scanCredential(row credentialScanner) (Credential, error) {
 	var c Credential
 	var headersJSON, cookie, notes sql.NullString
-	if err := row.Scan(&c.ID, &c.CaseID, &c.Name, &headersJSON, &cookie, &notes, &c.CreatedAt); err != nil {
+	var username, password, loginURL, loginMethod, usernameField, passwordField, tokenField sql.NullString
+	var sessionAt sql.NullTime
+	if err := row.Scan(
+		&c.ID, &c.CaseID, &c.Name, &headersJSON, &cookie, &notes,
+		&username, &password, &loginURL, &loginMethod, &usernameField, &passwordField, &tokenField, &sessionAt,
+		&c.CreatedAt,
+	); err != nil {
 		return Credential{}, err
 	}
 	if headersJSON.String != "" {
@@ -1073,7 +1388,86 @@ func scanCredential(row credentialScanner) (Credential, error) {
 	}
 	c.Cookie = cookie.String
 	c.Notes = notes.String
+	c.Username = username.String
+	c.Password = password.String
+	c.LoginURL = loginURL.String
+	c.LoginMethod = loginMethod.String
+	c.UsernameField = usernameField.String
+	c.PasswordField = passwordField.String
+	c.TokenField = tokenField.String
+	if sessionAt.Valid {
+		c.SessionAt = &sessionAt.Time
+	}
 	return c, nil
+}
+
+// --- Cookie vault (per-domain cookies) ---
+
+// DomainCookie is one case's saved Cookie-header override for one domain --
+// see the migrate() schema comment above domain_cookies.
+type DomainCookie struct {
+	CaseID    string    `json:"caseId"`
+	Domain    string    `json:"domain"`
+	Cookie    string    `json:"cookie"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+func (s *Store) ListDomainCookies(caseID string) ([]DomainCookie, error) {
+	rows, err := s.db.Query(`
+		SELECT case_id, domain, cookie, updated_at FROM domain_cookies WHERE case_id = ? ORDER BY domain ASC
+	`, caseID)
+	if err != nil {
+		return nil, fmt.Errorf("store: list domain cookies: %w", err)
+	}
+	defer rows.Close()
+
+	out := []DomainCookie{}
+	for rows.Next() {
+		var c DomainCookie
+		if err := rows.Scan(&c.CaseID, &c.Domain, &c.Cookie, &c.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("store: domain cookie row: %w", err)
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// SetDomainCookie saves cookie as caseID's override for domain, or deletes
+// the row entirely when cookie is blank -- clearing the field in the vault
+// UI removes the override rather than persisting an empty one.
+func (s *Store) SetDomainCookie(caseID, domain, cookie string) error {
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	if cookie == "" {
+		_, err := s.db.Exec(`DELETE FROM domain_cookies WHERE case_id = ? AND domain = ?`, caseID, domain)
+		if err != nil {
+			return fmt.Errorf("store: delete domain cookie: %w", err)
+		}
+		return nil
+	}
+	_, err := s.db.Exec(`
+		INSERT INTO domain_cookies (case_id, domain, cookie, updated_at) VALUES (?, ?, ?, ?)
+		ON CONFLICT(case_id, domain) DO UPDATE SET cookie = excluded.cookie, updated_at = excluded.updated_at
+	`, caseID, domain, cookie, time.Now())
+	if err != nil {
+		return fmt.Errorf("store: set domain cookie: %w", err)
+	}
+	return nil
+}
+
+// CookieForDomain returns caseID's saved cookie override for domain, or ""
+// if none is set. Used to auto-apply the vault to an outgoing request (see
+// api.applyDomainCookie) -- "not set" is not an error.
+func (s *Store) CookieForDomain(caseID, domain string) (string, error) {
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	var cookie string
+	err := s.db.QueryRow(`SELECT cookie FROM domain_cookies WHERE case_id = ? AND domain = ?`, caseID, domain).Scan(&cookie)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("store: cookie for domain: %w", err)
+	}
+	return cookie, nil
 }
 
 // --- Job templates ---
@@ -1127,58 +1521,6 @@ func (s *Store) DeleteJobTemplate(id string) error {
 	return nil
 }
 
-// --- Case activity ---
-
-// Activity is one logged case event -- see the migrate() schema comment
-// above case_activity.
-type Activity struct {
-	ID        string    `json:"id"`
-	CaseID    string    `json:"caseId"`
-	Kind      string    `json:"kind"`
-	Message   string    `json:"message"`
-	CreatedAt time.Time `json:"createdAt"`
-}
-
-// activityListLimit caps how many rows ListActivity returns -- this is a
-// running engagement log meant to be skimmed, not a paginated archive.
-const activityListLimit = 500
-
-// LogActivity records one case event, minting its own id/timestamp. Every
-// call site treats a logging failure as non-fatal to the action it's
-// recording (the action itself already succeeded) -- see its callers'
-// `_ = s.store.LogActivity(...)` convention.
-func (s *Store) LogActivity(caseID, kind, message string) error {
-	_, err := s.db.Exec(`
-		INSERT INTO case_activity (id, case_id, kind, message, created_at)
-		VALUES (?, ?, ?, ?, ?)
-	`, randomID(), caseID, kind, message, time.Now())
-	if err != nil {
-		return fmt.Errorf("store: log activity: %w", err)
-	}
-	return nil
-}
-
-func (s *Store) ListActivity(caseID string) ([]Activity, error) {
-	rows, err := s.db.Query(`
-		SELECT id, case_id, kind, message, created_at FROM case_activity
-		WHERE case_id = ? ORDER BY created_at DESC LIMIT ?
-	`, caseID, activityListLimit)
-	if err != nil {
-		return nil, fmt.Errorf("store: list activity: %w", err)
-	}
-	defer rows.Close()
-
-	out := []Activity{}
-	for rows.Next() {
-		var a Activity
-		if err := rows.Scan(&a.ID, &a.CaseID, &a.Kind, &a.Message, &a.CreatedAt); err != nil {
-			return nil, fmt.Errorf("store: activity row: %w", err)
-		}
-		out = append(out, a)
-	}
-	return out, rows.Err()
-}
-
 // --- Case scans (persisted Probe/JWT/Secret Scanner runs) ---
 
 // CaseScan is one Probe/JWT/Secret Scanner run launched with a case
@@ -1207,13 +1549,24 @@ func (s *Store) SaveCaseScan(c CaseScan) error {
 
 // ListCaseScans returns every scan recorded for a case, most recent first,
 // without each row's raw data payload -- a case can accumulate many scans
-// over an engagement, and the list view (Activity/Risk Panel) only ever
-// needs target/tool/severity/summary.
-func (s *Store) ListCaseScans(caseID string) ([]CaseScan, error) {
-	rows, err := s.db.Query(`
-		SELECT id, case_id, target, tool, severity, summary, created_at
-		FROM case_scans WHERE case_id = ? ORDER BY created_at DESC
-	`, caseID)
+// over an engagement, and the list view only ever
+// needs target/tool/severity/summary. tool optionally narrows the list to
+// one tool (e.g. "probe"), for a tab that only cares about its own history;
+// pass "" for every tool.
+func (s *Store) ListCaseScans(caseID, tool string) ([]CaseScan, error) {
+	var rows *sql.Rows
+	var err error
+	if tool == "" {
+		rows, err = s.db.Query(`
+			SELECT id, case_id, target, tool, severity, summary, created_at
+			FROM case_scans WHERE case_id = ? ORDER BY created_at DESC
+		`, caseID)
+	} else {
+		rows, err = s.db.Query(`
+			SELECT id, case_id, target, tool, severity, summary, created_at
+			FROM case_scans WHERE case_id = ? AND tool = ? ORDER BY created_at DESC
+		`, caseID, tool)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("store: list case scans: %w", err)
 	}
@@ -1244,75 +1597,6 @@ func (s *Store) GetCaseScan(id string) (CaseScan, error) {
 		return CaseScan{}, fmt.Errorf("store: get case scan: %w", err)
 	}
 	return c, nil
-}
-
-// --- Repeater history ---
-
-// RepeaterEntry is one sent Repeater request+response, kept for a case's
-// history -- see the migrate() schema comment above repeater_history.
-type RepeaterEntry struct {
-	ID             string            `json:"id"`
-	CaseID         string            `json:"caseId"`
-	Method         string            `json:"method"`
-	URL            string            `json:"url"`
-	RequestHeaders map[string]string `json:"requestHeaders,omitempty"`
-	RequestBody    string            `json:"requestBody,omitempty"`
-	Response       string            `json:"response"` // raw JSON of repeater.Response, opaque to store
-	CreatedAt      time.Time         `json:"createdAt"`
-}
-
-func (s *Store) SaveRepeaterEntry(e RepeaterEntry) error {
-	headersJSON, err := json.Marshal(e.RequestHeaders)
-	if err != nil {
-		return fmt.Errorf("store: marshal repeater headers: %w", err)
-	}
-	_, err = s.db.Exec(`
-		INSERT INTO repeater_history (id, case_id, method, url, request_headers, request_body, response, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, e.ID, e.CaseID, e.Method, e.URL, string(headersJSON), e.RequestBody, e.Response, time.Now())
-	if err != nil {
-		return fmt.Errorf("store: save repeater entry: %w", err)
-	}
-	return nil
-}
-
-// repeaterHistoryLimit caps how many entries ListRepeaterHistory returns --
-// a history meant to be skimmed for "what did I just send," not a
-// paginated archive, matching activityListLimit's reasoning.
-const repeaterHistoryLimit = 200
-
-func (s *Store) ListRepeaterHistory(caseID string) ([]RepeaterEntry, error) {
-	rows, err := s.db.Query(`
-		SELECT id, case_id, method, url, request_headers, request_body, response, created_at
-		FROM repeater_history WHERE case_id = ? ORDER BY created_at DESC LIMIT ?
-	`, caseID, repeaterHistoryLimit)
-	if err != nil {
-		return nil, fmt.Errorf("store: list repeater history: %w", err)
-	}
-	defer rows.Close()
-
-	out := []RepeaterEntry{}
-	for rows.Next() {
-		var e RepeaterEntry
-		var headersJSON, body sql.NullString
-		if err := rows.Scan(&e.ID, &e.CaseID, &e.Method, &e.URL, &headersJSON, &body, &e.Response, &e.CreatedAt); err != nil {
-			return nil, fmt.Errorf("store: repeater entry row: %w", err)
-		}
-		e.RequestBody = body.String
-		if headersJSON.Valid && headersJSON.String != "" && headersJSON.String != "null" {
-			_ = json.Unmarshal([]byte(headersJSON.String), &e.RequestHeaders)
-		}
-		out = append(out, e)
-	}
-	return out, rows.Err()
-}
-
-func (s *Store) DeleteRepeaterEntry(id string) error {
-	_, err := s.db.Exec(`DELETE FROM repeater_history WHERE id = ?`, id)
-	if err != nil {
-		return fmt.Errorf("store: delete repeater entry: %w", err)
-	}
-	return nil
 }
 
 // --- Settings ---

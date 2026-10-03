@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/Indigo6415/Aperture/internal/netgov"
 	"net/http"
 	"strings"
 	"time"
@@ -97,6 +98,7 @@ func (s *Server) handleProbeScan(w http.ResponseWriter, r *http.Request) {
 		}
 		opts.Headers = mergedCredentialHeaders(cred, nil)
 	}
+	opts.Headers = s.applyDomainCookie(req.CaseID, req.Target, opts.Headers)
 
 	scanID := newID()
 	s.probeMu.Lock()
@@ -139,7 +141,9 @@ func (s *Server) handleWatchProbeScan(w http.ResponseWriter, r *http.Request) {
 // "module" events that preceded it) since there's no job row to re-fetch
 // state from afterward.
 func (s *Server) runProbeScan(scanID string, pending pendingProbeScan) {
-	resp, err := probescan.RunScanStreaming(context.Background(), pending.Target, pending.Opts, func(m probescan.ModuleResult) {
+	opts := pending.Opts
+	opts.Progress = hubReporter{hub: s.hub, scanID: scanID}
+	resp, err := probescan.RunScanStreaming(netgov.WithPolicy(context.Background(), netgov.Policy{MaxConcurrency: pending.Opts.Concurrency}), pending.Target, opts, func(m probescan.ModuleResult) {
 		mod := m
 		s.hub.publish(scanID, RunEvent{Type: "module", Module: &mod})
 	})

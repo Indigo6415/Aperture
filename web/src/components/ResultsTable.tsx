@@ -1,5 +1,5 @@
-import { Fragment, useMemo, useState } from 'react'
-import type { Finding } from '../types'
+import { Fragment, useEffect, useMemo, useState } from 'react'
+import type { Finding, TriageStatus } from '../types'
 import { statusHexColor } from '../statusColor'
 import { extensionOf, hostnameOf } from '../url'
 import { isDangerousExtension } from '../extensions'
@@ -9,9 +9,11 @@ import { copyToClipboard, useContextMenu } from '../contextMenu'
 import { sendToJwtScanner } from '../jwtHandoff'
 import { sendToProbe } from '../probeHandoff'
 import { sendToSecretScan } from '../secretScanHandoff'
-import { sendToRepeater } from '../repeaterHandoff'
+import { sendToBypass403 } from '../bypass403Handoff'
+import { sendToTester } from '../testerHandoff'
+import { showToast } from '../toast'
 
-type SortKey = 'url' | 'statusCode' | 'extension' | 'contentLength' | 'words' | 'lines' | 'sourceTool'
+type SortKey = 'url' | 'statusCode' | 'extension' | 'contentLength' | 'words' | 'lines' | 'sourceTool' | 'triageStatus'
 
 const COLUMNS: { key: SortKey; label: string }[] = [
   { key: 'statusCode', label: 'Status' },
@@ -21,7 +23,26 @@ const COLUMNS: { key: SortKey; label: string }[] = [
   { key: 'words', label: 'Words' },
   { key: 'lines', label: 'Lines' },
   { key: 'sourceTool', label: 'Tool' },
+  { key: 'triageStatus', label: 'Triage' },
 ]
+
+// TRIAGE_META is one consistent label/color per triage status, for the
+// per-row dropdown and the facet filter's badges alike.
+const TRIAGE_META: Record<TriageStatus, { label: string; cls: string }> = {
+  new: { label: 'New', cls: 'border-neutral-700 bg-neutral-900 text-neutral-400' },
+  confirmed: { label: 'Confirmed', cls: 'border-red-700 bg-red-950/40 text-red-300' },
+  false_positive: { label: 'False positive', cls: 'border-neutral-800 bg-neutral-900 text-neutral-600' },
+  reported: { label: 'Reported', cls: 'border-emerald-700 bg-emerald-950/40 text-emerald-300' },
+}
+
+// triageMetaOf falls back to TRIAGE_META.new for any status TRIAGE_META
+// doesn't recognize -- a finding streamed live over the websocket the
+// instant a job emits it, before a round trip through the store, so it's
+// worth not trusting f.triageStatus to always be one of the four known
+// values here.
+function triageMetaOf(status: TriageStatus): { label: string; cls: string } {
+  return TRIAGE_META[status] ?? TRIAGE_META.new
+}
 
 // sortValueOf reads the value a given SortKey sorts by -- a plain property
 // for everything but 'extension', which isn't a Finding field and has to
@@ -60,6 +81,7 @@ const FINDING_DIMENSIONS: FacetDimension<Finding>[] = [
   { key: 'contentLength', label: 'Size', getValue: (f) => f.contentLength },
   { key: 'words', label: 'Words', getValue: (f) => f.words },
   { key: 'lines', label: 'Lines', getValue: (f) => f.lines },
+  { key: 'triageStatus', label: 'Triage', getValue: (f) => triageMetaOf(f.triageStatus).label },
 ]
 
 // rowKey uniquely identifies a finding within one ResultsTable -- the same
@@ -111,13 +133,44 @@ export function ResultsTable({
   const showPreview = Boolean(caseId) && screenshotPreviewEnabled
   const extraCols = (selectable ? 1 : 0) + (showPreview ? 1 : 0)
   const { openMenu } = useContextMenu()
-  const [faceted, setFaceted] = useState<Finding[]>(findings)
+  // triageOverrides holds this component's own optimistic view of a
+  // finding's triage status/note, keyed by finding.id -- the persisted
+  // value only ever refreshes from the server on the next full findings
+  // fetch (job re-run, tab reopen), so an edit here has to be layered on
+  // top of the `findings` prop rather than waiting on it.
+  const [triageOverrides, setTriageOverrides] = useState<Record<string, { status: TriageStatus; note: string }>>({})
+  const annotated = useMemo(
+    () =>
+      findings.map((f) => {
+        const o = triageOverrides[f.id]
+        return o ? { ...f, triageStatus: o.status, triageNote: o.note || undefined } : f
+      }),
+    [findings, triageOverrides],
+  )
+  const [faceted, setFaceted] = useState<Finding[]>(annotated)
   const [search, setSearch] = useState('')
   const [sortKey, setSortKey] = useState<SortKey>('statusCode')
   const [sortDir, setSortDir] = useState<1 | -1>(1)
   const [expanded, setExpanded] = useState<string | null>(null)
   const [checked, setChecked] = useState<Set<string>>(new Set())
   const [promoting, setPromoting] = useState(false)
+
+  // updateTriage applies immediately (so the dropdown/note feel instant)
+  // and rolls back if the save fails -- a finding's triage state otherwise
+  // has nowhere else to live client-side.
+  const updateTriage = async (f: Finding, status: TriageStatus, note: string) => {
+    setTriageOverrides((prev) => ({ ...prev, [f.id]: { status, note } }))
+    try {
+      await api.updateFindingTriage(f.id, status, note || undefined)
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : String(err), 'error')
+      setTriageOverrides((prev) => {
+        const next = { ...prev }
+        delete next[f.id]
+        return next
+      })
+    }
+  }
 
   const rows = useMemo(() => {
     const needle = search.trim().toLowerCase()
@@ -175,7 +228,7 @@ export function ResultsTable({
 
   const facetBar = (
     <FacetFilterBar
-      items={findings}
+      items={annotated}
       dimensions={FINDING_DIMENSIONS}
       onChange={setFaceted}
       restrictStatusByDefault
@@ -247,7 +300,8 @@ export function ResultsTable({
                         { label: 'Send to JWT Scanner', onSelect: () => sendToJwtScanner(f.url) },
                         { label: 'Send to Probe', onSelect: () => sendToProbe(f.url) },
                         { label: 'Send to Secret Scanner', onSelect: () => sendToSecretScan(f.url) },
-                        { label: 'Send to Repeater', onSelect: () => sendToRepeater(f.url, f.method || 'GET') },
+                        { label: 'Send to 403 Bypass', onSelect: () => sendToBypass403(f.url) },
+                        { label: 'Send to Tester', onSelect: () => sendToTester(f.url, f.method || 'GET', f.headers) },
                         'separator',
                         { label: isExpanded ? 'Collapse details' : 'Expand details', onSelect: () => setExpanded(isExpanded ? null : key) },
                       ])
@@ -289,11 +343,24 @@ export function ResultsTable({
                     <td className="px-3 py-1.5 text-neutral-400">{f.words}</td>
                     <td className="px-3 py-1.5 text-neutral-400">{f.lines}</td>
                     <td className="px-3 py-1.5 text-neutral-500">{f.sourceTool}</td>
+                    <td className="px-3 py-1.5" onClick={(e) => e.stopPropagation()}>
+                      <select
+                        value={f.triageStatus in TRIAGE_META ? f.triageStatus : 'new'}
+                        onChange={(e) => updateTriage(f, e.target.value as TriageStatus, f.triageNote ?? '')}
+                        className={`rounded border px-1.5 py-0.5 text-[11px] font-medium outline-none ${triageMetaOf(f.triageStatus).cls}`}
+                      >
+                        {(Object.keys(TRIAGE_META) as TriageStatus[]).map((s) => (
+                          <option key={s} value={s}>
+                            {TRIAGE_META[s].label}
+                          </option>
+                        ))}
+                      </select>
+                    </td>
                   </tr>
                   {isExpanded && (
                     <tr className="border-b border-neutral-900 bg-neutral-950/60">
                       <td colSpan={COLUMNS.length + extraCols} className="px-3 py-3">
-                        <FindingDetail finding={f} />
+                        <FindingDetail finding={f} onTriageChange={(note) => updateTriage(f, f.triageStatus, note)} />
                       </td>
                     </tr>
                   )}
@@ -335,8 +402,14 @@ export function ResultsTable({
 // Headers/redirect target are only present for tools that surface them
 // (currently feroxbuster; ffuf's live text output doesn't carry headers),
 // so those sections just don't render for a finding that has none.
-function FindingDetail({ finding: f }: { finding: Finding }) {
+function FindingDetail({ finding: f, onTriageChange }: { finding: Finding; onTriageChange: (note: string) => void }) {
   const headerEntries = f.headers ? Object.entries(f.headers) : []
+  const [note, setNote] = useState(f.triageNote ?? '')
+  // The note field is uncontrolled from the server's perspective until
+  // Save is pressed -- resync it whenever a different finding's row (or an
+  // update from elsewhere, e.g. a status-only edit) hands this a new value.
+  useEffect(() => setNote(f.triageNote ?? ''), [f.id, f.triageNote])
+
   return (
     <div className="flex flex-col gap-3 font-mono text-xs">
       <div className="flex items-center gap-2">
@@ -351,6 +424,12 @@ function FindingDetail({ finding: f }: { finding: Finding }) {
         >
           Open ↗
         </a>
+        <button
+          onClick={() => sendToTester(f.url, f.method || 'GET', f.headers)}
+          className="shrink-0 rounded border border-neutral-700 px-1.5 py-0.5 text-neutral-300 hover:border-sky-500 hover:text-sky-400"
+        >
+          Send to Tester
+        </button>
       </div>
       <div className="grid grid-cols-2 gap-x-6 gap-y-1 sm:grid-cols-3">
         <DetailField label="Method" value={f.method || 'GET'} />
@@ -375,6 +454,23 @@ function FindingDetail({ finding: f }: { finding: Finding }) {
           </div>
         </div>
       )}
+      <div onClick={(e) => e.stopPropagation()}>
+        <p className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-neutral-500">Triage note</p>
+        <textarea
+          value={note}
+          onChange={(e) => setNote(e.target.value)}
+          rows={2}
+          placeholder="Why this is/isn't a real finding, follow-up needed, ..."
+          className="w-full rounded border border-neutral-700 bg-neutral-950 px-2 py-1 font-sans text-xs text-neutral-200 outline-none focus:border-sky-500"
+        />
+        <button
+          onClick={() => onTriageChange(note)}
+          disabled={note === (f.triageNote ?? '')}
+          className="mt-1 rounded border border-neutral-700 px-2 py-0.5 text-[11px] text-neutral-300 hover:border-sky-500 hover:text-sky-400 disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          Save note
+        </button>
+      </div>
     </div>
   )
 }

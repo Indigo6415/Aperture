@@ -1,44 +1,50 @@
 package probescan
 
-import "context"
+import (
+	"context"
+	"strings"
+)
 
-// sensitiveFilesModule ports modules/exposed_sensitive_files.py: env files,
-// config backups, dependency manifests, database dumps, and private keys.
+// sensitiveFilesModule ports modules/exposed_sensitive_files.py: environment
+// files, config backups, database dumps, private keys, and credential files.
+// Dependency manifests live in devArtifactsModule so the same file is never
+// reported twice. Every check here must parse the file it claims to find.
 var sensitiveFilesModule = moduleDef{
 	id:       "sensitive_files",
 	name:     "Sensitive files",
 	severity: "high",
 	run: func(ctx context.Context, t *Target, c *probeClient) []Finding {
-		checks := []pathCheck{
-			{"/.env", "Environment file", containsCase("=")},
-			{"/.env.backup", "Environment backup file", containsCase("=")},
-			{"/.env.local", "Local environment file", containsCase("=")},
-			{"/.env.production", "Production environment file", containsCase("=")},
-			{"/.env.staging", "Staging environment file", containsCase("=")},
-			{"/web.config", "IIS web config", containsAny("<configuration>")},
-			{"/.htpasswd", "Apache password file", containsCase(":")},
-			{"/wp-config.php.bak", "WordPress config backup", containsCase("DB_")},
-			{"/config.php.bak", "PHP config backup", nonEmptyBody},
-			{"/database.yml", "Rails database config", containsCase("adapter:")},
-			{"/config/database.yml", "Rails database config", containsCase("adapter:")},
-			{"/composer.json", "PHP composer manifest", containsCase("require")},
-			{"/composer.lock", "PHP composer lockfile", containsCase("packages")},
-			{"/package.json", "Node.js package manifest", containsCase("dependencies")},
-			{"/Gemfile", "Ruby Gemfile", containsCase("gem ")},
-			{"/requirements.txt", "Python requirements file", nonEmptyBody},
-			{"/backup.sql", "SQL database dump", containsCase("INSERT", "CREATE")},
-			{"/dump.sql", "SQL database dump", containsCase("INSERT", "CREATE")},
-			{"/db.sql", "SQL database dump", containsCase("INSERT", "CREATE")},
-			{"/backup.zip", "Backup archive", bodyPrefix([]byte("PK\x03\x04"))},
-			{"/backup.tar.gz", "Backup archive", bodyPrefix([]byte("\x1f\x8b"))},
-			{"/.ssh/id_rsa", "Private SSH key", containsCase("PRIVATE KEY")},
-			{"/.ssh/id_ed25519", "Private SSH key", containsCase("PRIVATE KEY")},
-			{"/id_rsa", "Private SSH key", containsCase("PRIVATE KEY")},
-			{"/.aws/credentials", "AWS credentials file", containsAny("aws_access_key")},
-			{"/.DS_Store", "macOS DS_Store file", bodyPrefix([]byte{0, 0, 0, 1})},
-			{"/.vscode/settings.json", "VSCode settings", containsCase("{")},
-			{"/.idea/workspace.xml", "JetBrains workspace file", containsAny("<project")},
+		strong := []pathCheck{
+			{"/.env", "Environment file", validDotEnv},
+			{"/.env.backup", "Environment backup file", validDotEnv},
+			{"/.env.local", "Local environment file", validDotEnv},
+			{"/.env.production", "Production environment file", validDotEnv},
+			{"/.env.staging", "Staging environment file", validDotEnv},
+			{"/web.config", "IIS web config", validXMLRoot("configuration")},
+			{"/.htpasswd", "Apache password file", validHtpasswd},
+			{"/wp-config.php.bak", "WordPress config backup", func(r *httpResult) bool {
+				return validPHPSource(r) && strings.Contains(r.Text, "DB_PASSWORD")
+			}},
+			{"/config.php.bak", "PHP config backup", validPHPSource},
+			{"/database.yml", "Rails database config", validYAMLKey("adapter")},
+			{"/config/database.yml", "Rails database config", validYAMLKey("adapter")},
+			{"/backup.sql", "SQL database dump", validSQLDump},
+			{"/dump.sql", "SQL database dump", validSQLDump},
+			{"/db.sql", "SQL database dump", validSQLDump},
+			{"/backup.zip", "Backup archive", validZip},
+			{"/backup.tar.gz", "Backup archive", validTarGz},
+			{"/.ssh/id_rsa", "Private SSH key", validPEMPrivate},
+			{"/.ssh/id_ed25519", "Private SSH key", validPEMPrivate},
+			{"/id_rsa", "Private SSH key", validPEMPrivate},
+			{"/.aws/credentials", "AWS credentials file", validAWSCredentials},
+			{"/.DS_Store", "macOS DS_Store file", validDSStore},
 		}
-		return runPathChecks(ctx, c, t.URL, checks, false, "exposed at")
+		return runFileChecks(ctx, c, t.URL, strong, ConfidenceConfirmed)
 	},
+}
+
+// validAWSCredentials requires an INI file with at least one profile header
+// and an access key assignment, the shape of ~/.aws/credentials.
+func validAWSCredentials(r *httpResult) bool {
+	return validINIMatch(`\[[^\]]+\]`)(r) && strings.Contains(r.Text, "aws_access_key_id")
 }

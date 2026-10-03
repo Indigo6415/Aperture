@@ -2,6 +2,7 @@ package jwtscan
 
 import (
 	"fmt"
+	"github.com/Indigo6415/Aperture/internal/scanprogress"
 	"strings"
 )
 
@@ -15,6 +16,8 @@ type ScanRequest struct {
 	ExtraHeaders map[string]string
 	PubKeyPEM    string   // enables the RS256->HS256 confusion test
 	ExtraSecrets []string // extends the built-in weak-secret wordlist
+	// Progress, when set, receives one check per test as it runs. Nil means nobody is watching.
+	Progress scanprogress.Reporter `json:"-"`
 }
 
 // Baseline records the two reference requests every test's hit/miss
@@ -44,15 +47,23 @@ type ScanResponse struct {
 	// actually ran, after applying maxSecretAttempts -- shown in the UI so
 	// a truncated custom wordlist isn't mistaken for a full run.
 	SecretsTried int `json:"secretsTried"`
+	// Advisories are judgments that need no request to make: unsigned algorithms,
+	// missing or long expiry, client-controlled key references, and baselines
+	// that the server answers inconsistently.
+	Advisories []string `json:"advisories,omitempty"`
 }
 
 // RunScan parses req.Token, establishes baselines against req.URL, then
-// runs every misconfiguration test against it. Returns an error only when
-// the scan itself can't proceed at all (bad token, unreachable target, or a
-// token that the target doesn't even accept) -- once running, every
-// individual test failing to find anything is a normal ScanResponse result,
-// not an error.
-func RunScan(req ScanRequest) (*ScanResponse, error) {
+// runs every misconfiguration test against it, plus the kid-SSRF/jku/x5u
+// tests in oob.go when oob names an operator-picked callback server (see
+// OOBConfig -- the zero value just reports those three as skipped). Returns
+// an error only when the scan itself can't proceed at all (bad token,
+// unreachable target, or a token that the target doesn't even accept) --
+// once running, every individual test failing to find anything is a normal
+// ScanResponse result, not an error.
+func RunScan(req ScanRequest, oob OOBConfig) (*ScanResponse, error) {
+	rep := scanprogress.Or(req.Progress)
+
 	header, payload, _, err := ParseJWT(req.Token)
 	if err != nil {
 		return nil, fmt.Errorf("cannot parse JWT: %w", err)
@@ -64,7 +75,7 @@ func RunScan(req ScanRequest) (*ScanResponse, error) {
 	}
 	client := newHTTPClient()
 
-	okResp, err := probe(client, req.URL, req.Token, method, req.Cookie, req.ExtraHeaders)
+	okResp, okStatuses, err := sampleBaseline(client, req.URL, req.Token, method, req.Cookie, req.ExtraHeaders)
 	if err != nil {
 		return nil, fmt.Errorf("could not reach target with the provided token: %w", err)
 	}
@@ -75,15 +86,29 @@ func RunScan(req ScanRequest) (*ScanResponse, error) {
 		)
 	}
 
-	failResp, err := probe(client, req.URL, invalidBaselineToken, method, req.Cookie, req.ExtraHeaders)
+	failResp, failStatuses, err := sampleBaseline(client, req.URL, invalidBaselineToken, method, req.Cookie, req.ExtraHeaders)
 	if err != nil {
 		return nil, fmt.Errorf("baseline invalid-token request failed: %w", err)
 	}
+	// A baseline whose status changes between samples is not a stable yardstick,
+	// so every verdict drawn from it is weaker and the response says so.
+	var advisories []string
+	if !allSame(okStatuses) || !allSame(failStatuses) {
+		advisories = append(advisories, "The server answered the same request with different status codes across samples; treat every verdict as weaker.")
+	}
+	advisories = append(advisories, offlineAdvisories(header, payload)...)
 
 	ctx := &scanCtx{
 		client: client, url: req.URL, method: method, cookie: req.Cookie,
 		headers: req.ExtraHeaders, header: header, payload: payload,
 		ok: okResp, fail: failResp,
+		rawToken: req.Token,
+	}
+	// Identity markers: values from the real token that the valid response
+	// actually shows. Only those can tell an accepted forged token from a rejected one.
+	ctx.markers = presentIn(okResp.Body, identityMarkers(payload))
+	if len(ctx.markers) == 0 {
+		advisories = append(advisories, "No identity claim (sub, email, username, ...) appears in the valid response, so forged-token acceptance cannot be verified and token-acceptance tests report nothing.")
 	}
 
 	secrets := make([]string, 0, len(weakSecrets)+len(req.ExtraSecrets))
@@ -106,7 +131,24 @@ func RunScan(req ScanRequest) (*ScanResponse, error) {
 		secrets = append(secrets, s)
 	}
 
+	// Every test is one progress check. The three out-of-band tests run as one
+	// batch, so they are planned together here and finished from their results.
+	rep.Plan(
+		scanprogress.Check{ID: "alg_none", Label: "alg=none"},
+		scanprogress.Check{ID: "empty_sig", Label: "Empty signature"},
+		scanprogress.Check{ID: "weak_secret", Label: "Weak signing secret"},
+		scanprogress.Check{ID: "jwk_injection", Label: "jwk header injection"},
+		scanprogress.Check{ID: "kid_injection", Label: "kid header injection"},
+		scanprogress.Check{ID: "claim_tampering", Label: "Claim tampering"},
+		scanprogress.Check{ID: "rs256_hs256", Label: "RS256 to HS256 confusion"},
+		scanprogress.Check{ID: "kid_ssrf", Label: "kid Header SSRF"},
+		scanprogress.Check{ID: "jku_injection", Label: "jku Header Injection"},
+		scanprogress.Check{ID: "x5u_injection", Label: "x5u Header Injection"},
+	)
+
+	rep.Start("weak_secret")
 	weakResult, cracked := ctx.testWeakSecret(secrets)
+	rep.Done("weak_secret", vulnerableCount(weakResult), nil)
 
 	// Auto-discovery only makes sense for an RSA-signed source token (there's
 	// no RS256 public key to find otherwise) and never overrides a key the
@@ -129,18 +171,51 @@ func RunScan(req ScanRequest) (*ScanResponse, error) {
 			Identical:     okResp.StatusCode == failResp.StatusCode && okResp.Length == failResp.Length,
 		},
 		SecretsTried: len(secrets),
-		Results: []TestResult{
-			ctx.testAlgNone(),
-			ctx.testEmptySig(),
+		Advisories:   advisories,
+		Results: append([]TestResult{
+			track(rep, "alg_none", ctx.testAlgNone),
+			track(rep, "empty_sig", ctx.testEmptySig),
 			weakResult,
-			ctx.testJWKInjection(),
-			ctx.testKidInjection(),
-			ctx.testClaimTampering(cracked),
-			ctx.testRS256HS256(req.PubKeyPEM, discoveredKey),
-		},
+			track(rep, "jwk_injection", ctx.testJWKInjection),
+			track(rep, "kid_injection", ctx.testKidInjection),
+			track(rep, "claim_tampering", func() TestResult { return ctx.testClaimTampering(cracked) }),
+			track(rep, "rs256_hs256", func() TestResult { return ctx.testRS256HS256(req.PubKeyPEM, discoveredKey) }),
+		}, trackOOB(rep, ctx, oob)...),
 	}
 	if cracked != nil {
 		resp.CrackedSecret = *cracked
 	}
 	return resp, nil
+}
+
+// track runs one test as a progress check: its square reads as testing while
+// the test runs, and finishes counting a finding when the test reports the
+// target vulnerable.
+func track(rep scanprogress.Reporter, id string, run func() TestResult) TestResult {
+	rep.Start(id)
+	r := run()
+	rep.Done(id, vulnerableCount(r), nil)
+	return r
+}
+
+// trackOOB runs the out-of-band tests as one batch and finishes each of their
+// checks from its own result.
+func trackOOB(rep scanprogress.Reporter, ctx *scanCtx, oob OOBConfig) []TestResult {
+	for _, id := range []string{"kid_ssrf", "jku_injection", "x5u_injection"} {
+		rep.Start(id)
+	}
+	results := runOOBTests(ctx, oob)
+	for _, r := range results {
+		rep.Done(r.ID, vulnerableCount(r), nil)
+	}
+	return results
+}
+
+// vulnerableCount is 1 when a test reports the target vulnerable, 0 otherwise.
+// It's the finding count a progress check reports for that test.
+func vulnerableCount(r TestResult) int {
+	if r.Status == StatusVulnerable {
+		return 1
+	}
+	return 0
 }

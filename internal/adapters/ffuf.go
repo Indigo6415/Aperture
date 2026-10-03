@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Indigo6415/Aperture/internal/fingerprint"
 	"github.com/Indigo6415/Aperture/internal/model"
 	"github.com/Indigo6415/Aperture/internal/wordlists"
 )
@@ -102,6 +103,10 @@ type FFufConfig struct {
 	AutoCalibrate   bool              `json:"autoCalibrate,omitempty"`   // ffuf -ac: filter out responses matching a baseline probed with randomized input -- essential for vhost fuzzing, where the default vhost answers every Host header near-identically
 	FollowRedirects bool              `json:"followRedirects,omitempty"` // ffuf -r
 	ExtraArgs       []string          `json:"extraArgs,omitempty"`
+	// DisableCatchAllFilter turns off the default filtering of responses that
+	// match the host's soft-404 page. Set it when the catch-all itself is the
+	// thing being investigated.
+	DisableCatchAllFilter bool `json:"disableCatchAllFilter,omitempty"`
 }
 
 // fuzzHeader returns the name of the first header whose value contains the
@@ -155,6 +160,16 @@ func (a *FFufAdapter) Run(ctx context.Context, config json.RawMessage, meta RunM
 				u.Host = host
 				return u.String()
 			}
+		}
+	}
+
+	// Responses that match the host's catch-all page are filtered after the run
+	// instead of being reported as discoveries. A profile that is not stable is
+	// not used, so real content is never hidden on an inconsistent host.
+	var catchAll *fingerprint.Profile
+	if !cfg.DisableCatchAllFilter && !headerHasFuzz {
+		if p := buildCatchAll(ctx, cfg.URL, cfg.Headers); p != nil && p.Stable {
+			catchAll = p
 		}
 	}
 
@@ -273,6 +288,9 @@ func (a *FFufAdapter) Run(ctx context.Context, config json.RawMessage, meta RunM
 		}
 		status, _ := strconv.Atoi(m[2])
 		size, _ := strconv.Atoi(m[3])
+		if catchAll.MatchesSize(status, size) {
+			continue
+		}
 		words, _ := strconv.Atoi(m[4])
 		lines, _ := strconv.Atoi(m[5])
 		emit(model.Finding{

@@ -10,13 +10,30 @@ import "regexp"
 type Pattern struct {
 	Name  string
 	Regex *regexp.Regexp
+	// Engine identifies which pattern library this entry came from -- "core"
+	// for this file's own conservative set, "secretfinder" for the
+	// SecretFinderPatterns ported in patterns_secretfinder.go. Carried
+	// through to Match.Engine so the UI can badge which engine flagged a
+	// given result.
+	Engine string
+	// Public marks keys that are designed to ship in client-side code
+	// (publishable payment keys, browser map keys). They are reported at
+	// informational level, not as leaked secrets.
+	Public bool
 }
 
 // mp ("make pattern") panics on an invalid regex -- every entry below is a
 // compile-time constant, so a typo is a bug to catch immediately, not a
 // runtime error to handle.
 func mp(name, pattern string) Pattern {
-	return Pattern{Name: name, Regex: regexp.MustCompile(pattern)}
+	return Pattern{Name: name, Regex: regexp.MustCompile(pattern), Engine: "core"}
+}
+
+// mpPublic is mp for a key format that is public by design.
+func mpPublic(name, pattern string) Pattern {
+	p := mp(name, pattern)
+	p.Public = true
+	return p
 }
 
 // Patterns is the full library scanText matches every page/script against.
@@ -35,7 +52,9 @@ var Patterns = []Pattern{
 	mp("AWS Session Token", `(?i)aws_session_token["']?\s*[:=]\s*["']([A-Za-z0-9/+=]{100,})["']`),
 
 	// --- Google / Firebase / GCP ---
-	mp("Google API Key", `\bAIza[0-9A-Za-z_\-]{35}\b`),
+	// Browser API keys are commonly shipped in client code and restricted by
+	// referrer, so they are informational unless the caller proves otherwise.
+	mpPublic("Google API Key", `\bAIza[0-9A-Za-z_\-]{35}\b`),
 	mp("Google OAuth Access Token", `\bya29\.[0-9A-Za-z\-_]+\b`),
 	mp("Google OAuth Refresh Token", `\b1//[0-9A-Za-z\-_]{35,}\b`),
 	mp("Firebase Cloud Messaging Key", `\bAAAA[A-Za-z0-9_-]{7}:[A-Za-z0-9_-]{140}\b`),
@@ -74,7 +93,7 @@ var Patterns = []Pattern{
 
 	// --- Payments ---
 	mp("Stripe Live Secret Key", `\bsk_live_[0-9a-zA-Z]{24,}\b`),
-	mp("Stripe Live Publishable Key", `\bpk_live_[0-9a-zA-Z]{24,}\b`),
+	mpPublic("Stripe Live Publishable Key", `\bpk_live_[0-9a-zA-Z]{24,}\b`),
 	mp("Stripe Restricted Key", `\brk_live_[0-9a-zA-Z]{24,}\b`),
 	mp("PayPal Braintree Access Token", `access_token\$production\$[0-9a-z]{16}\$[0-9a-f]{32}`),
 	mp("Square Access Token", `\bsq0atp-[0-9A-Za-z\-_]{22}\b`),

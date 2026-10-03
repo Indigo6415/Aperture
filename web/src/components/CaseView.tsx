@@ -1,36 +1,54 @@
 import { useEffect, useRef, useState, type ReactElement, type SVGProps } from 'react'
 import { api, watchJob } from '../api'
-import type { Case, CaseScan, Check, CheckKind, Credential, Finding, Job, JobOptions, JobOptionsPreset, NodeStatus, RunStatus, Target, Tool } from '../types'
+import type { Case, Check, CheckKind, CookieVaultEntry, Credential, Finding, Job, JobOptions, JobOptionsPreset, NodeStatus, RunStatus, Target, TargetList, TargetListKind, TargetPingResult, Tool } from '../types'
 import { JOB_PRESETS } from '../presets'
 import { statusHexColor } from '../statusColor'
 import { estimateEtaSeconds } from '../eta'
 import { ResultsTable } from './ResultsTable'
+import { NucleiResults } from './NucleiResults'
 import { TargetProgressPanel, type TargetProgress } from './TargetProgressPanel'
-import { GraphView } from './GraphView'
 import { TechTable } from './TechTable'
 import { JwtScan } from './JwtScan'
 import { Probe } from './Probe'
+import { DomainScan } from './DomainScan'
 import { SecretScan } from './SecretScan'
-import { Repeater } from './Repeater'
+import { BreachCheck } from './BreachCheck'
+import { Bypass403 } from './Bypass403'
+import { PwReset } from './PwReset'
+import { GraphqlEnum } from './GraphqlEnum'
+import { ApiEnum } from './ApiEnum'
+import { Cors } from './Cors'
+import { OpenRedirect } from './OpenRedirect'
+import { Ssrf } from './Ssrf'
+import { Csrf } from './Csrf'
+import { SstiScan } from './SstiScan'
+import { XssScan } from './XssScan'
+import { Tester } from './Tester'
+import { Collaborator } from './Collaborator'
 import { FfufTab } from './Ffuf'
 import { JobHistory } from './JobHistory'
 import { TargetPicker } from './TargetPicker'
+import { SaveToListModal } from './SaveToListModal'
+import { TARGET_LIST_KINDS, TARGET_LIST_KIND_LABELS, TARGET_LIST_KIND_PLACEHOLDERS } from '../targetListKinds'
 import { copyToClipboard, useContextMenu } from '../contextMenu'
 import { showToast } from '../toast'
 import { sendToJwtScanner, onJwtScannerRequest, type JwtScannerRequest } from '../jwtHandoff'
 import { sendToProbe, onProbeRequest, type ProbeRequest } from '../probeHandoff'
 import { sendToSecretScan, onSecretScanRequest, type SecretScanRequest } from '../secretScanHandoff'
-import { sendToRepeater, onRepeaterRequest, type RepeaterHandoffRequest } from '../repeaterHandoff'
+import { sendToBypass403, onBypass403Request, type Bypass403HandoffRequest } from '../bypass403Handoff'
+import { sendToTester, onTesterRequest, type TesterHandoffRequest } from '../testerHandoff'
 import { CollapsibleFormPanel } from './CollapsibleFormPanel'
 import { useAutoCollapseOnce, useAutoExpandOnce, useCollapsible } from '../collapsible'
 import { CredentialVault } from './CredentialVault'
 import { CredentialPicker } from './CredentialPicker'
-import { ActivityTimeline } from './ActivityTimeline'
-import { RiskPanel } from './RiskPanel'
+import { CookieVault } from './CookieVault'
 import { JobTemplatePicker } from './JobTemplatePicker'
 import {
   IconActivity,
-  IconChart,
+  IconBraces,
+  IconBug,
+  IconCode,
+  IconCookie,
   IconCrosshair,
   IconFolder,
   IconFolderSearch,
@@ -38,13 +56,17 @@ import {
   IconKey,
   IconLightning,
   IconLock,
+  IconMailQuestion,
   IconRadar,
   IconRepeat,
+  IconRouteTree,
   IconScan,
+  IconSend,
   IconServer,
   IconShieldKey,
   IconSitemap,
   IconTarget,
+  IconUnlock,
   IconWarning,
   IconWrench,
 } from './icons'
@@ -76,46 +98,64 @@ function keyFor(target: string, kind: CheckKind): string {
 type Tab =
   | 'targets'
   | 'credentials'
+  | 'cookieVault'
   | 'identify'
-  | 'risk'
   | 'feroxbuster'
   | 'ffuf-subdomain'
   | 'ffuf-vhost'
   | 'ffuf-custom'
   | 'subfinder'
-  | 'amass'
   | 'katana'
-  | 'httpx'
-  | 'whatweb'
-  | 'graph'
+  | 'nuclei'
   | 'jwtscan'
   | 'probe'
+  | 'domainscan'
   | 'secrets'
-  | 'repeater'
-  | 'activity'
+  | 'breach'
+  | 'bypass403'
+  | 'pwreset'
+  | 'graphqlenum'
+  | 'apienum'
+  | 'corsscan'
+  | 'openredirect'
+  | 'ssrf'
+  | 'csrf'
+  | 'sstiscan'
+  | 'xss'
+  | 'tester'
+  | 'collaborator'
 
 type IconType = (props: SVGProps<SVGSVGElement>) => ReactElement
 
 const TAB_META: Record<Tab, { label: string; icon: IconType }> = {
   targets: { label: 'Targets', icon: IconTarget },
   credentials: { label: 'Credentials', icon: IconKey },
+  cookieVault: { label: 'Cookie Vault', icon: IconCookie },
   identify: { label: 'Identify', icon: IconRadar },
   feroxbuster: { label: 'Directory Scanner', icon: IconFolderSearch },
   'ffuf-subdomain': { label: 'Subdomain Scanner', icon: IconGlobe },
   'ffuf-vhost': { label: 'VHost Scanner', icon: IconServer },
   'ffuf-custom': { label: 'FFuF', icon: IconLightning },
   subfinder: { label: 'Subfinder', icon: IconGlobe },
-  amass: { label: 'Amass', icon: IconSitemap },
   katana: { label: 'Katana Crawler', icon: IconFolder },
-  httpx: { label: 'Httpx Prober', icon: IconServer },
-  whatweb: { label: 'WhatWeb', icon: IconChart },
+  nuclei: { label: 'Nuclei', icon: IconWarning },
   jwtscan: { label: 'JWT Scanner', icon: IconShieldKey },
   probe: { label: 'Probe', icon: IconCrosshair },
+  domainscan: { label: 'Domain Scan', icon: IconBug },
   secrets: { label: 'Secrets', icon: IconLock },
-  repeater: { label: 'Repeater', icon: IconRepeat },
-  risk: { label: 'Risk', icon: IconWarning },
-  graph: { label: 'Graph', icon: IconSitemap },
-  activity: { label: 'Activity', icon: IconActivity },
+  breach: { label: 'Breach Check', icon: IconKey },
+  bypass403: { label: '403 Bypass', icon: IconUnlock },
+  pwreset: { label: 'Password Reset Scanner', icon: IconMailQuestion },
+  graphqlenum: { label: 'GraphQL Enumeration', icon: IconBraces },
+  apienum: { label: 'API Enumerator', icon: IconRouteTree },
+  corsscan: { label: 'CORS Scanner', icon: IconGlobe },
+  openredirect: { label: 'Open Redirect', icon: IconRepeat },
+  ssrf: { label: 'SSRF Scanner', icon: IconServer },
+  csrf: { label: 'CSRF Sweep', icon: IconSitemap },
+  sstiscan: { label: 'SSTI Scanner', icon: IconBraces },
+  xss: { label: 'XSS Scanner', icon: IconCode },
+  tester: { label: 'Tester', icon: IconSend },
+  collaborator: { label: 'Collaborator', icon: IconActivity },
 }
 
 // NAV_GROUPS is the left navbar's shape: case-management tabs pinned above
@@ -127,7 +167,7 @@ const TAB_META: Record<Tab, { label: string; icon: IconType }> = {
 // the `navGroupOpen` state below.
 type NavGroup = { id: string; label: string; icon: IconType; tabs: Tab[] }
 
-const PINNED_TABS: Tab[] = ['targets', 'credentials']
+const PINNED_TABS: Tab[] = ['targets', 'credentials', 'cookieVault']
 
 const NAV_GROUPS: NavGroup[] = [
   { id: 'identify', label: 'Identify', icon: IconRadar, tabs: ['identify'] },
@@ -135,23 +175,51 @@ const NAV_GROUPS: NavGroup[] = [
     id: 'scanners',
     label: 'Scanners',
     icon: IconScan,
-    tabs: ['feroxbuster', 'ffuf-subdomain', 'ffuf-vhost', 'subfinder', 'amass', 'katana'],
+    tabs: ['feroxbuster', 'ffuf-subdomain', 'ffuf-vhost', 'subfinder', 'katana', 'nuclei'],
   },
-  { id: 'tools', label: 'Tools', icon: IconWrench, tabs: ['ffuf-custom', 'httpx', 'whatweb', 'jwtscan', 'probe', 'secrets', 'repeater'] },
-  { id: 'intelligence', label: 'Intelligence', icon: IconChart, tabs: ['risk', 'graph', 'activity'] },
+  {
+    id: 'tools',
+    label: 'Tools',
+    icon: IconWrench,
+    tabs: [
+      'ffuf-custom',
+      'jwtscan',
+      'probe',
+      'domainscan',
+      'secrets',
+      'breach',
+      'bypass403',
+      'pwreset',
+      'graphqlenum',
+      'apienum',
+      'corsscan',
+      'openredirect',
+      'ssrf',
+      'csrf',
+      'sstiscan',
+      'xss',
+      'tester',
+      'collaborator',
+    ],
+  },
 ]
 
 // CaseView is one case's workspace: a left navbar switching between Targets,
-// Identify, each scanning tool, and the Graph, each rendered as its own tab
+// Identify, and each scanning tool, each rendered as its own tab
 // so the user can see how each tool is doing independently. Every tool tab
 // only ever runs when the user launches it from that tab's JobLauncher --
 // nothing here starts anything on its own.
 export function CaseView({ caseId }: { caseId: string }) {
   const [c, setCase] = useState<Case | null>(null)
   const [targets, setTargets] = useState<Target[]>([])
+  const [targetLists, setTargetLists] = useState<TargetList[]>([])
+  // Set whenever a tool result (or a discovered subdomain) is being saved
+  // to the case from outside the Targets tab -- opens SaveToListModal to
+  // ask which list it should go into. See promoteFromTool/confirmPromote.
+  const [pendingPromote, setPendingPromote] = useState<{ values: string[]; save: (listId: string) => Promise<void> } | null>(null)
   const [credentials, setCredentials] = useState<Credential[]>([])
+  const [cookieVault, setCookieVault] = useState<CookieVaultEntry[]>([])
   const [jobs, setJobs] = useState<Job[]>([])
-  const [caseScans, setCaseScans] = useState<CaseScan[]>([])
   const [checks, setChecks] = useState<Record<string, Check>>({})
   const [runFindings, setRunFindings] = useState<Record<string, Finding[]>>({}) // keyed by jobId
   const [jobStatus, setJobStatus] = useState<Record<string, RunStatus>>({}) // keyed by jobId, overrides job.status once live events arrive
@@ -167,7 +235,7 @@ export function CaseView({ caseId }: { caseId: string }) {
   // 12rem sidebar -- persisted like every other collapse toggle in this file.
   const [navOpen, setNavOpen] = useCollapsible('caseNav', true)
   // Set by a "Send to JWT Scanner" context-menu item anywhere in this case
-  // (Targets list, tool results, graph/hierarchy nodes -- see
+  // (Targets list, tool results -- see
   // jwtHandoff.ts); JwtScan applies it even though it stays mounted the
   // whole time this case is open.
   const [jwtPrefill, setJwtPrefill] = useState<JwtScannerRequest | undefined>()
@@ -177,8 +245,12 @@ export function CaseView({ caseId }: { caseId: string }) {
   // Set by a "Send to Secret Scanner" context-menu item -- see
   // secretScanHandoff.ts.
   const [secretScanPrefill, setSecretScanPrefill] = useState<SecretScanRequest | undefined>()
-  // Set by a "Send to Repeater" context-menu item -- see repeaterHandoff.ts.
-  const [repeaterPrefill, setRepeaterPrefill] = useState<RepeaterHandoffRequest | undefined>()
+  // Set by a "Send to 403 Bypass" context-menu item -- see
+  // bypass403Handoff.ts.
+  const [bypass403Prefill, setBypass403Prefill] = useState<Bypass403HandoffRequest | undefined>()
+  // Set by a "Send to Tester" context-menu item anywhere in this case
+  // (any scanner's findings, a raw target/URL) -- see testerHandoff.ts.
+  const [testerPrefill, setTesterPrefill] = useState<TesterHandoffRequest | undefined>()
 
   // Only one case is ever open at a time, so this subscription always
   // targets whichever case is currently visible -- no need to key it by
@@ -205,9 +277,16 @@ export function CaseView({ caseId }: { caseId: string }) {
   }, [])
 
   useEffect(() => {
-    return onRepeaterRequest((req) => {
-      setRepeaterPrefill(req)
-      setTab('repeater')
+    return onBypass403Request((req) => {
+      setBypass403Prefill(req)
+      setTab('bypass403')
+    })
+  }, [])
+
+  useEffect(() => {
+    return onTesterRequest((req) => {
+      setTesterPrefill(req)
+      setTab('tester')
     })
   }, [])
 
@@ -246,9 +325,10 @@ export function CaseView({ caseId }: { caseId: string }) {
     let cancelled = false
     setCase(null)
     setTargets([])
+    setTargetLists([])
     setCredentials([])
+    setCookieVault([])
     setJobs([])
-    setCaseScans([])
     setChecks({})
     setRunFindings({})
     setJobStatus({})
@@ -265,8 +345,14 @@ export function CaseView({ caseId }: { caseId: string }) {
     api.listTargets(caseId).then((t) => {
       if (!cancelled) setTargets(t)
     })
+    api.listTargetLists(caseId).then((l) => {
+      if (!cancelled) setTargetLists(l)
+    })
     api.listCredentials(caseId).then((c) => {
       if (!cancelled) setCredentials(c)
+    })
+    api.listCookieVault(caseId).then((v) => {
+      if (!cancelled) setCookieVault(v)
     })
     api.listCaseChecks(caseId).then((list) => {
       if (cancelled) return
@@ -279,9 +365,6 @@ export function CaseView({ caseId }: { caseId: string }) {
       setJobs(js)
       for (const j of js) watchTheJob(j)
     })
-    api.listCaseScans(caseId).then((list) => {
-      if (!cancelled) setCaseScans(list)
-    })
 
     return () => {
       cancelled = true
@@ -293,20 +376,27 @@ export function CaseView({ caseId }: { caseId: string }) {
 
   const refreshTargets = () => {
     api.listTargets(caseId).then(setTargets)
+    // A new target can add a domain the cookie vault hasn't seen yet.
+    refreshCookieVault()
+  }
+
+  const refreshTargetLists = () => {
+    api.listTargetLists(caseId).then(setTargetLists)
+  }
+
+  const createTargetList = async (name: string, kind: TargetListKind) => {
+    const list = await api.createTargetList(caseId, name, kind)
+    refreshTargetLists()
+    return list
   }
 
   const refreshCredentials = () => {
     api.listCredentials(caseId).then(setCredentials)
   }
 
-  // Probe/JWT/Secret Scanner runs are one-shot actions with no live stream
-  // (unlike checks/findings above), so the Risk Panel's rollup of them is
-  // only ever as fresh as its last fetch -- refetched every time that tab
-  // is opened rather than polled continuously.
-  useEffect(() => {
-    if (tab === 'risk') api.listCaseScans(caseId).then(setCaseScans)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab, caseId])
+  const refreshCookieVault = () => {
+    api.listCookieVault(caseId).then(setCookieVault)
+  }
 
   const addJob = (job: Job) => {
     setJobs((prev) => [...prev, job])
@@ -340,16 +430,31 @@ export function CaseView({ caseId }: { caseId: string }) {
     }
   }
 
-  const promoteFromTool = async (tool: Tool, values: string[]) => {
+  // requestSaveTargets opens the "which list?" prompt for any save flow
+  // that isn't already inside a specific list tab (promoting tool results,
+  // saving discovered subdomains) -- save is called with the list the user
+  // picked (or just created) once they confirm.
+  const requestSaveTargets = (values: string[], save: (listId: string) => Promise<void>) => {
+    if (values.length === 0) return
+    setPendingPromote({ values, save })
+  }
+
+  // Left for SaveToListModal to catch and display inline -- no toast here,
+  // so a failed save leaves the modal open with the error instead of
+  // dismissing it silently.
+  const confirmPromote = async (listId: string) => {
+    if (!pendingPromote) return
+    await pendingPromote.save(listId)
+  }
+
+  const promoteFromTool = (tool: Tool, values: string[]) => {
     const latest = [...jobsOfTool(tool)].pop()
     if (!latest) return
-    try {
-      await api.promoteTargets(caseId, latest.id, values)
+    requestSaveTargets(values, async (listId) => {
+      await api.promoteTargets(caseId, latest.id, listId, values)
       showToast(`Saved ${values.length} target${values.length === 1 ? '' : 's'} to the case`, 'success')
       refreshTargets()
-    } catch (err) {
-      showToast(err instanceof Error ? err.message : String(err), 'error')
-    }
+    })
   }
 
   if (!c) {
@@ -366,18 +471,27 @@ export function CaseView({ caseId }: { caseId: string }) {
     'ffuf-vhost': jobsOfTool('ffuf-vhost').length === 0 ? STATUS_DOT.pending : jobsOfTool('ffuf-vhost').some((j) => statusOf(j) === 'running') ? STATUS_DOT.running : STATUS_DOT.done,
     'ffuf-custom': jobsOfTool('ffuf-custom').length === 0 ? STATUS_DOT.pending : jobsOfTool('ffuf-custom').some((j) => statusOf(j) === 'running') ? STATUS_DOT.running : STATUS_DOT.done,
     subfinder: jobsOfTool('subfinder').length === 0 ? STATUS_DOT.pending : jobsOfTool('subfinder').some((j) => statusOf(j) === 'running') ? STATUS_DOT.running : STATUS_DOT.done,
-    amass: jobsOfTool('amass').length === 0 ? STATUS_DOT.pending : jobsOfTool('amass').some((j) => statusOf(j) === 'running') ? STATUS_DOT.running : STATUS_DOT.done,
     katana: jobsOfTool('katana').length === 0 ? STATUS_DOT.pending : jobsOfTool('katana').some((j) => statusOf(j) === 'running') ? STATUS_DOT.running : STATUS_DOT.done,
-    httpx: jobsOfTool('httpx').length === 0 ? STATUS_DOT.pending : jobsOfTool('httpx').some((j) => statusOf(j) === 'running') ? STATUS_DOT.running : STATUS_DOT.done,
-    whatweb: jobsOfTool('whatweb').length === 0 ? STATUS_DOT.pending : jobsOfTool('whatweb').some((j) => statusOf(j) === 'running') ? STATUS_DOT.running : STATUS_DOT.done,
-    graph: STATUS_DOT.done,
+    nuclei: jobsOfTool('nuclei').length === 0 ? STATUS_DOT.pending : jobsOfTool('nuclei').some((j) => statusOf(j) === 'running') ? STATUS_DOT.running : STATUS_DOT.done,
     jwtscan: STATUS_DOT.done,
     probe: STATUS_DOT.done,
+    domainscan: STATUS_DOT.done,
     secrets: STATUS_DOT.done,
-    repeater: STATUS_DOT.done,
+    breach: STATUS_DOT.done,
+    bypass403: STATUS_DOT.done,
+    pwreset: STATUS_DOT.done,
+    graphqlenum: STATUS_DOT.done,
+    apienum: STATUS_DOT.done,
+    corsscan: STATUS_DOT.done,
+    openredirect: STATUS_DOT.done,
+    ssrf: STATUS_DOT.done,
+    csrf: STATUS_DOT.done,
+    sstiscan: STATUS_DOT.done,
+    xss: STATUS_DOT.done,
+    tester: STATUS_DOT.done,
+    collaborator: STATUS_DOT.done,
     credentials: STATUS_DOT.done,
-    risk: STATUS_DOT.done,
-    activity: STATUS_DOT.done,
+    cookieVault: STATUS_DOT.done,
   }
   const counts: Record<Tab, number | null> = {
     targets: targets.length,
@@ -387,18 +501,27 @@ export function CaseView({ caseId }: { caseId: string }) {
     'ffuf-vhost': findingsOfTool('ffuf-vhost').length,
     'ffuf-custom': findingsOfTool('ffuf-custom').length,
     subfinder: findingsOfTool('subfinder').length,
-    amass: findingsOfTool('amass').length,
     katana: findingsOfTool('katana').length,
-    httpx: findingsOfTool('httpx').length,
-    whatweb: findingsOfTool('whatweb').length,
-    graph: null,
+    nuclei: findingsOfTool('nuclei').length,
     jwtscan: null,
     probe: null,
+    domainscan: null,
     secrets: null,
-    repeater: null,
+    breach: null,
+    bypass403: null,
+    pwreset: null,
+    graphqlenum: null,
+    apienum: null,
+    corsscan: null,
+    openredirect: null,
+    ssrf: null,
+    csrf: null,
+    sstiscan: null,
+    xss: null,
+    tester: null,
+    collaborator: null,
     credentials: credentials.length,
-    risk: null,
-    activity: null,
+    cookieVault: cookieVault.filter((e) => e.cookie).length,
   }
 
   return (
@@ -479,11 +602,15 @@ export function CaseView({ caseId }: { caseId: string }) {
             click "Save selected to case". */}
         <div className="flex-1 overflow-hidden">
           <div className={`h-full ${tab === 'targets' ? '' : 'hidden'}`}>
-            <TargetsTab caseId={caseId} targets={targets} onChange={refreshTargets} />
+            <TargetsTab caseId={caseId} targets={targets} lists={targetLists} onChange={refreshTargets} onListsChanged={refreshTargetLists} />
           </div>
 
           <div className={`h-full overflow-y-auto ${tab === 'credentials' ? '' : 'hidden'}`}>
             <CredentialVault caseId={caseId} credentials={credentials} onChanged={refreshCredentials} />
+          </div>
+
+          <div className={`h-full overflow-y-auto ${tab === 'cookieVault' ? '' : 'hidden'}`}>
+            <CookieVault caseId={caseId} entries={cookieVault} onChanged={refreshCookieVault} />
           </div>
 
           <div className={`h-full ${tab === 'identify' ? '' : 'hidden'}`}>
@@ -496,6 +623,7 @@ export function CaseView({ caseId }: { caseId: string }) {
               onStart={addJob}
               onCancel={cancelJob}
               onTargetsChanged={refreshTargets}
+              requestSaveTargets={requestSaveTargets}
             />
           </div>
 
@@ -579,27 +707,6 @@ export function CaseView({ caseId }: { caseId: string }) {
             />
           </div>
 
-          <div className={`h-full ${tab === 'amass' ? '' : 'hidden'}`}>
-            <ToolTab
-              caseId={caseId}
-              tool="amass"
-              targets={targets}
-              credentials={credentials}
-              jobs={jobsOfTool('amass')}
-              findings={findingsOfTool('amass')}
-              statusOf={statusOf}
-              nodeStatus={nodeStatus}
-              jobProgress={jobProgress}
-              nodeStartedAtRef={nodeStartedAtRef}
-              onStart={addJob}
-              onCancel={cancelJob}
-              onPromote={(values) => promoteFromTool('amass', values)}
-              wordlistField={false}
-              credentialField={false}
-              disabledMessage="The amass binary itself just hangs and produces nothing on every run right now, regardless of flags -- disabled for the moment. Will be fixed soon."
-            />
-          </div>
-
           <div className={`h-full ${tab === 'katana' ? '' : 'hidden'}`}>
             <ToolTab
               caseId={caseId}
@@ -637,52 +744,26 @@ export function CaseView({ caseId }: { caseId: string }) {
             />
           </div>
 
-          <div className={`h-full ${tab === 'httpx' ? '' : 'hidden'}`}>
+          <div className={`h-full ${tab === 'nuclei' ? '' : 'hidden'}`}>
             <ToolTab
               caseId={caseId}
-              tool="httpx"
+              tool="nuclei"
               targets={targets}
               credentials={credentials}
-              jobs={jobsOfTool('httpx')}
-              findings={findingsOfTool('httpx')}
+              jobs={jobsOfTool('nuclei')}
+              findings={findingsOfTool('nuclei')}
               statusOf={statusOf}
               nodeStatus={nodeStatus}
               jobProgress={jobProgress}
               nodeStartedAtRef={nodeStartedAtRef}
               onStart={addJob}
               onCancel={cancelJob}
-              onPromote={(values) => promoteFromTool('httpx', values)}
+              onPromote={(values) => promoteFromTool('nuclei', values)}
               schemeField
               wordlistField={false}
+              credentialField={false}
+              resultsView={(nucleiFindings) => <NucleiResults findings={nucleiFindings} />}
             />
-          </div>
-
-          <div className={`h-full ${tab === 'whatweb' ? '' : 'hidden'}`}>
-            <ToolTab
-              caseId={caseId}
-              tool="whatweb"
-              targets={targets}
-              credentials={credentials}
-              jobs={jobsOfTool('whatweb')}
-              findings={findingsOfTool('whatweb')}
-              statusOf={statusOf}
-              nodeStatus={nodeStatus}
-              jobProgress={jobProgress}
-              nodeStartedAtRef={nodeStartedAtRef}
-              onStart={addJob}
-              onCancel={cancelJob}
-              onPromote={(values) => promoteFromTool('whatweb', values)}
-              schemeField
-              wordlistField={false}
-            />
-          </div>
-
-          <div className={`h-full ${tab === 'risk' ? '' : 'hidden'}`}>
-            <RiskPanel checks={checks} targets={targets} jobs={jobs} caseScans={caseScans} />
-          </div>
-
-          <div className={`h-full ${tab === 'graph' ? '' : 'hidden'}`}>
-            <GraphView caseId={caseId} />
           </div>
 
           <div className={`h-full overflow-hidden ${tab === 'jwtscan' ? '' : 'hidden'}`}>
@@ -693,19 +774,78 @@ export function CaseView({ caseId }: { caseId: string }) {
             <Probe caseId={caseId} targets={targets} credentials={credentials} prefill={probePrefill} />
           </div>
 
+          <div className={`h-full overflow-y-auto ${tab === 'domainscan' ? '' : 'hidden'}`}>
+            <DomainScan caseId={caseId} targets={targets} credentials={credentials} />
+          </div>
+
           <div className={`h-full overflow-y-auto ${tab === 'secrets' ? '' : 'hidden'}`}>
             <SecretScan caseId={caseId} targets={targets} credentials={credentials} prefill={secretScanPrefill} />
           </div>
 
-          <div className={`h-full overflow-hidden ${tab === 'repeater' ? '' : 'hidden'}`}>
-            <Repeater caseId={caseId} targets={targets} credentials={credentials} prefill={repeaterPrefill} />
+          <div className={`h-full overflow-y-auto ${tab === 'breach' ? '' : 'hidden'}`}>
+            <BreachCheck caseId={caseId} targets={targets} credentials={credentials} />
           </div>
 
-          <div className={`h-full ${tab === 'activity' ? '' : 'hidden'}`}>
-            <ActivityTimeline caseId={caseId} />
+          <div className={`h-full overflow-y-auto ${tab === 'bypass403' ? '' : 'hidden'}`}>
+            <Bypass403 caseId={caseId} targets={targets} credentials={credentials} prefill={bypass403Prefill} />
           </div>
+
+          <div className={`h-full overflow-y-auto ${tab === 'pwreset' ? '' : 'hidden'}`}>
+            <PwReset caseId={caseId} targets={targets} credentials={credentials} />
+          </div>
+
+          <div className={`h-full overflow-y-auto ${tab === 'graphqlenum' ? '' : 'hidden'}`}>
+            <GraphqlEnum caseId={caseId} targets={targets} credentials={credentials} />
+          </div>
+
+          <div className={`h-full overflow-y-auto ${tab === 'apienum' ? '' : 'hidden'}`}>
+            <ApiEnum caseId={caseId} targets={targets} credentials={credentials} requestSaveTargets={requestSaveTargets} onTargetsChanged={refreshTargets} />
+          </div>
+
+          <div className={`h-full overflow-y-auto ${tab === 'corsscan' ? '' : 'hidden'}`}>
+            <Cors caseId={caseId} targets={targets} credentials={credentials} />
+          </div>
+
+          <div className={`h-full overflow-y-auto ${tab === 'openredirect' ? '' : 'hidden'}`}>
+            <OpenRedirect caseId={caseId} targets={targets} credentials={credentials} />
+          </div>
+
+          <div className={`h-full overflow-y-auto ${tab === 'ssrf' ? '' : 'hidden'}`}>
+            <Ssrf caseId={caseId} targets={targets} credentials={credentials} />
+          </div>
+
+          <div className={`h-full overflow-y-auto ${tab === 'csrf' ? '' : 'hidden'}`}>
+            <Csrf caseId={caseId} targets={targets} credentials={credentials} />
+          </div>
+
+          <div className={`h-full overflow-y-auto ${tab === 'sstiscan' ? '' : 'hidden'}`}>
+            <SstiScan caseId={caseId} targets={targets} credentials={credentials} />
+          </div>
+
+          <div className={`h-full overflow-y-auto ${tab === 'xss' ? '' : 'hidden'}`}>
+            <XssScan caseId={caseId} targets={targets} credentials={credentials} />
+          </div>
+
+          <div className={`h-full overflow-hidden ${tab === 'tester' ? '' : 'hidden'}`}>
+            <Tester caseId={caseId} targets={targets} credentials={credentials} cookieVault={cookieVault} prefill={testerPrefill} />
+          </div>
+
+          <div className={`h-full overflow-y-auto ${tab === 'collaborator' ? '' : 'hidden'}`}>
+            <Collaborator />
+          </div>
+
         </div>
       </div>
+
+      {pendingPromote && (
+        <SaveToListModal
+          lists={targetLists}
+          itemLabel={`${pendingPromote.values.length} target${pendingPromote.values.length === 1 ? '' : 's'}`}
+          onPick={confirmPromote}
+          onCreateList={createTargetList}
+          onClose={() => setPendingPromote(null)}
+        />
+      )}
     </div>
   )
 }
@@ -789,20 +929,110 @@ function NavGroupSection({
 
 // --- Targets tab ---
 
-function TargetsTab({ caseId, targets, onChange }: { caseId: string; targets: Target[]; onChange: () => void }) {
+// TargetsTab is where the case's target lists themselves are managed --
+// one tab per list (plus "+ New list"), like a row of Spotify playlists.
+// Unlike SaveToListModal (the "which list?" prompt every other save flow
+// goes through), adding a target here always goes straight into whichever
+// list tab is currently open -- you're already looking at the destination.
+function TargetsTab({
+  caseId,
+  targets,
+  lists,
+  onChange,
+  onListsChanged,
+}: {
+  caseId: string
+  targets: Target[]
+  lists: TargetList[]
+  onChange: () => void
+  onListsChanged: () => void
+}) {
   const { openMenu } = useContextMenu()
+  // Falls back to the first list whenever the explicitly picked one is
+  // unset or has been deleted out from under it, rather than tracking that
+  // fallback as its own state (which would need an effect to stay in sync
+  // once lists loads or a list gets deleted).
+  const [pickedListId, setPickedListId] = useState<string | null>(null)
+  const activeListId = pickedListId && lists.some((l) => l.id === pickedListId) ? pickedListId : (lists[0]?.id ?? null)
+
   const [value, setValue] = useState('')
   const [adding, setAdding] = useState(false)
   const [error, setError] = useState('')
 
+  const [creatingList, setCreatingList] = useState(false)
+  const [newListName, setNewListName] = useState('')
+  const [newListKind, setNewListKind] = useState<TargetListKind>('domain')
+
+  // Ping verdicts are keyed by target id, so a row keeps its result while the
+  // user switches lists. Target ids are unique, so stale entries are harmless.
+  const [pingResults, setPingResults] = useState<Record<string, TargetPingResult>>({})
+  const [pinging, setPinging] = useState(false)
+
+  const createList = async (e: React.FormEvent) => {
+    e.preventDefault()
+    const trimmed = newListName.trim()
+    if (!trimmed) return
+    try {
+      const list = await api.createTargetList(caseId, trimmed, newListKind)
+      onListsChanged()
+      setPickedListId(list.id)
+      setCreatingList(false)
+      setNewListName('')
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : String(err), 'error')
+    }
+  }
+
+  const renameList = async (list: TargetList) => {
+    const name = window.prompt('Rename list', list.name)
+    if (!name || !name.trim() || name.trim() === list.name) return
+    try {
+      await api.renameTargetList(list.id, name.trim())
+      onListsChanged()
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : String(err), 'error')
+    }
+  }
+
+  const deleteList = async (list: TargetList) => {
+    try {
+      await api.deleteTargetList(list.id)
+      onListsChanged()
+      onChange()
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : String(err), 'error')
+    }
+  }
+
+  // pingList checks every target in one list and records each verdict. The
+  // results are merged into the existing map, so other lists' results stay.
+  const pingList = async (listId: string) => {
+    setPinging(true)
+    try {
+      const results = await api.pingTargetList(listId)
+      setPingResults((prev) => {
+        const next = { ...prev }
+        // Each result is keyed by its target id so it lands on the right row.
+        for (const r of results) {
+          next[r.targetId] = r
+        }
+        return next
+      })
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : String(err), 'error')
+    } finally {
+      setPinging(false)
+    }
+  }
+
   const add = async (e: React.FormEvent) => {
     e.preventDefault()
     const trimmed = value.trim()
-    if (!trimmed) return
+    if (!trimmed || !activeListId) return
     setAdding(true)
     setError('')
     try {
-      await api.addTarget(caseId, trimmed)
+      await api.addTarget(caseId, trimmed, activeListId)
       setValue('')
       onChange()
     } catch (err) {
@@ -821,67 +1051,180 @@ function TargetsTab({ caseId, targets, onChange }: { caseId: string; targets: Ta
     }
   }
 
+  const activeList = lists.find((l) => l.id === activeListId)
+  const listTargets = targets.filter((t) => t.listId === activeListId)
+  // Directory and file lists hold local paths, so there is nothing to ping.
+  const pingable = activeList !== undefined && activeList.kind !== 'directory' && activeList.kind !== 'file'
+  // Only this list's targets that have a verdict count toward the summary.
+  const checked = listTargets.map((t) => pingResults[t.id]).filter((r): r is TargetPingResult => r !== undefined)
+  const aliveCount = checked.filter((r) => r.alive).length
+
   return (
     <div className="mx-auto max-w-3xl space-y-4 px-4 py-6">
-      <form onSubmit={add} className="flex gap-2">
-        <input
-          value={value}
-          onChange={(e) => setValue(e.target.value)}
-          placeholder="example.com, sub.example.com, 10.0.0.1, https://example.com/api …"
-          className="flex-1 rounded-lg border border-neutral-700 bg-neutral-900 px-3 py-2 text-sm text-neutral-100 outline-none focus:border-sky-500"
-        />
-        <button
-          type="submit"
-          disabled={adding || !value.trim()}
-          className="rounded-lg bg-sky-600 px-4 py-2 text-sm font-medium text-white hover:bg-sky-500 disabled:opacity-50"
-        >
-          {adding ? 'Adding…' : 'Add target'}
-        </button>
-      </form>
-      {error && <p className="text-sm text-red-400">{error}</p>}
-
-      <div className="rounded-lg border border-neutral-800">
-        <div className="flex items-center gap-2 border-b border-neutral-800 px-3 py-2">
-          <h2 className="text-xs font-semibold uppercase tracking-wide text-neutral-400">Targets</h2>
-          <span className="text-xs text-neutral-600">{targets.length}</span>
-        </div>
-        {targets.length === 0 ? (
-          <p className="px-3 py-8 text-center text-xs text-neutral-600">
-            No targets yet — add one above, or run a tool and save some of its results.
-          </p>
+      <div className="flex flex-wrap items-center gap-1.5 border-b border-neutral-800 pb-2">
+        {lists.map((l) => (
+          <button
+            key={l.id}
+            type="button"
+            onClick={() => setPickedListId(l.id)}
+            onContextMenu={(e) => {
+              e.stopPropagation()
+              openMenu(e, [
+                { label: 'Rename list', onSelect: () => renameList(l) },
+                { label: 'Delete list', onSelect: () => deleteList(l), danger: true },
+              ])
+            }}
+            className={`rounded border-b-2 px-3 py-1.5 text-xs font-medium ${
+              activeListId === l.id ? 'border-sky-500 text-sky-300' : 'border-transparent text-neutral-400 hover:text-neutral-200'
+            }`}
+          >
+            {l.name} <span className="text-neutral-600">{targets.filter((t) => t.listId === l.id).length}</span>
+          </button>
+        ))}
+        {!creatingList ? (
+          <button
+            type="button"
+            onClick={() => setCreatingList(true)}
+            className="rounded border border-dashed border-neutral-700 px-2 py-1 text-xs text-neutral-500 hover:border-sky-600 hover:text-sky-400"
+          >
+            + New list
+          </button>
         ) : (
-          <div className="divide-y divide-neutral-900">
-            {targets.map((t) => (
-              <div
-                key={t.id}
-                onContextMenu={(e) => {
-                  e.stopPropagation()
-                  openMenu(e, [
-                    { label: 'Copy value', onSelect: () => copyToClipboard(t.value, 'Copied target') },
-                    { label: 'Send to JWT Scanner', onSelect: () => sendToJwtScanner(t.value) },
-                    { label: 'Send to Probe', onSelect: () => sendToProbe(t.value) },
-                    { label: 'Send to Secret Scanner', onSelect: () => sendToSecretScan(t.value) },
-                    { label: 'Send to Repeater', onSelect: () => sendToRepeater(t.value) },
-                    'separator',
-                    { label: 'Remove target', onSelect: () => remove(t), danger: true },
-                  ])
-                }}
-                className="flex items-center gap-3 px-3 py-2 text-sm hover:bg-neutral-900/60"
-              >
-                <span className="min-w-0 flex-1 truncate font-mono text-neutral-200">{t.value}</span>
-                {t.sourceTool && (
-                  <span className="shrink-0 rounded border border-neutral-700 px-1.5 py-0.5 text-xs text-neutral-400">from {t.sourceTool}</span>
-                )}
-                <span className="shrink-0 text-xs text-neutral-600">{new Date(t.createdAt).toLocaleDateString()}</span>
-                <button onClick={() => remove(t)} className="shrink-0 text-xs text-neutral-600 hover:text-red-400">
-                  Remove
-                </button>
-              </div>
-            ))}
-          </div>
+          <form onSubmit={createList} className="flex items-center gap-1">
+            <input
+              autoFocus
+              value={newListName}
+              onChange={(e) => setNewListName(e.target.value)}
+              placeholder="List name…"
+              className="w-32 rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-xs text-neutral-100 outline-none focus:border-sky-500"
+            />
+            <select
+              value={newListKind}
+              onChange={(e) => setNewListKind(e.target.value as TargetListKind)}
+              className="rounded border border-neutral-700 bg-neutral-900 px-1 py-1 text-xs text-neutral-200 outline-none focus:border-sky-500"
+            >
+              {TARGET_LIST_KINDS.map((k) => (
+                <option key={k} value={k}>
+                  {TARGET_LIST_KIND_LABELS[k]}
+                </option>
+              ))}
+            </select>
+            <button type="submit" disabled={!newListName.trim()} className="rounded bg-sky-600 px-2 py-1 text-xs font-medium text-white hover:bg-sky-500 disabled:opacity-50">
+              Create
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setCreatingList(false)
+                setNewListName('')
+              }}
+              className="text-xs text-neutral-500 hover:text-neutral-300"
+            >
+              Cancel
+            </button>
+          </form>
         )}
       </div>
+
+      {lists.length === 0 ? (
+        <p className="px-3 py-8 text-center text-xs text-neutral-600">No target lists yet — create one above to start saving targets.</p>
+      ) : (
+        <>
+          <form onSubmit={add} className="flex gap-2">
+            <input
+              value={value}
+              onChange={(e) => setValue(e.target.value)}
+              placeholder={activeList ? TARGET_LIST_KIND_PLACEHOLDERS[activeList.kind] : ''}
+              className="flex-1 rounded-lg border border-neutral-700 bg-neutral-900 px-3 py-2 text-sm text-neutral-100 outline-none focus:border-sky-500"
+            />
+            <button
+              type="submit"
+              disabled={adding || !value.trim()}
+              className="rounded-lg bg-sky-600 px-4 py-2 text-sm font-medium text-white hover:bg-sky-500 disabled:opacity-50"
+            >
+              {adding ? 'Adding…' : `Add to ${activeList?.name ?? 'list'}`}
+            </button>
+          </form>
+          {error && <p className="text-sm text-red-400">{error}</p>}
+
+          <div className="rounded-lg border border-neutral-800">
+            <div className="flex items-center gap-2 border-b border-neutral-800 px-3 py-2">
+              <h2 className="text-xs font-semibold uppercase tracking-wide text-neutral-400">{activeList?.name}</h2>
+              <span className="text-xs text-neutral-600">{listTargets.length}</span>
+              {pingable && listTargets.length > 0 && (
+                <div className="ml-auto flex items-center gap-3">
+                  {checked.length > 0 && (
+                    <span className="text-xs text-neutral-500">
+                      {aliveCount} alive · {checked.length - aliveCount} unreachable
+                    </span>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => activeListId && pingList(activeListId)}
+                    disabled={pinging}
+                    className="rounded border border-neutral-700 px-2 py-1 text-xs text-neutral-300 hover:border-sky-600 hover:text-sky-400 disabled:opacity-50"
+                  >
+                    {pinging ? 'Checking…' : 'Check alive'}
+                  </button>
+                </div>
+              )}
+            </div>
+            {listTargets.length === 0 ? (
+              <p className="px-3 py-8 text-center text-xs text-neutral-600">
+                No targets yet — add one above, or run a tool and save some of its results here.
+              </p>
+            ) : (
+              <div className="divide-y divide-neutral-900">
+                {listTargets.map((t) => (
+                  <div
+                    key={t.id}
+                    onContextMenu={(e) => {
+                      e.stopPropagation()
+                      openMenu(e, [
+                        { label: 'Copy value', onSelect: () => copyToClipboard(t.value, 'Copied target') },
+                        { label: 'Send to JWT Scanner', onSelect: () => sendToJwtScanner(t.value) },
+                        { label: 'Send to Probe', onSelect: () => sendToProbe(t.value) },
+                        { label: 'Send to Secret Scanner', onSelect: () => sendToSecretScan(t.value) },
+                        { label: 'Send to 403 Bypass', onSelect: () => sendToBypass403(t.value) },
+                        { label: 'Send to Tester', onSelect: () => sendToTester(t.value) },
+                        'separator',
+                        { label: 'Remove target', onSelect: () => remove(t), danger: true },
+                      ])
+                    }}
+                    className="flex items-center gap-3 px-3 py-2 text-sm hover:bg-neutral-900/60"
+                  >
+                    <span className="min-w-0 flex-1 truncate font-mono text-neutral-200">{t.value}</span>
+                    {pingResults[t.id] && <PingStatus ping={pingResults[t.id]} />}
+                    {t.sourceTool && (
+                      <span className="shrink-0 rounded border border-neutral-700 px-1.5 py-0.5 text-xs text-neutral-400">from {t.sourceTool}</span>
+                    )}
+                    <span className="shrink-0 text-xs text-neutral-600">{new Date(t.createdAt).toLocaleDateString()}</span>
+                    <button onClick={() => remove(t)} className="shrink-0 text-xs text-neutral-600 hover:text-red-400">
+                      Remove
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </>
+      )}
     </div>
+  )
+}
+
+// PingStatus is the alive/unreachable badge on a target row after a list ping.
+// An unreachable row shows the transport error as its tooltip.
+function PingStatus({ ping }: { ping: TargetPingResult }) {
+  return (
+    <span
+      title={ping.alive ? ping.url : ping.error}
+      className={`shrink-0 rounded border px-1.5 py-0.5 text-xs ${
+        ping.alive ? 'border-emerald-800 text-emerald-400' : 'border-red-900 text-red-400'
+      }`}
+    >
+      {ping.alive ? `alive · ${ping.statusCode}` : 'unreachable'}
+    </span>
   )
 }
 
@@ -898,6 +1241,7 @@ function IdentifyTab({
   onStart,
   onCancel,
   onTargetsChanged,
+  requestSaveTargets,
 }: {
   caseId: string
   targets: Target[]
@@ -907,6 +1251,7 @@ function IdentifyTab({
   onStart: (job: Job) => void
   onCancel: (job: Job) => void
   onTargetsChanged: () => void
+  requestSaveTargets: (values: string[], save: (listId: string) => Promise<void>) => void
 }) {
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [starting, setStarting] = useState(false)
@@ -948,14 +1293,12 @@ function IdentifyTab({
 
   const technologyChecks = Object.values(checks).filter((c) => c.kind === 'technologies')
 
-  const saveSubdomains = async (values: string[]) => {
-    try {
-      await Promise.all(values.map((v) => api.addTarget(caseId, v, 'subdomain')))
+  const saveSubdomains = (values: string[]) => {
+    requestSaveTargets(values, async (listId) => {
+      await Promise.all(values.map((v) => api.addTarget(caseId, v, listId)))
       showToast(`Saved ${values.length} target${values.length === 1 ? '' : 's'} to the case`, 'success')
       onTargetsChanged()
-    } catch (err) {
-      showToast(err instanceof Error ? err.message : String(err), 'error')
-    }
+    })
   }
 
   return (
@@ -1225,6 +1568,7 @@ function ToolTab({
   wordlistField = true,
   credentialField = true,
   disabledMessage,
+  resultsView,
 }: {
   caseId: string
   tool: Tool
@@ -1244,12 +1588,12 @@ function ToolTab({
   hostSuffixField?: boolean
   recursiveField?: boolean
   // wordlistField hides the wordlist-file tuning input for tools that
-  // don't fuzz off a wordlist at all (subfinder/amass/katana/httpx/
-  // whatweb) -- true (shown) for every wordlist-driven tool that predates
+  // don't fuzz off a wordlist at all (subfinder/katana) --
+  // true (shown) for every wordlist-driven tool that predates
   // this flag.
   wordlistField?: boolean
   // credentialField hides the saved-credential picker for tools that never
-  // issue an authenticated request to the target at all (subfinder/amass,
+  // issue an authenticated request to the target at all (subfinder,
   // which only ever query third-party OSINT sources) -- true (shown) for
   // every tool that predates this flag.
   credentialField?: boolean
@@ -1258,6 +1602,12 @@ function ToolTab({
   // known broken right now rather than one the user just hasn't run yet.
   // Past jobs/results (if any) still render below it as usual.
   disabledMessage?: string
+  // resultsView, when set, replaces the default ResultsTable in the results
+  // pane -- for a tool whose findings need a purpose-built display (nuclei's
+  // severity-grouped view) rather than the generic status/size/words table
+  // every wordlist/crawl-style tool shares. The per-target progress panel
+  // alongside it is unaffected either way.
+  resultsView?: (findings: Finding[]) => React.ReactNode
 }) {
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [starting, setStarting] = useState(false)
@@ -1498,7 +1848,11 @@ function ToolTab({
       <div className="flex flex-1 overflow-hidden">
         <TargetProgressPanel targets={targetProgress()} tabKey={tool} />
         <div className="flex-1 overflow-hidden">
-          <ResultsTable findings={findings} caseId={caseId} facetPlacement="right" selectable onPromote={onPromote} deriveTargetValue={deriveTargetValue} />
+          {resultsView ? (
+            resultsView(findings)
+          ) : (
+            <ResultsTable findings={findings} caseId={caseId} facetPlacement="right" selectable onPromote={onPromote} deriveTargetValue={deriveTargetValue} />
+          )}
         </div>
       </div>
     </div>

@@ -15,12 +15,16 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/sha512"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"hash"
 	"math/big"
 	"strings"
+	"time"
 )
 
 // b64dec decodes a base64url segment, tolerating the missing padding JWTs
@@ -163,4 +167,26 @@ func jwkFromPublicKey(pub *rsa.PublicKey) map[string]any {
 		"alg": "RS256",
 		"use": "sig",
 	}
+}
+
+// selfSignedCertPEM builds a minimal, self-signed X.509 certificate for
+// priv, PEM-encoded -- what the x5u-header-injection test (see
+// runOOBTests in oob.go) stages and points the target at. A server that
+// resolves "x5u" into "fetch this cert chain and verify the token's
+// signature against its leaf certificate's public key" accepts this exact
+// key pair, the same way testJWKInjection's embedded "jwk" header does for
+// a server that resolves that instead.
+func selfSignedCertPEM(priv *rsa.PrivateKey) ([]byte, error) {
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "aperture-x5u-test"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &priv.PublicKey, priv)
+	if err != nil {
+		return nil, fmt.Errorf("create self-signed certificate: %w", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), nil
 }

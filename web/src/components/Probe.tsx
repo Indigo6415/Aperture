@@ -1,29 +1,34 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api, ApiError, watchProbeScan } from '../api'
 import type { ProbeRequest } from '../probeHandoff'
-import type { Credential, JobOptionsPreset, ProbeFinding, ProbeModuleInfo, ProbeModuleResult, ProbeScanResponse, ProbeSeverity, Target } from '../types'
+import type { Credential, JobOptionsPreset, ProbeFinding, ProbeModuleResult, ProbeScanResponse, ProbeSeverity, Target } from '../types'
+import { applyScanEvent, emptyProgress, finishProgress, type ScanProgress } from '../scanProgress'
 import { CollapsibleFormPanel } from './CollapsibleFormPanel'
 import { TargetPicker } from './TargetPicker'
 import { CredentialPicker } from './CredentialPicker'
+import { BatchResultsPanel, type BatchResultSummary } from './BatchResultsPanel'
+import { ScanHistoryPanel } from './ScanHistoryPanel'
+import { ScanWindowTabs } from './ScanWindowTabs'
+import { latestByTarget, loadCaseScans } from '../scanHistory'
 import { useAutoCollapseOnce, useCollapsible } from '../collapsible'
 import { inputBase } from '../formStyles'
 import { SEVERITY_META, SEVERITY_ORDER } from '../severityColor'
 import { JOB_PRESETS } from '../presets'
 import { CopyButton } from './CopyButton'
 import { copyToClipboard, useContextMenu } from '../contextMenu'
-import { sendToRepeater } from '../repeaterHandoff'
-
-// TestState is one check module's place in a running scan -- grey (not
-// running yet), orange (in flight), or green (finished) -- see ProbeTestList
-// below.
-type TestState = 'idle' | 'running' | 'done'
+import { sendToBypass403 } from '../bypass403Handoff'
+import { sendToTester } from '../testerHandoff'
 
 // TargetScanState is one target's place in a (possibly multi-target) probe
 // run: its own test-progress map and, once finished, its own result --
 // independent of every other target running alongside it.
+import { ScanErrorNotice } from './ScanErrorNotice'
+
 interface TargetScanState {
   status: 'running' | 'done' | 'error'
-  testStatus: Record<string, TestState>
+  // progress is the run's live per-module state (see scanProgress.ts), shown
+  // as a grid of squares on the target's card.
+  progress?: ScanProgress
   result?: ProbeScanResponse
   error?: string
 }
@@ -41,16 +46,38 @@ export function Probe({
 }) {
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [manualTarget, setManualTarget] = useState('')
-  const [modules, setModules] = useState<ProbeModuleInfo[]>([])
   const [scans, setScans] = useState<Record<string, TargetScanState>>({})
   const [preset, setPreset] = useState<JobOptionsPreset>('custom')
   const [credentialId, setCredentialId] = useState<string | undefined>()
+  const [view, setView] = useState<'scan' | 'history'>('scan')
 
   const hasScans = Object.keys(scans).length > 0
   // Same collapse-on-first-result pattern as JwtScan.tsx -- see
   // collapsible.ts and CollapsibleFormPanel.tsx.
   const [formOpen, setFormOpen] = useCollapsible('probe.form', true)
   useAutoCollapseOnce(hasScans, setFormOpen)
+
+  // Restores this case's most recent probe run per target on mount/reload
+  // -- see saveCaseScan in internal/api/handlers_probe.go, which persists
+  // every scan launched with a case selected. Past runs (all of them, not
+  // just the latest) are also browsable in full via the "Scan history" tab
+  // below (ScanHistoryPanel), independent of this seed.
+  useEffect(() => {
+    let cancelled = false
+    loadCaseScans<ProbeScanResponse>(caseId, 'probe').then((list) => {
+      if (cancelled) return
+      const restored = latestByTarget(list)
+      if (restored.length === 0) return
+      setScans((prev) => {
+        const next = { ...prev }
+        for (const r of restored) if (!next[r.scan.target]) next[r.scan.target] = { status: 'done', result: r.data }
+        return next
+      })
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [caseId])
 
   // Applies a "Send to Probe" handoff (see probeHandoff.ts) even though this
   // component stays mounted the whole time the case is open -- keyed on
@@ -60,13 +87,6 @@ export function Probe({
     if (prefill) setManualTarget(prefill.target)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [prefill?.seq])
-
-  // The module list is static (every registered check, unaffected by the
-  // target) so it's fetched once and used to render every test grey before
-  // a scan ever starts.
-  useEffect(() => {
-    api.listProbeModules().then(setModules).catch(() => {})
-  }, [])
 
   // manualTargets splits the free-text field on commas/newlines, matching
   // the Targets tab's "paste a list" convention -- lets a batch be typed or
@@ -83,11 +103,13 @@ export function Probe({
   const runScan = () => {
     if (!canRun) return
     const list = runTargets
-    const initialTestStatus = Object.fromEntries(modules.map((m) => [m.id, 'running' as TestState]))
-    setScans(Object.fromEntries(list.map((t) => [t, { status: 'running' as const, testStatus: { ...initialTestStatus } }])))
+    setScans(Object.fromEntries(list.map((t) => [t, { status: 'running' as const, progress: emptyProgress() }])))
     for (const t of list) runOneScan(t)
   }
 
+  // runOneScan streams this target's probe run into its card: each module's
+  // start and finish arrive as progress events, and the full result is built
+  // from the module events once the terminal "done" lands.
   const runOneScan = async (targetValue: string) => {
     // Modules finish in whatever order their HTTP checks happen to
     // complete, streamed one at a time over this target's probe scan
@@ -95,6 +117,8 @@ export function Probe({
     // only turned into a result once the terminal "done" event says every
     // module has reported in.
     const collected: ProbeModuleResult[] = []
+    const patch = (fn: (cur: TargetScanState) => TargetScanState) =>
+      setScans((prev) => (prev[targetValue] ? { ...prev, [targetValue]: fn(prev[targetValue]) } : prev))
     let stopWatch: () => void = () => {}
     try {
       const { scanId } = await api.probeScan({
@@ -106,29 +130,25 @@ export function Probe({
       await new Promise<void>((resolve, reject) => {
         stopWatch = watchProbeScan(scanId, (ev) => {
           if (ev.type === 'module' && ev.module) {
-            const mod = ev.module
-            collected.push(mod)
-            setScans((prev) => {
-              const cur = prev[targetValue]
-              if (!cur) return prev
-              return { ...prev, [targetValue]: { ...cur, testStatus: { ...cur.testStatus, [mod.id]: 'done' } } }
-            })
+            collected.push(ev.module)
           } else if (ev.type === 'done') {
             if (ev.status === 'failed') {
               reject(new Error(ev.message || 'Probe scan failed'))
             } else if (ev.probeTarget && ev.probeHealth) {
               const result: ProbeScanResponse = { target: ev.probeTarget, health: ev.probeHealth, modules: collected }
-              setScans((prev) => ({ ...prev, [targetValue]: { ...prev[targetValue], status: 'done', result } }))
+              patch((cur) => ({ ...cur, status: 'done', result, progress: finishProgress(cur.progress ?? emptyProgress()) }))
               resolve()
             } else {
               reject(new Error('Probe scan ended without a result'))
             }
+            return
           }
+          patch((cur) => ({ ...cur, progress: applyScanEvent(cur.progress ?? emptyProgress(), ev) }))
         })
       })
     } catch (err) {
       const message = err instanceof ApiError ? err.message : err instanceof Error ? err.message : String(err)
-      setScans((prev) => ({ ...prev, [targetValue]: { ...prev[targetValue], status: 'error', error: message } }))
+      patch((cur) => ({ ...cur, status: 'error', error: message }))
     } finally {
       stopWatch()
     }
@@ -206,38 +226,79 @@ export function Probe({
       </CollapsibleFormPanel>
 
       <div className="min-w-0 flex-1 space-y-4">
-        {!hasScans && (
-          <div className="flex h-64 items-center justify-center rounded-lg border border-dashed border-neutral-800 text-sm text-neutral-600">
-            Select or type one or more targets, then run.
-          </div>
-        )}
+        <ScanWindowTabs view={view} onChange={setView} />
 
-        {Object.entries(scans).map(([t, scan]) => (
-          <TargetScanCard key={t} target={t} scan={scan} modules={modules} />
-        ))}
+        {view === 'scan' ? (
+          <>
+            {!hasScans && (
+              <div className="flex h-64 items-center justify-center rounded-lg border border-dashed border-neutral-800 text-sm text-neutral-600">
+                Select or type one or more targets, then run.
+              </div>
+            )}
+
+            {hasScans && (
+              <BatchResultsPanel
+                entries={Object.entries(scans)}
+                getSummary={probeScanSummary}
+                getProgress={(scan) => scan.progress}
+                renderCard={(t, scan) => <TargetScanCard target={t} scan={scan} />}
+              />
+            )}
+          </>
+        ) : (
+          <ScanHistoryPanel
+            caseId={caseId}
+            tool="probe"
+            toState={(data: ProbeScanResponse) => ({ status: 'done' as const, result: data })}
+            getSummary={probeScanSummary}
+            renderCard={(t, scan) => <TargetScanCard target={t} scan={scan} />}
+          />
+        )}
       </div>
     </div>
   )
+}
+
+// probeScanSummary is one target's one-line compact-view badge once a batch
+// covers more than BatchResultsPanel's threshold -- "still running"/"error"
+// take priority, then whether anything critical/high turned up (danger) vs.
+// only lower-severity findings (warn) vs. a clean scan, so a scan against
+// 100s of targets sorts the handful worth looking at to the top.
+function probeScanSummary(scan: TargetScanState): BatchResultSummary {
+  if (scan.status === 'running') return { label: 'Running…', tone: 'neutral', running: true }
+  if (scan.status === 'error') return { label: 'Error', tone: 'danger' }
+  const modules = scan.result?.modules ?? []
+  const total = modules.reduce((n, m) => n + m.findings.length, 0)
+  if (total === 0) return { label: 'Clean', tone: 'clean' }
+  const hasSevere = modules.some((m) => m.findings.length > 0 && (m.severity === 'critical' || m.severity === 'high'))
+  return { label: `${total} finding${total === 1 ? '' : 's'}`, tone: hasSevere ? 'danger' : 'warn' }
 }
 
 // TargetScanCard is one target's whole scan lifecycle in a batch run: its
 // header (target + status badge), the live test list while running, and
 // its own findings once done -- everything Probe used to render globally
 // for the single current target, now scoped per target.
-function TargetScanCard({ target, scan, modules }: { target: string; scan: TargetScanState; modules: ProbeModuleInfo[] }) {
+function TargetScanCard({ target, scan }: { target: string; scan: TargetScanState }) {
   const severityCounts = useMemo(() => {
     const c: Record<ProbeSeverity, number> = { critical: 0, high: 0, medium: 0, low: 0, info: 0 }
     for (const m of scan.result?.modules ?? []) c[m.severity] += m.findings.length
     return c
   }, [scan.result])
 
+  const totalFindings = (scan.result?.modules ?? []).reduce((n, m) => n + m.findings.length, 0)
+
+  // Once at least one module found something, only list the categories that
+  // actually hit -- with every check module registered (a few dozen), a
+  // dropdown per category regardless of whether it found anything just
+  // pushed the real findings off-screen. A clean scan (totalFindings === 0)
+  // still falls through to the "No misconfigurations found" message below,
+  // so this filter only ever removes noise, never the sole "all clear" signal.
   const sortedModules = useMemo(() => {
     const mods = scan.result?.modules ?? []
     const rank: Record<ProbeSeverity, number> = Object.fromEntries(SEVERITY_ORDER.map((s, i) => [s, i])) as Record<ProbeSeverity, number>
-    return [...mods].sort((a, b) => rank[a.severity] - rank[b.severity] || a.name.localeCompare(b.name))
-  }, [scan.result])
-
-  const totalFindings = (scan.result?.modules ?? []).reduce((n, m) => n + m.findings.length, 0)
+    const relevant = totalFindings > 0 ? mods.filter((m) => m.findings.length > 0) : mods
+    return [...relevant].sort((a, b) => rank[a.severity] - rank[b.severity] || a.name.localeCompare(b.name))
+  }, [scan.result, totalFindings])
 
   return (
     <div className="space-y-3 rounded-lg border border-neutral-800 bg-neutral-950/40 p-3">
@@ -246,11 +307,7 @@ function TargetScanCard({ target, scan, modules }: { target: string; scan: Targe
         <ScanStatusBadge status={scan.status} />
       </div>
 
-      {scan.status === 'error' && (
-        <div className="rounded-lg border border-red-800 bg-red-950/40 p-3 text-xs text-red-300">{scan.error}</div>
-      )}
-
-      {scan.status === 'running' && <ProbeTestList modules={modules} status={scan.testStatus} loading />}
+      {scan.status === 'error' && <ScanErrorNotice message={scan.error} />}
 
       {scan.status === 'done' && scan.result && (
         <>
@@ -288,56 +345,6 @@ const SCAN_STATUS_STYLES: Record<TargetScanState['status'], { label: string; cls
 function ScanStatusBadge({ status }: { status: TargetScanState['status'] }) {
   const meta = SCAN_STATUS_STYLES[status]
   return <span className={`rounded border px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wide ${meta.cls}`}>{meta.label}</span>
-}
-
-// ProbeTestList shows every registered check module as a small pill --
-// grey while idle, orange while the scan has it in flight, green once it's
-// reported back. Once a scan finishes, the caller stops rendering this in
-// favor of the findings themselves.
-function ProbeTestList({ modules, status, loading }: { modules: ProbeModuleInfo[]; status: Record<string, TestState>; loading: boolean }) {
-  if (modules.length === 0) {
-    return (
-      <div className="flex h-32 items-center justify-center rounded-lg border border-dashed border-neutral-800 text-sm text-neutral-600">
-        Results will appear here once you run a scan.
-      </div>
-    )
-  }
-  const doneCount = modules.filter((m) => status[m.id] === 'done').length
-  return (
-    <div className="rounded-lg border border-neutral-800 bg-neutral-900 p-3">
-      <div className="mb-2 flex items-center justify-between">
-        <h2 className="text-xs font-semibold uppercase tracking-wide text-neutral-400">Tests</h2>
-        {loading ? (
-          <span className="text-xs text-neutral-500">
-            {doneCount} / {modules.length} finished
-          </span>
-        ) : (
-          <span className="text-xs text-neutral-600">Run a scan to see progress</span>
-        )}
-      </div>
-      <div className="flex flex-wrap gap-1.5">
-        {modules.map((m) => (
-          <TestPill key={m.id} name={m.name} state={status[m.id] ?? 'idle'} />
-        ))}
-      </div>
-    </div>
-  )
-}
-
-const TEST_STATE_STYLES: Record<TestState, { pill: string; dot: string }> = {
-  idle: { pill: 'border-neutral-700 bg-neutral-950 text-neutral-500', dot: 'bg-neutral-600' },
-  running: { pill: 'border-amber-700 bg-amber-950/40 text-amber-300', dot: 'bg-amber-400 animate-pulse' },
-  done: { pill: 'border-emerald-700 bg-emerald-950/40 text-emerald-300', dot: 'bg-emerald-400' },
-}
-
-function TestPill({ name, state }: { name: string; state: TestState }) {
-  const styles = TEST_STATE_STYLES[state]
-  return (
-    <span className={`flex items-center gap-1.5 rounded border px-2 py-1 text-xs ${styles.pill}`}>
-      <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${styles.dot}`} />
-      {name}
-    </span>
-  )
 }
 
 function TargetSummaryCard({ result }: { result: ProbeScanResponse }) {
@@ -436,7 +443,8 @@ function FindingRow({ finding }: { finding: ProbeFinding }) {
         e.stopPropagation()
         openMenu(e, [
           { label: 'Copy URL', onSelect: () => copyToClipboard(finding.url!, 'Copied URL') },
-          { label: 'Send to Repeater', onSelect: () => sendToRepeater(finding.url!, finding.method || 'GET') },
+          { label: 'Send to 403 Bypass', onSelect: () => sendToBypass403(finding.url!) },
+          { label: 'Send to Tester', onSelect: () => sendToTester(finding.url!, finding.method || 'GET') },
         ])
       }}
       className="py-2 text-xs"

@@ -12,15 +12,15 @@ body,
 }
 
 body {
-  background: #0b0d12;
-  color: #e5e7eb;
+  background: var(--body-bg, #0b0d12);
+  color: var(--body-text, #e5e7eb);
   font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
 
 /* Custom scrollbars (Firefox) */
 * {
   scrollbar-width: thin;
-  scrollbar-color: #3f3f46 transparent;
+  scrollbar-color: var(--scroll, #3f3f46) transparent;
 }
 
 /* Custom scrollbars (WebKit: Chrome, Edge, Safari) */
@@ -34,16 +34,520 @@ body {
 }
 
 *::-webkit-scrollbar-thumb {
-  background-color: #3f3f46;
+  background-color: var(--scroll, #3f3f46);
   border-radius: 9999px;
   border: 2px solid transparent;
   background-clip: content-box;
 }
 
 *::-webkit-scrollbar-thumb:hover {
-  background-color: #52525b;
+  background-color: var(--scroll-hover, #52525b);
 }
 
 *::-webkit-scrollbar-corner {
   background: transparent;
+}
+
+/* ---------------------------------------------------------------------
+ * Theming (see theme.ts)
+ *
+ * The app itself is written entirely in literal Tailwind utility classes
+ * (bg-neutral-900, text-sky-400, and so on) -- there was never a
+ * design-token layer to swap out. Rather than rewrite every component to
+ * consume CSS variables, each theme+mode pair below defines what those
+ * variables are meant to mean, and one shared block of important overrides
+ * (below all the theme blocks) remaps the actual neutral and sky utility
+ * classes the app uses onto them.
+ *
+ * Theme (palette) and mode (light/dark) are two independent choices -- see
+ * theme.ts's Theme/Mode types and the two separate controls in Settings --
+ * applied as two attributes on <html>, so every palette below is defined
+ * twice: once per mode. For every palette, the *dark* block's neutral scale
+ * runs darkest (n950, the page background) to lightest (n100, the brightest
+ * text), and the *light* block is the exact same ten shades in reverse --
+ * n950 becomes the lightest shade (the page background) and n100 the
+ * darkest (body text) -- which is what makes a palette hang together in
+ * both modes without two independently hand-tuned scales. --sky500/600/700
+ * stay fixed across both modes of a given palette (they are always used as
+ * a filled background behind fixed white text, or as a border, so they
+ * don't need to flip); only --sky300/400 (emphasis text) and --sky950 (a
+ * very subtle tinted highlight background) flip between a pale tint for
+ * dark mode and a deep tint for light mode, for the same reason the neutral
+ * scale flips.
+ *
+ * "default" is Aperture's original look: its dark block matches Tailwind's
+ * own neutral/sky palette exactly, so the override rules are a no-op there
+ * and the app looks exactly as it did before theming existed.
+ * ------------------------------------------------------------------- */
+
+[data-theme="default"][data-mode="dark"] {
+  color-scheme: dark;
+  --n950: #0a0a0a;
+  --n900: #171717;
+  --n800: #262626;
+  --n700: #404040;
+  --n600: #525252;
+  --n500: #737373;
+  --n400: #a3a3a3;
+  --n300: #d4d4d4;
+  --n200: #e5e5e5;
+  --n100: #f5f5f5;
+  --sky300: #7dd3fc;
+  --sky400: #38bdf8;
+  --sky500: #0ea5e9;
+  --sky600: #0284c7;
+  --sky700: #0369a1;
+  --sky950: #082f49;
+  --body-bg: #0a0a0a;
+  --body-text: #f5f5f5;
+  --scroll: #404040;
+  --scroll-hover: #525252;
+}
+
+[data-theme="default"][data-mode="light"] {
+  color-scheme: light;
+  --n950: #f5f5f5;
+  --n900: #e5e5e5;
+  --n800: #d4d4d4;
+  --n700: #a3a3a3;
+  --n600: #737373;
+  --n500: #525252;
+  --n400: #404040;
+  --n300: #262626;
+  --n200: #171717;
+  --n100: #0a0a0a;
+  --sky300: #075985;
+  --sky400: #0284c7;
+  --sky500: #0ea5e9;
+  --sky600: #0284c7;
+  --sky700: #0369a1;
+  --sky950: #e0f2fe;
+  --body-bg: #f5f5f5;
+  --body-text: #0a0a0a;
+  --scroll: #a3a3a3;
+  --scroll-hover: #737373;
+}
+
+[data-theme="professional"][data-mode="dark"] {
+  color-scheme: dark;
+  --n950: #0d1319;
+  --n900: #1c252e;
+  --n800: #2e3944;
+  --n700: #47535f;
+  --n600: #64707d;
+  --n500: #8a95a3;
+  --n400: #c7d0db;
+  --n300: #dde3ea;
+  --n200: #ffffff;
+  --n100: #eef1f6;
+  --sky300: #9db9f6;
+  --sky400: #5c8af0;
+  --sky500: #2563eb;
+  --sky600: #1d4ed8;
+  --sky700: #1e3a8a;
+  --sky950: #040c1c;
+  --body-bg: #0d1319;
+  --body-text: #eef1f6;
+  --scroll: #47535f;
+  --scroll-hover: #64707d;
+}
+
+[data-theme="professional"][data-mode="light"] {
+  color-scheme: light;
+  --n950: #eef1f6;
+  --n900: #ffffff;
+  --n800: #dde3ea;
+  --n700: #c7d0db;
+  --n600: #8a95a3;
+  --n500: #64707d;
+  --n400: #47535f;
+  --n300: #2e3944;
+  --n200: #1c252e;
+  --n100: #0d1319;
+  --sky300: #143681;
+  --sky400: #1e4fbc;
+  --sky500: #2563eb;
+  --sky600: #1d4ed8;
+  --sky700: #1e3a8a;
+  --sky950: #e9effd;
+  --body-bg: #eef1f6;
+  --body-text: #0d1319;
+  --scroll: #c7d0db;
+  --scroll-hover: #8a95a3;
+}
+
+[data-theme="burp"][data-mode="dark"] {
+  color-scheme: dark;
+  --n950: #23252a;
+  --n900: #2b2d33;
+  --n800: #3a3d44;
+  --n700: #4a4e57;
+  --n600: #6b6f78;
+  --n500: #9498a1;
+  --n400: #b7bac1;
+  --n300: #d3d5da;
+  --n200: #e8e9ec;
+  --n100: #ffffff;
+  --sky300: #f7b955;
+  --sky400: #f5a623;
+  --sky500: #f2933d;
+  --sky600: #e07b00;
+  --sky700: #b35f00;
+  --sky950: #3a2410;
+  --body-bg: #23252a;
+  --body-text: #ffffff;
+  --scroll: #4a4e57;
+  --scroll-hover: #6b6f78;
+}
+
+[data-theme="burp"][data-mode="light"] {
+  color-scheme: light;
+  --n950: #ffffff;
+  --n900: #e8e9ec;
+  --n800: #d3d5da;
+  --n700: #b7bac1;
+  --n600: #9498a1;
+  --n500: #6b6f78;
+  --n400: #4a4e57;
+  --n300: #3a3d44;
+  --n200: #2b2d33;
+  --n100: #23252a;
+  --sky300: #855122;
+  --sky400: #c27631;
+  --sky500: #f2933d;
+  --sky600: #e07b00;
+  --sky700: #b35f00;
+  --sky950: #fef4ec;
+  --body-bg: #ffffff;
+  --body-text: #23252a;
+  --scroll: #b7bac1;
+  --scroll-hover: #9498a1;
+}
+
+[data-theme="hacker"][data-mode="dark"] {
+  color-scheme: dark;
+  --n950: #000000;
+  --n900: #020a02;
+  --n800: #0d240d;
+  --n700: #164016;
+  --n600: #2c6b2c;
+  --n500: #3fae3f;
+  --n400: #4ade4a;
+  --n300: #6bf06b;
+  --n200: #8ef98e;
+  --n100: #baffba;
+  --sky300: #66ff85;
+  --sky400: #33ff66;
+  --sky500: #00ff41;
+  --sky600: #00cc33;
+  --sky700: #009926;
+  --sky950: #001f0a;
+  --body-bg: #000000;
+  --body-text: #baffba;
+  --scroll: #164016;
+  --scroll-hover: #2c6b2c;
+}
+
+[data-theme="hacker"][data-mode="light"] {
+  color-scheme: light;
+  --n950: #baffba;
+  --n900: #8ef98e;
+  --n800: #6bf06b;
+  --n700: #4ade4a;
+  --n600: #3fae3f;
+  --n500: #2c6b2c;
+  --n400: #164016;
+  --n300: #0d240d;
+  --n200: #020a02;
+  --n100: #000000;
+  --sky300: #008c24;
+  --sky400: #00cc34;
+  --sky500: #00ff41;
+  --sky600: #00cc33;
+  --sky700: #009926;
+  --sky950: #e6ffec;
+  --body-bg: #baffba;
+  --body-text: #000000;
+  --scroll: #4ade4a;
+  --scroll-hover: #3fae3f;
+}
+
+[data-theme="prussian-amber"][data-mode="dark"] {
+  color-scheme: dark;
+  --n950: #000000;
+  --n900: #070b14;
+  --n800: #0d1629;
+  --n700: #14213d;
+  --n600: #5a6275;
+  --n500: #9fa4ad;
+  --n400: #e5e5e5;
+  --n300: #eeeeee;
+  --n200: #f6f6f6;
+  --n100: #ffffff;
+  --sky300: #fed694;
+  --sky400: #fdba4c;
+  --sky500: #fca311;
+  --sky600: #a46a0b;
+  --sky700: #7e5208;
+  --sky950: #1e1402;
+  --body-bg: #000000;
+  --body-text: #ffffff;
+  --scroll: #14213d;
+  --scroll-hover: #5a6275;
+}
+
+[data-theme="prussian-amber"][data-mode="light"] {
+  color-scheme: light;
+  --n950: #ffffff;
+  --n900: #f6f6f6;
+  --n800: #eeeeee;
+  --n700: #e5e5e5;
+  --n600: #9fa4ad;
+  --n500: #5a6275;
+  --n400: #14213d;
+  --n300: #0d1629;
+  --n200: #070b14;
+  --n100: #000000;
+  --sky300: #8b5a09;
+  --sky400: #ca820e;
+  --sky500: #fca311;
+  --sky600: #a46a0b;
+  --sky700: #7e5208;
+  --sky950: #fff6e7;
+  --body-bg: #ffffff;
+  --body-text: #000000;
+  --scroll: #e5e5e5;
+  --scroll-hover: #9fa4ad;
+}
+
+[data-theme="teal-slate"][data-mode="dark"] {
+  color-scheme: dark;
+  --n950: #353535;
+  --n900: #313c44;
+  --n800: #2c4454;
+  --n700: #284b63;
+  --n600: #637a8a;
+  --n500: #9eaab2;
+  --n400: #d9d9d9;
+  --n300: #e6e6e6;
+  --n200: #f2f2f2;
+  --n100: #ffffff;
+  --sky300: #a7bebf;
+  --sky400: #6d9294;
+  --sky500: #3c6e71;
+  --sky600: #274849;
+  --sky700: #1e3738;
+  --sky950: #070d0e;
+  --body-bg: #353535;
+  --body-text: #ffffff;
+  --scroll: #284b63;
+  --scroll-hover: #637a8a;
+}
+
+[data-theme="teal-slate"][data-mode="light"] {
+  color-scheme: light;
+  --n950: #ffffff;
+  --n900: #f2f2f2;
+  --n800: #e6e6e6;
+  --n700: #d9d9d9;
+  --n600: #9eaab2;
+  --n500: #637a8a;
+  --n400: #284b63;
+  --n300: #2c4454;
+  --n200: #313c44;
+  --n100: #353535;
+  --sky300: #213c3e;
+  --sky400: #30585a;
+  --sky500: #3c6e71;
+  --sky600: #274849;
+  --sky700: #1e3738;
+  --sky950: #ecf0f1;
+  --body-bg: #ffffff;
+  --body-text: #353535;
+  --scroll: #d9d9d9;
+  --scroll-hover: #9eaab2;
+}
+
+[data-theme="linen-sun"][data-mode="dark"] {
+  color-scheme: dark;
+  --n950: #242423;
+  --n900: #292a28;
+  --n800: #2e2f2e;
+  --n700: #333533;
+  --n600: #676c69;
+  --n500: #9ba49f;
+  --n400: #cfdbd5;
+  --n300: #d7e1d8;
+  --n200: #e0e7dc;
+  --n100: #e8eddf;
+  --sky300: #fae8b6;
+  --sky400: #f8d885;
+  --sky500: #f5cb5c;
+  --sky600: #9f843c;
+  --sky700: #7a662e;
+  --sky950: #1d180b;
+  --body-bg: #242423;
+  --body-text: #e8eddf;
+  --scroll: #333533;
+  --scroll-hover: #676c69;
+}
+
+[data-theme="linen-sun"][data-mode="light"] {
+  color-scheme: light;
+  --n950: #e8eddf;
+  --n900: #e0e7dc;
+  --n800: #d7e1d8;
+  --n700: #cfdbd5;
+  --n600: #9ba49f;
+  --n500: #676c69;
+  --n400: #333533;
+  --n300: #2e2f2e;
+  --n200: #292a28;
+  --n100: #242423;
+  --sky300: #877033;
+  --sky400: #c4a24a;
+  --sky500: #f5cb5c;
+  --sky600: #9f843c;
+  --sky700: #7a662e;
+  --sky950: #fefaef;
+  --body-bg: #e8eddf;
+  --body-text: #242423;
+  --scroll: #cfdbd5;
+  --scroll-hover: #9ba49f;
+}
+
+[data-theme="stone-almond"][data-mode="dark"] {
+  color-scheme: dark;
+  --n950: #0a0908;
+  --n900: #121719;
+  --n800: #1a252a;
+  --n700: #22333b;
+  --n600: #363d3c;
+  --n500: #4a463e;
+  --n400: #5e503f;
+  --n300: #8d8071;
+  --n200: #bbb0a3;
+  --n100: #eae0d5;
+  --sky300: #e5dacd;
+  --sky400: #d4c1ab;
+  --sky500: #c6ac8f;
+  --sky600: #81705d;
+  --sky700: #635648;
+  --sky950: #181511;
+  --body-bg: #0a0908;
+  --body-text: #eae0d5;
+  --scroll: #22333b;
+  --scroll-hover: #363d3c;
+}
+
+[data-theme="stone-almond"][data-mode="light"] {
+  color-scheme: light;
+  --n950: #eae0d5;
+  --n900: #bbb0a3;
+  --n800: #8d8071;
+  --n700: #5e503f;
+  --n600: #4a463e;
+  --n500: #363d3c;
+  --n400: #22333b;
+  --n300: #1a252a;
+  --n200: #121719;
+  --n100: #0a0908;
+  --sky300: #6d5f4f;
+  --sky400: #9e8a72;
+  --sky500: #c6ac8f;
+  --sky600: #81705d;
+  --sky700: #635648;
+  --sky950: #f9f7f4;
+  --body-bg: #eae0d5;
+  --body-text: #0a0908;
+  --scroll: #5e503f;
+  --scroll-hover: #4a463e;
+}
+
+
+[data-theme="hacker"] body {
+  font-family: ui-monospace, "SF Mono", "Cascadia Code", "Fira Code", Menlo, Consolas, monospace;
+}
+
+/* Shared remap: every theme block above defines the variables, this is the
+ * only place that ties them to the utility classes the app actually uses. */
+[data-theme] .bg-neutral-600 { background-color: var(--n600) !important; }
+[data-theme] .bg-neutral-700 { background-color: var(--n700) !important; }
+[data-theme] .bg-neutral-800 { background-color: var(--n800) !important; }
+[data-theme] .bg-neutral-900 { background-color: var(--n900) !important; }
+[data-theme] .bg-neutral-950 { background-color: var(--n950) !important; }
+[data-theme] .border-neutral-500 { border-color: var(--n500) !important; }
+[data-theme] .border-neutral-600 { border-color: var(--n600) !important; }
+[data-theme] .border-neutral-700 { border-color: var(--n700) !important; }
+[data-theme] .border-neutral-800 { border-color: var(--n800) !important; }
+[data-theme] .border-neutral-900 { border-color: var(--n900) !important; }
+[data-theme] .text-neutral-100 { color: var(--n100) !important; }
+[data-theme] .text-neutral-200 { color: var(--n200) !important; }
+[data-theme] .text-neutral-300 { color: var(--n300) !important; }
+[data-theme] .text-neutral-400 { color: var(--n400) !important; }
+[data-theme] .text-neutral-500 { color: var(--n500) !important; }
+[data-theme] .text-neutral-600 { color: var(--n600) !important; }
+[data-theme] .hover\:bg-neutral-800:hover { background-color: var(--n800) !important; }
+[data-theme] .hover\:bg-neutral-900:hover { background-color: var(--n900) !important; }
+[data-theme] .hover\:border-neutral-500:hover { border-color: var(--n500) !important; }
+[data-theme] .hover\:text-neutral-100:hover { color: var(--n100) !important; }
+[data-theme] .hover\:text-neutral-200:hover { color: var(--n200) !important; }
+[data-theme] .hover\:text-neutral-300:hover { color: var(--n300) !important; }
+
+[data-theme] .bg-sky-500 { background-color: var(--sky500) !important; }
+[data-theme] .bg-sky-600 { background-color: var(--sky600) !important; }
+[data-theme] .bg-sky-950 { background-color: var(--sky950) !important; }
+[data-theme] .border-sky-500 { border-color: var(--sky500) !important; }
+[data-theme] .border-sky-600 { border-color: var(--sky600) !important; }
+[data-theme] .border-sky-700 { border-color: var(--sky700) !important; }
+[data-theme] .text-sky-300 { color: var(--sky300) !important; }
+[data-theme] .text-sky-400 { color: var(--sky400) !important; }
+[data-theme] .text-sky-500 { color: var(--sky500) !important; }
+[data-theme] .text-sky-700 { color: var(--sky700) !important; }
+[data-theme] .hover\:bg-sky-500:hover { background-color: var(--sky500) !important; }
+[data-theme] .hover\:border-sky-500:hover { border-color: var(--sky500) !important; }
+[data-theme] .hover\:border-sky-600:hover { border-color: var(--sky600) !important; }
+[data-theme] .hover\:text-sky-300:hover { color: var(--sky300) !important; }
+[data-theme] .hover\:text-sky-400:hover { color: var(--sky400) !important; }
+[data-theme] .focus\:border-sky-500:focus { border-color: var(--sky500) !important; }
+[data-theme] .accent-sky-500 { accent-color: var(--sky500) !important; }
+
+/* Live scan grid (see components/ScanTargetCard.tsx). A square pops when its
+ * check finishes, pulses while the check is in flight, and each new status
+ * line fades in. All of it stops under reduced motion, leaving the colors
+ * as the only signal. */
+@keyframes check-pop {
+  0% { transform: scale(0.35); opacity: 0.3; }
+  60% { transform: scale(1.3); opacity: 1; }
+  100% { transform: scale(1); opacity: 1; }
+}
+
+@keyframes check-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgb(251 191 36 / 0.6); }
+  50% { box-shadow: 0 0 0 4px rgb(251 191 36 / 0); }
+}
+
+@keyframes check-fade {
+  from { opacity: 0; transform: translateY(2px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.check-pop {
+  animation: check-pop 360ms ease-out;
+}
+
+.check-running {
+  animation: check-pulse 1.1s ease-in-out infinite;
+}
+
+.check-ticker {
+  animation: check-fade 240ms ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .check-pop,
+  .check-running,
+  .check-ticker {
+    animation: none;
+  }
 }

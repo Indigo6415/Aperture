@@ -2,8 +2,9 @@ package secretscan
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
+	"github.com/Indigo6415/Aperture/internal/netgov"
+	"github.com/Indigo6415/Aperture/internal/scanprogress"
 	"io"
 	"net/http"
 	"net/url"
@@ -33,12 +34,24 @@ const (
 	maxMatchesPerPatternPerPage = 3
 )
 
-// Match is one secret found at one location.
+// Match is one secret found at one location. Value is always the masked form
+// (see Mask); the raw secret is never stored or returned. Fingerprint is a
+// SHA-256 of the raw value, which identifies the same secret across pages.
 type Match struct {
-	Type     string `json:"type"`
-	Method   string `json:"method"` // "regex" | "entropy"
-	Value    string `json:"value"`
+	Type        string `json:"type"`
+	Method      string `json:"method"` // "regex" | "entropy"
+	Value       string `json:"value"`
+	Fingerprint string `json:"fingerprint"`
+	// Level is "secret" for credentials and "public-key" for keys designed to
+	// ship in client code, which are informational rather than leaks.
+	Level    string `json:"level"`
 	Location string `json:"location"`
+	// Engine is which pattern library produced this match: "core" (this
+	// package's own conservative set) or "secretfinder" (the opt-in,
+	// broader SecretFinderPatterns library -- see
+	// Request.SecretFinderEngine). Entropy matches are always "core", since
+	// SecretFinderPatterns has no entropy detector of its own.
+	Engine string `json:"engine"`
 }
 
 // Request is one secret-scan crawl's parameters.
@@ -52,6 +65,13 @@ type Request struct {
 	// off by default, matching Snitch's own CLI default (--entropy is
 	// opt-in there too).
 	Entropy bool
+	// SecretFinderEngine also matches every page/script against
+	// SecretFinderPatterns (patterns_secretfinder.go), a second, broader
+	// pattern library ported from the SecretFinder tool -- off by default,
+	// same "opt-in, noisier" posture as Entropy, since it trades more false
+	// positives for a higher chance of catching something Patterns' own
+	// tighter, \b-bounded regexes miss.
+	SecretFinderEngine bool
 	// MaxPages overrides defaultMaxPages, capped at maxPagesCap. Zero uses
 	// the default.
 	MaxPages int
@@ -60,6 +80,9 @@ type Request struct {
 	// the target sits behind auth this crawl would otherwise never get
 	// past the seed page's login redirect.
 	Headers map[string]string
+	// Progress, when set, receives one check per page as the crawl reaches it.
+	// Nil means nobody is watching.
+	Progress scanprogress.Reporter `json:"-"`
 }
 
 // Response is one crawl's full result.
@@ -72,10 +95,7 @@ type Response struct {
 // newClient never verifies TLS -- this tool routinely targets self-signed
 // lab/CTF/internal boxes, same posture as jwtscan/probescan's own clients.
 func newClient() *http.Client {
-	return &http.Client{
-		Timeout:   requestTimeout,
-		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}, //nolint:gosec // deliberate: authorized testing against lab/CTF/self-signed targets
-	}
+	return netgov.NewClient(requestTimeout, true)
 }
 
 var (
@@ -83,40 +103,81 @@ var (
 	anchorHrefPattern = regexp.MustCompile(`(?is)<a[^>]+href\s*=\s*["']([^"']+)["']`)
 )
 
-func fetch(ctx context.Context, client *http.Client, target string, headers map[string]string) (string, error) {
+// fetch GETs one page or script and returns its body and Content-Type. Saved
+// credential headers are applied through netgov.ApplyHeaders so a Host header
+// is honored, not silently dropped.
+func fetch(ctx context.Context, client *http.Client, target string, headers map[string]string) (string, string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; Aperture SecretScan)")
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
+	netgov.ApplyHeaders(req, headers)
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	return string(body), nil
+	return string(body), resp.Header.Get("Content-Type"), nil
 }
 
-func scanText(text, location string, withEntropy bool) []Match {
+// scanText runs every pattern over one body and, when asked, the entropy
+// detector. Placeholder values are dropped, and every kept value is masked
+// before it leaves this function.
+func scanText(text, location string, patterns []Pattern, withEntropy bool) []Match {
 	var matches []Match
-	for _, p := range Patterns {
-		for _, m := range p.Regex.FindAllString(text, maxMatchesPerPatternPerPage) {
-			matches = append(matches, Match{Type: p.Name, Method: "regex", Value: truncate(m, 200), Location: location})
+	for _, p := range patterns {
+		// Each hit keeps the secret group when the pattern has one, so the
+		// value is the credential itself and not the key name around it.
+		for _, idx := range p.Regex.FindAllStringSubmatchIndex(text, maxMatchesPerPatternPerPage) {
+			raw := secretGroup(text, idx)
+			if raw == "" || isPlaceholder(raw) {
+				continue
+			}
+			matches = append(matches, newMatch(p.Name, "regex", raw, location, p.Engine, p.Public))
 		}
 	}
 	if withEntropy {
 		for _, s := range findHighEntropyStrings(text, entropyThreshold, entropyMaxLen) {
-			matches = append(matches, Match{Type: "High-entropy string", Method: "entropy", Value: s, Location: location})
+			matches = append(matches, newMatch("High-entropy string", "entropy", s, location, "core", false))
 		}
 	}
 	return matches
+}
+
+// secretGroup returns the value a match should be judged by: the last
+// non-empty capture group if the pattern has any, otherwise the whole match.
+// Patterns put the credential in the last group (for example the value after
+// "api_key:"), so this skips the surrounding key name.
+func secretGroup(text string, idx []int) string {
+	for g := len(idx)/2 - 1; g >= 1; g-- {
+		if idx[2*g] >= 0 && idx[2*g+1] > idx[2*g] {
+			return text[idx[2*g]:idx[2*g+1]]
+		}
+	}
+	return text[idx[0]:idx[1]]
+}
+
+// newMatch builds a Match from a raw secret value. The raw value is hashed
+// and masked here, so no caller can accidentally keep it.
+func newMatch(name, method, raw, location, engine string, public bool) Match {
+	level := "secret"
+	if public {
+		level = "public-key"
+	}
+	return Match{
+		Type:        name,
+		Method:      method,
+		Value:       Mask(raw),
+		Fingerprint: Fingerprint(raw),
+		Level:       level,
+		Location:    location,
+		Engine:      engine,
+	}
 }
 
 func truncate(s string, n int) string {
@@ -140,6 +201,8 @@ type queuedPage struct {
 // allows) <a href> targets, and repeat -- bounded overall by maxPages so an
 // aggressive RecursionDepth against a large site can't run away.
 func Run(ctx context.Context, req Request) (*Response, error) {
+	rep := scanprogress.Or(req.Progress)
+
 	seed, err := url.Parse(strings.TrimSpace(req.URL))
 	if err != nil || seed.Host == "" || (seed.Scheme != "http" && seed.Scheme != "https") {
 		return nil, fmt.Errorf("invalid URL %q", req.URL)
@@ -151,6 +214,11 @@ func Run(ctx context.Context, req Request) (*Response, error) {
 	}
 	if maxPages > maxPagesCap {
 		maxPages = maxPagesCap
+	}
+
+	patterns := Patterns
+	if req.SecretFinderEngine {
+		patterns = append(append([]Pattern{}, Patterns...), SecretFinderPatterns...)
 	}
 
 	client := newClient()
@@ -178,15 +246,27 @@ func Run(ctx context.Context, req Request) (*Response, error) {
 		}
 		visitedPages[item.url] = true
 
-		body, err := fetch(ctx, client, item.url, req.Headers)
+		// Each page is its own check, planned the moment the crawl reaches it,
+		// so the grid grows as more pages turn up.
+		rep.Plan(scanprogress.Check{ID: item.url, Label: item.url, Group: "Pages"})
+		rep.Start(item.url)
+		matchesBefore := len(matches)
+
+		body, contentType, err := fetch(ctx, client, item.url, req.Headers)
 		if err != nil {
+			rep.Done(item.url, 0, err)
 			continue
 		}
 		pagesScanned = append(pagesScanned, item.url)
-		matches = append(matches, scanText(body, item.url, req.Entropy)...)
+		// Binary responses (images, archives, fonts) cannot hold readable source,
+		// so scanning them only produces noise.
+		if !skippableContentType(contentType) {
+			matches = append(matches, scanText(body, item.url, patterns, req.Entropy)...)
+		}
 
 		pageURL, err := url.Parse(item.url)
 		if err != nil {
+			rep.Done(item.url, len(matches)-matchesBefore, err)
 			continue
 		}
 
@@ -203,14 +283,19 @@ func Run(ctx context.Context, req Request) (*Response, error) {
 			}
 			visitedScripts[resolved.String()] = true
 			scriptCount++
-			scriptBody, err := fetch(ctx, client, resolved.String(), req.Headers)
+			scriptBody, scriptType, err := fetch(ctx, client, resolved.String(), req.Headers)
 			if err != nil {
 				continue
 			}
 			scriptsScanned = append(scriptsScanned, resolved.String())
-			matches = append(matches, scanText(scriptBody, resolved.String(), req.Entropy)...)
+			if !skippableContentType(scriptType) {
+				matches = append(matches, scanText(scriptBody, resolved.String(), patterns, req.Entropy)...)
+			}
 		}
 
+		// The page and its own scripts are scanned by now, so its check is done
+		// whether or not the crawl goes any deeper from here.
+		rep.Done(item.url, len(matches)-matchesBefore, nil)
 		if item.depth >= req.RecursionDepth {
 			continue
 		}
@@ -231,11 +316,14 @@ func Run(ctx context.Context, req Request) (*Response, error) {
 	}, nil
 }
 
+// dedupMatches keeps one match per distinct secret per location. Keying on the
+// value fingerprint, not the pattern name, collapses overlapping patterns that
+// all match the same credential (the three private-key patterns, for example).
 func dedupMatches(in []Match) []Match {
 	seen := make(map[string]bool, len(in))
 	out := make([]Match, 0, len(in))
 	for _, m := range in {
-		key := m.Type + "|" + m.Location + "|" + m.Value
+		key := m.Fingerprint + "|" + m.Location
 		if seen[key] {
 			continue
 		}

@@ -2,15 +2,29 @@ package probescan
 
 import (
 	"context"
+	"strconv"
 	"strings"
+
+	"github.com/Indigo6415/Aperture/internal/fingerprint"
+)
+
+// Confidence levels for a Finding. "confirmed" means the response was parsed
+// as the file it claims to be; "likely" means it passed a plain-text or
+// content-presence check only; "heuristic" is reserved for findings that rest
+// on a guess (for example a bare directory name).
+const (
+	ConfidenceConfirmed = "confirmed"
+	ConfidenceLikely    = "likely"
+	ConfidenceHeuristic = "heuristic"
 )
 
 // Finding is one thing a module discovered -- a path that exists, a
 // misconfiguration, an exposed file. Label/URL/Detail are the summary a
 // finding list renders inline; Method/StatusCode/Evidence are the "how was
-// this found" specifics (the request that triggered it, and the exact
-// matched content -- a leaked key's value, a SQL error string, a reflected
-// payload) shown when a finding is expanded for more detail.
+// this found" specifics (the request that triggered it, and the matched
+// content, redacted where it could be a credential) shown when a finding is
+// expanded for more detail. Confidence says how strongly the response
+// supports the claim.
 type Finding struct {
 	Label      string `json:"label"`
 	URL        string `json:"url,omitempty"`
@@ -18,6 +32,7 @@ type Finding struct {
 	Evidence   string `json:"evidence,omitempty"`
 	Method     string `json:"method,omitempty"`
 	StatusCode int    `json:"statusCode,omitempty"`
+	Confidence string `json:"confidence,omitempty"`
 }
 
 // ModuleResult is one check category's outcome, shaped for direct rendering
@@ -51,10 +66,13 @@ type pathCheck struct {
 }
 
 // --- Shared response-validator helpers, mirroring the small predicates
-// the Python modules inline as lambdas. ---
+// the Python modules inline as lambdas. These are substring checks and are
+// only appropriate where the content itself is distinctive; file checks
+// should prefer the structural validators in validate.go. ---
 
 func nonEmptyBody(r *httpResult) bool { return len(r.Text) > 0 }
 
+// containsAny passes when any substring appears, compared case-insensitively.
 func containsAny(subs ...string) func(r *httpResult) bool {
 	return func(r *httpResult) bool {
 		body := r.textLower()
@@ -67,6 +85,8 @@ func containsAny(subs ...string) func(r *httpResult) bool {
 	}
 }
 
+// containsAll passes only when every substring appears, compared
+// case-insensitively.
 func containsAll(subs ...string) func(r *httpResult) bool {
 	return func(r *httpResult) bool {
 		body := r.textLower()
@@ -93,18 +113,46 @@ func containsCase(subs ...string) func(r *httpResult) bool {
 	}
 }
 
+// bodyPrefix passes when the raw body starts with prefix (a magic number).
 func bodyPrefix(prefix []byte) func(r *httpResult) bool {
 	return func(r *httpResult) bool {
 		return len(r.Body) >= len(prefix) && string(r.Body[:len(prefix)]) == string(prefix)
 	}
 }
 
+// observation summarizes r for comparison with the host's catch-all profile.
+func (r *httpResult) observation() fingerprint.Observation {
+	return fingerprint.Observe(r.StatusCode, r.Header.Get("Content-Type"), r.Body)
+}
+
+// isCatchAll reports whether r is the host's soft-404 page. A scan without a
+// profile (the probe that builds it failed) never treats anything as one.
+func (c *probeClient) isCatchAll(r *httpResult) bool {
+	return c.profile.Matches(r.observation())
+}
+
 // runPathChecks runs every check in checks concurrently (bounded by the
 // shared client's semaphore) against base+check.path, appending
-// "<label> <verb> at <url>" findings for hits. verb lets a module phrase the
-// finding the way its Python original did ("exposed at", "accessible at",
-// "found at", ...).
+// "<label> <verb> at <url>" findings for hits. A response that matches the
+// host's catch-all profile is never a hit, whatever its body says. verb lets
+// a module phrase the finding the way its Python original did ("exposed at",
+// "accessible at", "found at", ...).
 func runPathChecks(ctx context.Context, c *probeClient, base string, checks []pathCheck, follow bool, verb string) []Finding {
+	return runChecks(ctx, c, base, checks, follow, verb, "", false)
+}
+
+// runFileChecks is the strict path for file-disclosure checks. On top of
+// runPathChecks' catch-all gate it rejects any HTML response, since a
+// configuration, key, or dump is never legitimately served as a web page, and
+// it records confidence on each finding. Pass ConfidenceConfirmed for lists
+// of structural validators and ConfidenceLikely for plain-text-only lists.
+func runFileChecks(ctx context.Context, c *probeClient, base string, checks []pathCheck, confidence string) []Finding {
+	return runChecks(ctx, c, base, checks, false, "exposed at", confidence, true)
+}
+
+// runChecks is the shared engine behind runPathChecks and runFileChecks.
+// strictFile adds the non-HTML rule and fills Confidence and Evidence.
+func runChecks(ctx context.Context, c *probeClient, base string, checks []pathCheck, follow bool, verb, confidence string, strictFile bool) []Finding {
 	type hit struct {
 		idx     int
 		finding Finding
@@ -117,16 +165,25 @@ func runPathChecks(ctx context.Context, c *probeClient, base string, checks []pa
 		go func(i int, chk pathCheck) {
 			url := base + chk.path
 			r, err := c.get(ctx, url, follow)
-			if err != nil || r.StatusCode != 200 || !chk.valid(r) {
+			if err != nil || r.StatusCode != 200 || c.isCatchAll(r) || !chk.valid(r) {
 				results <- hit{idx: i}
 				return
 			}
-			results <- hit{idx: i, finding: Finding{
+			if strictFile && looksHTML(r) {
+				results <- hit{idx: i}
+				return
+			}
+			f := Finding{
 				Label:      chk.label + " " + verb + " " + url,
 				URL:        url,
 				Method:     "GET",
 				StatusCode: r.StatusCode,
-			}}
+			}
+			if strictFile {
+				f.Confidence = confidence
+				f.Evidence = evidenceFor(r)
+			}
+			results <- hit{idx: i, finding: f}
 		}(i, chk)
 	}
 
@@ -146,4 +203,14 @@ func runPathChecks(ctx context.Context, c *probeClient, base string, checks []pa
 		}
 	}
 	return out
+}
+
+// evidenceFor describes a file hit for the finding's evidence field. Text
+// files are shown with secret-looking values masked; binary files are
+// summarized by size, since their bytes are not useful inline.
+func evidenceFor(r *httpResult) string {
+	if validPlainText(r) {
+		return maskEvidence(r.Text)
+	}
+	return "binary content, " + strconv.Itoa(len(r.Body)) + " bytes"
 }

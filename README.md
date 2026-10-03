@@ -22,8 +22,9 @@ frontend embedded.
 ## Install
 
 `install.sh` (macOS/Linux) and `install.ps1` (Windows) install everything —
-Go, Node, ffuf, feroxbuster, nuclei, subfinder, amass, httpx, katana (plus,
-best-effort, WhatWeb on macOS/Linux) — build Aperture from this checkout,
+Go, Node, ffuf, feroxbuster, nuclei, subfinder, amass, httpx, katana,
+retire.js (plus, best-effort, WhatWeb on macOS/Linux) — build Aperture from
+this checkout,
 and put `aperture` on your `PATH`. Safe to re-run any time to update
 everything to latest; no admin/root required beyond your OS's usual
 package-manager prompts.

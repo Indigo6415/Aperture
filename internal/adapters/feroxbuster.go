@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Indigo6415/Aperture/internal/fingerprint"
 	"github.com/Indigo6415/Aperture/internal/model"
 	"github.com/Indigo6415/Aperture/internal/wordlists"
 )
@@ -28,9 +29,12 @@ type FeroxbusterConfig struct {
 	Threads     int               `json:"threads,omitempty"`
 	Depth       int               `json:"depth,omitempty"` // 0 = ferox default; 1 = no recursion
 	NoRecursion bool              `json:"noRecursion,omitempty"`
-	Timeout     int               `json:"timeoutSeconds,omitempty"`
-	RateLimit   int               `json:"rateLimit,omitempty"` // feroxbuster --rate-limit: requests/sec across the whole run; 0 = unlimited
-	ExtraArgs   []string          `json:"extraArgs,omitempty"`
+	// DisableCatchAllFilter turns off filtering of responses that match the
+	// host's soft-404 page (see catchall.go).
+	DisableCatchAllFilter bool     `json:"disableCatchAllFilter,omitempty"`
+	Timeout               int      `json:"timeoutSeconds,omitempty"`
+	RateLimit             int      `json:"rateLimit,omitempty"` // feroxbuster --rate-limit: requests/sec across the whole run; 0 = unlimited
+	ExtraArgs             []string `json:"extraArgs,omitempty"`
 }
 
 type FeroxbusterAdapter struct{}
@@ -89,6 +93,16 @@ func (a *FeroxbusterAdapter) Run(ctx context.Context, config json.RawMessage, me
 	// larger than this base-level estimate, so this still catches it.
 	if err := checkFuzzRequestCount(a.Name(), cfg.Wordlist, cfg.Extensions); err != nil {
 		return err
+	}
+
+	// Build the catch-all profile from the same base feroxbuster will walk.
+	// When it is stable, responses matching it are dropped below; when it is not,
+	// the repeated-shape threshold is the only guard, as before.
+	var catchAll *fingerprint.Profile
+	if !cfg.DisableCatchAllFilter {
+		if p := buildCatchAll(ctx, cfg.URL, cfg.Headers); p != nil && p.Stable {
+			catchAll = p
+		}
 	}
 
 	// --no-state prevents feroxbuster from writing a state file to disk on
@@ -196,7 +210,13 @@ func (a *FeroxbusterAdapter) Run(ctx context.Context, config json.RawMessage, me
 		done++
 		sig := feroxSignature{resp.Status, resp.ContentLength, resp.WordCount, resp.LineCount}
 		seen[sig]++
-		if seen[sig] <= feroxNoiseThreshold {
+		// A stable catch-all profile decides on its own; otherwise the
+		// repeated-shape threshold does, which is the pre-existing behavior.
+		emitIt := seen[sig] <= feroxNoiseThreshold
+		if catchAll != nil {
+			emitIt = !catchAll.MatchesSize(resp.Status, resp.ContentLength)
+		}
+		if emitIt {
 			emit(model.Finding{
 				ID:            newFindingID(),
 				URL:           resp.URL,

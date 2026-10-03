@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -26,8 +27,25 @@ type NucleiConfig struct {
 	Targets   []string `json:"targets"`
 	Severity  string   `json:"severity,omitempty"` // nuclei -severity value, e.g. "medium,high,critical"; empty = all severities
 	RateLimit int      `json:"rateLimit,omitempty"`
+	// Tags restricts the run to templates carrying any of these tags (nuclei
+	// -tags). Use it to run only the templates that fit the technologies
+	// already fingerprinted on a host (see techfp.NucleiTags), which cuts both
+	// noise and request volume.
+	Tags []string `json:"tags,omitempty"`
+	// ExcludeTags removes templates by tag (nuclei -etags). When left empty,
+	// denialof-service and fuzzing templates are excluded: they send traffic
+	// built to break a target, which is not what a discovery run should do.
+	ExcludeTags []string `json:"excludeTags,omitempty"`
+	// Retries and Timeout bound each template request (nuclei -retries and
+	// -timeout, in seconds). Zero leaves nuclei's own defaults in place.
+	Retries   int      `json:"retries,omitempty"`
+	Timeout   int      `json:"timeout,omitempty"`
 	ExtraArgs []string `json:"extraArgs,omitempty"`
 }
+
+// nucleiDefaultExcludeTags are excluded from every run unless the caller
+// supplies its own ExcludeTags.
+var nucleiDefaultExcludeTags = []string{"dos", "fuzz"}
 
 type NucleiAdapter struct{}
 
@@ -43,6 +61,10 @@ type nucleiResult struct {
 	} `json:"info"`
 	Host      string `json:"host"`
 	MatchedAt string `json:"matched-at"`
+	// MatcherName says which matcher inside the template fired.
+	MatcherName string `json:"matcher-name"`
+	// CurlCommand is nuclei's own reproduction command for the match.
+	CurlCommand string `json:"curl-command"`
 }
 
 func (a *NucleiAdapter) Run(ctx context.Context, config json.RawMessage, meta RunMeta, emit Emit, progress Progress) error {
@@ -72,6 +94,20 @@ func (a *NucleiAdapter) Run(ctx context.Context, config json.RawMessage, meta Ru
 	args := []string{"-l", targetFile.Name(), "-jsonl", "-silent"}
 	if cfg.Severity != "" {
 		args = append(args, "-severity", cfg.Severity)
+	}
+	if len(cfg.Tags) > 0 {
+		args = append(args, "-tags", strings.Join(cfg.Tags, ","))
+	}
+	exclude := cfg.ExcludeTags
+	if len(exclude) == 0 {
+		exclude = nucleiDefaultExcludeTags
+	}
+	args = append(args, "-etags", strings.Join(exclude, ","))
+	if cfg.Retries > 0 {
+		args = append(args, "-retries", strconv.Itoa(cfg.Retries))
+	}
+	if cfg.Timeout > 0 {
+		args = append(args, "-timeout", strconv.Itoa(cfg.Timeout))
 	}
 	if cfg.RateLimit > 0 {
 		args = append(args, "-rate-limit", strconv.Itoa(cfg.RateLimit))
@@ -110,11 +146,20 @@ func (a *NucleiAdapter) Run(ctx context.Context, config json.RawMessage, meta Ru
 			url = res.Host
 		}
 		emit(model.Finding{
-			ID:           newFindingID(),
-			URL:          url,
-			ContentType:  res.Info.Name,
-			Method:       "VULN",
-			Tags:         []string{res.Info.Severity, res.TemplateID},
+			ID:  newFindingID(),
+			URL: url,
+			// Method is the request method nuclei used, not a placeholder. The
+			// Tester replays findings with it, so "VULN" made replays fail.
+			Method:      nucleiMethod(res.CurlCommand),
+			ContentType: res.Info.Name,
+			Tags:        []string{res.Info.Severity, res.TemplateID},
+			Template:    res.TemplateID,
+			Severity:    res.Info.Severity,
+			Matcher:     res.MatcherName,
+			Reproduce:   res.CurlCommand,
+			// A nuclei template is a verified rule, but templates can misfire,
+			// so a match is reported as likely rather than confirmed.
+			Confidence:   "likely",
 			SourceTool:   a.Name(),
 			SourceNodeID: meta.NodeID,
 			RunID:        meta.RunID,
@@ -140,4 +185,17 @@ func (a *NucleiAdapter) Run(ctx context.Context, config json.RawMessage, meta Ru
 		return fmt.Errorf("nuclei: %w", waitErr)
 	}
 	return nil
+}
+
+// curlMethodPattern pulls the request method out of a curl command line, such
+// as the "-X POST" that nuclei writes for non-GET templates.
+var curlMethodPattern = regexp.MustCompile(`-X\s+([A-Z]+)`)
+
+// nucleiMethod returns the HTTP method of a nuclei match from its curl command,
+// defaulting to GET when the command names none.
+func nucleiMethod(curl string) string {
+	if m := curlMethodPattern.FindStringSubmatch(curl); m != nil {
+		return m[1]
+	}
+	return "GET"
 }

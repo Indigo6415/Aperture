@@ -6,7 +6,7 @@ import { copyToClipboard, useContextMenu } from '../contextMenu'
 import { sendToJwtScanner } from '../jwtHandoff'
 import { sendToProbe } from '../probeHandoff'
 import { sendToSecretScan } from '../secretScanHandoff'
-import { sendToRepeater } from '../repeaterHandoff'
+import { sendToBypass403 } from '../bypass403Handoff'
 import { useAutoExpandOnce, useCollapsible } from '../collapsible'
 
 export interface TargetProgress {
@@ -129,7 +129,7 @@ function TargetRow({ t }: { t: TargetProgress }) {
           { label: 'Send to JWT Scanner', onSelect: () => sendToJwtScanner(t.target) },
           { label: 'Send to Probe', onSelect: () => sendToProbe(t.target) },
           { label: 'Send to Secret Scanner', onSelect: () => sendToSecretScan(t.target) },
-          { label: 'Send to Repeater', onSelect: () => sendToRepeater(t.target) },
+          { label: 'Send to 403 Bypass', onSelect: () => sendToBypass403(t.target) },
         ])
       }}
       title={tooltipFor(t)}

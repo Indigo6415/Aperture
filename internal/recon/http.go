@@ -2,8 +2,8 @@ package recon
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
+	"github.com/Indigo6415/Aperture/internal/netgov"
 	"io"
 	"net/http"
 	"regexp"
@@ -47,18 +47,16 @@ func checkHTTP(ctx context.Context, domain string) (map[string]any, error) {
 
 func fetchOnce(ctx context.Context, scheme, domain string) (map[string]any, error) {
 	var redirects []string
-	client := &http.Client{
-		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
-		// Record every hop instead of silently following it, so the UI can
-		// show the redirect chain; still bail out after 10 hops like the
-		// default client would.
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			redirects = append(redirects, req.URL.String())
-			if len(via) >= 10 {
-				return http.ErrUseLastResponse
-			}
-			return nil
-		},
+	client := netgov.NewClient(0, true)
+	// Record every hop instead of silently following it, so the UI can
+	// show the redirect chain; still bail out after 10 hops like the
+	// default client would.
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		redirects = append(redirects, req.URL.String())
+		if len(via) >= 10 {
+			return http.ErrUseLastResponse
+		}
+		return nil
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, scheme+"://"+domain+"/", nil)

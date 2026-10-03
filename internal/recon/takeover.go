@@ -80,3 +80,15 @@ func bodyMatchesProvider(provider, body string) bool {
 	}
 	return false
 }
+
+// providerHasFingerprint reports whether provider has its own "unclaimed"
+// page text. Providers without one can only be judged from DNS, so a page match
+// is never possible for them and must not be counted as confirmation.
+func providerHasFingerprint(provider string) bool {
+	for _, p := range takeoverProviders {
+		if p.name == provider {
+			return p.fingerprint != ""
+		}
+	}
+	return false
+}

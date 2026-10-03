@@ -3,7 +3,6 @@ package api
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"time"
 
 	"github.com/Indigo6415/Aperture/internal/cve"
@@ -79,7 +78,6 @@ func (s *Server) runIdentifyJob(caseID, jobID string, targets []string) {
 		final = store.RunCancelled
 	}
 	_ = s.store.FinishJob(jobID, final, "")
-	_ = s.store.LogActivity(caseID, "job_finished", fmt.Sprintf("Job %s finished: %s", jobID, final))
 	s.hub.publish(jobID, RunEvent{Type: "done", Message: string(final)})
 }
 

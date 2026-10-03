@@ -34,16 +34,30 @@ func maxSeverity(a, b string) string {
 	return a
 }
 
-// handleListCaseScans returns every Probe/JWT/Secret Scanner run persisted
-// for a case (see store.SaveCaseScan), most recent first -- without each
-// row's full raw result, matching store.ListCaseScans' own doc comment.
+// handleListCaseScans returns every scan tool run persisted for a case (see
+// store.SaveCaseScan), most recent first -- without each row's full raw
+// result, matching store.ListCaseScans' own doc comment. An optional
+// ?tool= query param narrows it to one tool's history, e.g. for a tab that
+// only wants its own past runs.
 func (s *Server) handleListCaseScans(w http.ResponseWriter, r *http.Request) {
-	scans, err := s.store.ListCaseScans(r.PathValue("id"))
+	scans, err := s.store.ListCaseScans(r.PathValue("id"), r.URL.Query().Get("tool"))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, scans)
+}
+
+// handleGetCaseScan returns one persisted scan's full record, including its
+// raw result payload -- used to restore a tool tab's results on reload and
+// to open a past run from its "Scans" history tab (see store.GetCaseScan).
+func (s *Server) handleGetCaseScan(w http.ResponseWriter, r *http.Request) {
+	scan, err := s.store.GetCaseScan(r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, scan)
 }
 
 // saveCaseScan is the shared tail end of handleProbeScan/handleJWTScan/
@@ -63,5 +77,4 @@ func (s *Server) saveCaseScan(caseID, target, tool, severity, summary string, da
 	if err := s.store.SaveCaseScan(cs); err != nil {
 		return
 	}
-	_ = s.store.LogActivity(caseID, "scan_saved", tool+" scan of "+target+": "+summary)
 }

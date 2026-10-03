@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/Indigo6415/Aperture/internal/netgov"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -18,7 +19,11 @@ import (
 // user explicitly does so -- there is no automatic/background job creation
 // anywhere in this package.
 const (
-	ToolFeroxbuster   = "feroxbuster"
+	ToolFeroxbuster = "feroxbuster"
+	// ToolWebFuzz is Aperture's native directory fuzzer (internal/adapters/webfuzz.go).
+	// It runs the same wordlist job as ToolFeroxbuster without an external
+	// binary, and it calibrates against the host's catch-all page itself.
+	ToolWebFuzz       = "webfuzz"
 	ToolFFufSubdomain = "ffuf-subdomain"
 	ToolFFufVHost     = "ffuf-vhost"
 	// ToolFFufCustom is the general-purpose FFuF GUI: unlike
@@ -31,22 +36,18 @@ const (
 	// ToolIdentify runs passive recon (internal/recon) directly rather than
 	// an engine.Flow -- see runIdentifyJob in identify.go.
 	ToolIdentify = "identify"
-	// ToolSubfinder/ToolAmass are additional, purely passive OSINT-source
-	// subdomain-enumeration methods alongside ToolFFufSubdomain's
-	// wordlist-based guessing (see adapters.AmassConfig's doc comment for
-	// why amass always runs passive here).
+	// ToolSubfinder is an additional, purely passive OSINT-source
+	// subdomain-enumeration method alongside ToolFFufSubdomain's
+	// wordlist-based guessing.
 	ToolSubfinder = "subfinder"
-	ToolAmass     = "amass"
 	// ToolKatana is a crawl-based content-discovery method alongside
 	// ToolFeroxbuster's wordlist-based guessing.
 	ToolKatana = "katana"
-	// ToolHttpx/ToolWhatWeb are bulk HTTP probing/fingerprinting methods,
-	// each launched (like every other tool here) as one source node per
-	// target rather than truly batched into a single process -- simpler and
-	// consistent with every other tool's per-target progress/status
-	// tracking, at the cost of httpx/whatweb's own bulk-run efficiency.
-	ToolHttpx   = "httpx"
-	ToolWhatWeb = "whatweb"
+	// ToolNuclei runs nuclei's community template set against each target to
+	// flag known CVEs/misconfigurations -- same one-source-node-per-target
+	// fanout as every other tool here, at the cost of nuclei's own
+	// bulk-target efficiency.
+	ToolNuclei = "nuclei"
 )
 
 // FFufJobOptions carries every field specific to ToolFFufCustom -- an almost
@@ -88,7 +89,7 @@ type startJobRequest struct {
 	// CredentialID optionally names a saved case credential (see
 	// handlers_credentials.go) whose headers/cookie are applied to every
 	// request feroxbuster/ffuf issues for this job -- the same vault
-	// Probe/JWT Scanner/Secret Scanner/Repeater already draw from.
+	// Probe/JWT Scanner/Secret Scanner already draw from.
 	CredentialID string `json:"credentialId,omitempty"`
 }
 
@@ -220,13 +221,21 @@ func (s *Server) buildToolFlow(tool string, targets []string, req startJobReques
 	case ToolSubfinder:
 		return buildSubfinderFlow(targets, opts, credHeaders), nil
 
-	case ToolAmass:
-		// Disabled for now -- the amass binary itself has been observed to
-		// just hang/produce nothing on every run regardless of flags, so
-		// there's no config fix here; see the Amass tab's own notice for
-		// the user-facing side of this. Rejected here too (not just in the
-		// UI) so a direct API call can't launch it either.
-		return engine.Flow{}, fmt.Errorf("amass: temporarily disabled -- will be fixed soon")
+	case ToolWebFuzz:
+		wordlistPath := s.resolveWordlist(opts, wordlists.CategoryDirectories, wordlists.DefaultName)
+		extensions, _ := wordlists.ExtensionsForCategory(s.wordlistsDir)
+		return buildFanoutFlow("Webfuzz", targets, func(i int, target string) (engine.NodeKind, string, json.RawMessage) {
+			base := target
+			if !strings.Contains(base, "://") {
+				base = scheme + "://" + base
+			}
+			cfg, _ := json.Marshal(adapters.WebFuzzConfig{
+				URL: base + "/FUZZ", Wordlist: wordlistPath, Extensions: extensions, Headers: credHeaders,
+				Threads: opts.Threads, Timeout: opts.TimeoutSeconds, RateLimit: opts.RateLimit,
+				Recursive: opts.Recursive,
+			})
+			return engine.KindWebFuzz, "webfuzz: " + target, cfg
+		}), nil
 
 	case ToolKatana:
 		return buildFanoutFlow("Katana", targets, func(i int, target string) (engine.NodeKind, string, json.RawMessage) {
@@ -240,29 +249,16 @@ func (s *Server) buildToolFlow(tool string, targets []string, req startJobReques
 			return engine.KindKatana, "katana: " + target, cfg
 		}), nil
 
-	case ToolHttpx:
-		return buildFanoutFlow("Httpx", targets, func(i int, target string) (engine.NodeKind, string, json.RawMessage) {
+	case ToolNuclei:
+		return buildFanoutFlow("Nuclei", targets, func(i int, target string) (engine.NodeKind, string, json.RawMessage) {
 			base := target
 			if !strings.Contains(base, "://") {
 				base = scheme + "://" + base
 			}
-			cfg, _ := json.Marshal(adapters.HttpxConfig{
-				Targets: []string{base}, Headers: credHeaders,
-				Threads: opts.Threads, Timeout: opts.TimeoutSeconds, RateLimit: opts.RateLimit,
+			cfg, _ := json.Marshal(adapters.NucleiConfig{
+				Targets: []string{base}, RateLimit: opts.RateLimit,
 			})
-			return engine.KindHttpx, "httpx: " + target, cfg
-		}), nil
-
-	case ToolWhatWeb:
-		return buildFanoutFlow("WhatWeb", targets, func(i int, target string) (engine.NodeKind, string, json.RawMessage) {
-			base := target
-			if !strings.Contains(base, "://") {
-				base = scheme + "://" + base
-			}
-			cfg, _ := json.Marshal(adapters.WhatWebConfig{
-				Targets: []string{base}, Headers: credHeaders, Threads: opts.Threads,
-			})
-			return engine.KindWhatWeb, "whatweb: " + target, cfg
+			return engine.KindNuclei, "nuclei: " + target, cfg
 		}), nil
 
 	default:
@@ -364,7 +360,6 @@ func (s *Server) handleStartJob(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		_ = s.store.LogActivity(caseID, "job_started", fmt.Sprintf("Started identify against %d target(s)", len(targets)))
 		go s.runIdentifyJob(caseID, jobID, targets)
 		writeJSON(w, http.StatusAccepted, jobStartResult{JobID: jobID})
 		return
@@ -410,8 +405,7 @@ func (s *Server) handleStartJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = s.store.LogActivity(caseID, "job_started", fmt.Sprintf("Started %s against %d target(s)", req.Tool, len(targets)))
-	go s.executeToolJob(caseID, flow, jobID, runID)
+	go s.executeToolJob(caseID, flow, jobID, runID, jobPolicy(req.Options))
 
 	writeJSON(w, http.StatusAccepted, jobStartResult{JobID: jobID})
 }
@@ -511,12 +505,6 @@ func (s *Server) jobNodeDetails(job store.Job) []JobNodeDetail {
 			details = append(details, JobNodeDetail{
 				NodeID: n.ID, Target: cfg.Domain, Threads: cfg.Threads, TimeoutSeconds: cfg.Timeout, RateLimit: cfg.RateLimit,
 			})
-		case engine.KindAmass:
-			var cfg adapters.AmassConfig
-			if json.Unmarshal(n.Config, &cfg) != nil {
-				continue
-			}
-			details = append(details, JobNodeDetail{NodeID: n.ID, Target: cfg.Domain, RateLimit: cfg.RateLimit})
 		case engine.KindKatana:
 			var cfg adapters.KatanaConfig
 			if json.Unmarshal(n.Config, &cfg) != nil {
@@ -525,22 +513,12 @@ func (s *Server) jobNodeDetails(job store.Job) []JobNodeDetail {
 			details = append(details, JobNodeDetail{
 				NodeID: n.ID, Target: cfg.URL, TimeoutSeconds: cfg.Timeout, RateLimit: cfg.RateLimit,
 			})
-		case engine.KindHttpx:
-			var cfg adapters.HttpxConfig
+		case engine.KindNuclei:
+			var cfg adapters.NucleiConfig
 			if json.Unmarshal(n.Config, &cfg) != nil || len(cfg.Targets) == 0 {
 				continue
 			}
-			details = append(details, JobNodeDetail{
-				NodeID: n.ID, Target: cfg.Targets[0], Threads: cfg.Threads, TimeoutSeconds: cfg.Timeout, RateLimit: cfg.RateLimit,
-			})
-		case engine.KindWhatWeb:
-			var cfg adapters.WhatWebConfig
-			if json.Unmarshal(n.Config, &cfg) != nil || len(cfg.Targets) == 0 {
-				continue
-			}
-			details = append(details, JobNodeDetail{
-				NodeID: n.ID, Target: cfg.Targets[0], Threads: cfg.Threads,
-			})
+			details = append(details, JobNodeDetail{NodeID: n.ID, Target: cfg.Targets[0], RateLimit: cfg.RateLimit})
 		}
 	}
 	return details
@@ -557,4 +535,14 @@ func candidateCount(wordlistPath string, extensions []string) int {
 		return 0
 	}
 	return lines * (1 + len(extensions))
+}
+
+// jobPolicy turns a job's resolved intensity preset into the per-host budget its
+// requests run under. Threads caps how many requests are in flight to one host,
+// and RateLimit paces them. A preset with no rate limit (the normal and
+// aggressive presets) leaves pacing off, while the adaptive throttling still
+// applies whenever the target starts pushing back.
+func jobPolicy(o engine.ScanOptions) netgov.Policy {
+	resolved := o.Resolved()
+	return netgov.Policy{MaxConcurrency: resolved.Threads, MaxRPS: float64(resolved.RateLimit)}
 }

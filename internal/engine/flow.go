@@ -21,15 +21,11 @@ const (
 	KindFeroxbuster NodeKind = "feroxbuster"
 	KindNmap        NodeKind = "nmap"
 	KindNuclei      NodeKind = "nuclei"
-	// KindSubfinder/KindAmass are subdomain-enumeration sources (see
-	// adapters.SubfinderAdapter/AmassAdapter), KindKatana is a crawl-based
-	// content-discovery source alongside KindFFuf/KindFeroxbuster, and
-	// KindHttpx/KindWhatWeb are bulk HTTP-probing/fingerprinting sources.
+	// KindSubfinder is a subdomain-enumeration source (see
+	// adapters.SubfinderAdapter) and KindKatana is a crawl-based
+	// content-discovery source alongside KindFFuf/KindFeroxbuster.
 	KindSubfinder NodeKind = "subfinder"
-	KindAmass     NodeKind = "amass"
 	KindKatana    NodeKind = "katana"
-	KindHttpx     NodeKind = "httpx"
-	KindWhatWeb   NodeKind = "whatweb"
 	KindFilter    NodeKind = "filter"
 	KindMerge     NodeKind = "merge"
 	KindTable     NodeKind = "table"
@@ -51,7 +47,7 @@ const (
 func (k NodeKind) IsSource() bool {
 	switch k {
 	case KindWebFuzz, KindFFuf, KindFeroxbuster, KindNmap, KindNuclei,
-		KindSubfinder, KindAmass, KindKatana, KindHttpx, KindWhatWeb:
+		KindSubfinder, KindKatana:
 		return true
 	default:
 		return false

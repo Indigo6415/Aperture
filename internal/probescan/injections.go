@@ -2,9 +2,14 @@ package probescan
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 	"regexp"
+	"sort"
 	"strings"
+	"time"
+
+	"github.com/Indigo6415/Aperture/internal/netgov"
 )
 
 // sqlErrorStrings ports injections.py's SQL_ERRORS table.
@@ -99,21 +104,48 @@ func withParam(rawURL string, params url.Values, param, value string) string {
 	return u.String()
 }
 
-// firstSQLError returns the first (db, errorString) pair found in body, or
-// ("", "") if none matched -- one finding per parameter is enough, mirroring
-// the Python check's early return.
+// firstSQLError returns the (db, errorString) pair found in body, or ("", "")
+// if none matched. Databases are checked in sorted order so the same body
+// always reports the same engine, even when two signatures match.
 func firstSQLError(body string) (db, errStr string) {
-	for db, errs := range sqlErrorStrings {
-		for _, e := range errs {
+	names := make([]string, 0, len(sqlErrorStrings))
+	for name := range sqlErrorStrings {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		for _, e := range sqlErrorStrings[name] {
 			if strings.Contains(body, e) {
-				return db, e
+				return name, e
 			}
 		}
 	}
 	return "", ""
 }
 
+// baselineFor fetches the target with its original parameter values. Every
+// injection check compares against this, so text that the page already shows
+// (a docs page quoting an SQL error, a sample /etc/passwd excerpt) is never
+// reported as a reflection of the payload.
+func baselineFor(ctx context.Context, c *probeClient, target paramTarget) *httpResult {
+	r, err := c.get(ctx, target.url, true)
+	if err != nil {
+		return nil
+	}
+	return r
+}
+
+// checkSQLInjection appends a bare quote to each parameter and looks for a
+// database error string. A page that already shows such an error on its
+// original request is skipped for that whole target, since it says nothing
+// about the injected value.
 func checkSQLInjection(ctx context.Context, c *probeClient, target paramTarget) []Finding {
+	baseline := baselineFor(ctx, c, target)
+	if baseline != nil {
+		if db, _ := firstSQLError(baseline.textLower()); db != "" {
+			return nil
+		}
+	}
 	var findings []Finding
 	for param, values := range target.params {
 		original := ""
@@ -132,17 +164,90 @@ func checkSQLInjection(ctx context.Context, c *probeClient, target paramTarget) 
 				Method:     "GET",
 				StatusCode: r.StatusCode,
 				Evidence:   errStr,
-				Detail:     "Appended a bare `'` to the '" + param + "' parameter; the response's body then contained a " + db + " error string",
+				Detail:     "Appended a bare `'` to the '" + param + "' parameter; the response's body then contained a " + db + " error string that the original request did not contain",
+				Confidence: ConfidenceLikely,
 			})
 		}
 	}
 	return findings
 }
 
+// timeDelaySeconds is the sleep each time-based payload requests. It stays
+// below probeTimeout so a real delay completes instead of timing out.
+const timeDelaySeconds = 3
+
+// timeSQLPayloads are sleep-style payloads for the common engines. Each is
+// appended to the parameter's original value.
+var timeSQLPayloads = []struct{ engine, suffix string }{
+	{"MySQL", fmt.Sprintf("' AND SLEEP(%d)-- -", timeDelaySeconds)},
+	{"PostgreSQL", fmt.Sprintf("'||pg_sleep(%d)-- -", timeDelaySeconds)},
+	{"MSSQL", fmt.Sprintf("';WAITFOR DELAY '0:0:%d'-- -", timeDelaySeconds)},
+}
+
+// checkTimeBasedSQLi detects blind SQL injection by timing. A payload counts
+// only when it is slower than the original request by most of the requested
+// delay, and the same result repeats on a second send. Timing is unreliable
+// while the host is throttled, so the check is skipped whenever the governor
+// has tagged responses as suspect.
+func checkTimeBasedSQLi(ctx context.Context, c *probeClient, target paramTarget) []Finding {
+	var findings []Finding
+	for param, values := range target.params {
+		original := ""
+		if len(values) > 0 {
+			original = values[0]
+		}
+		baselineStart := time.Now()
+		base, err := c.get(ctx, target.url, true)
+		baseElapsed := time.Since(baselineStart)
+		if err != nil || suspectResponse(base) {
+			continue
+		}
+		for _, p := range timeSQLPayloads {
+			injected := withParam(target.url, target.params, param, original+p.suffix)
+			hits := 0
+			for attempt := 0; attempt < 2; attempt++ {
+				start := time.Now()
+				r, err := c.get(ctx, injected, true)
+				elapsed := time.Since(start)
+				if err != nil || suspectResponse(r) {
+					break
+				}
+				if elapsed-baseElapsed >= (timeDelaySeconds-1)*time.Second {
+					hits++
+				}
+			}
+			if hits == 2 {
+				findings = append(findings, Finding{
+					Label:      "Possible " + p.engine + " time-based SQL injection via parameter '" + param + "' at " + target.url,
+					URL:        target.url,
+					Method:     "GET",
+					Evidence:   fmt.Sprintf("payload delayed the response by about %ds on two consecutive sends", timeDelaySeconds),
+					Detail:     "Appended a " + p.engine + " sleep payload to '" + param + "'. The response was consistently about " + fmt.Sprint(timeDelaySeconds) + " seconds slower than the original request, twice in a row. Network jitter does not usually repeat like that; confirm manually before treating it as exploitable.",
+					Confidence: ConfidenceLikely,
+				})
+				break
+			}
+		}
+	}
+	return findings
+}
+
+// suspectResponse reports whether the governor tagged a response as taken
+// during a drift window, in which case its timing and content are unreliable.
+func suspectResponse(r *httpResult) bool {
+	return r != nil && r.Header.Get(netgov.SuspectHeader) != ""
+}
+
+// checkPathTraversal sends traversal payloads through each parameter. A marker
+// already present in the original response is not evidence of traversal.
 func checkPathTraversal(ctx context.Context, c *probeClient, target paramTarget) []Finding {
+	baseline := baselineFor(ctx, c, target)
 	var findings []Finding
 	for param := range target.params {
 		for _, tp := range traversalPayloads {
+			if baseline != nil && strings.Contains(baseline.Text, tp.indicator) {
+				break
+			}
 			injected := withParam(target.url, target.params, param, tp.payload)
 			r, err := c.get(ctx, injected, true)
 			if err != nil {
@@ -155,7 +260,8 @@ func checkPathTraversal(ctx context.Context, c *probeClient, target paramTarget)
 					Method:     "GET",
 					StatusCode: r.StatusCode,
 					Evidence:   tp.indicator,
-					Detail:     "Set the '" + param + "' parameter to the payload `" + tp.payload + "`; the response's body then contained the expected traversal-target content",
+					Detail:     "Set the '" + param + "' parameter to the payload `" + tp.payload + "`; the response's body then contained the expected traversal-target content, which the original response did not",
+					Confidence: ConfidenceConfirmed,
 				})
 				break
 			}
@@ -164,10 +270,17 @@ func checkPathTraversal(ctx context.Context, c *probeClient, target paramTarget)
 	return findings
 }
 
+// checkSSTI sends template expressions through each parameter and flags a
+// response that shows the evaluated result. A result already present in the
+// original response (a page that happens to print the same number) is skipped.
 func checkSSTI(ctx context.Context, c *probeClient, target paramTarget) []Finding {
+	baseline := baselineFor(ctx, c, target)
 	var findings []Finding
 	for param := range target.params {
 		for _, sp := range sstiPayloads {
+			if baseline != nil && strings.Contains(baseline.Text, sp.expected) {
+				break
+			}
 			injected := withParam(target.url, target.params, param, sp.payload)
 			r, err := c.get(ctx, injected, true)
 			if err != nil {
@@ -181,6 +294,7 @@ func checkSSTI(ctx context.Context, c *probeClient, target paramTarget) []Findin
 					StatusCode: r.StatusCode,
 					Evidence:   sp.expected,
 					Detail:     "Set the '" + param + "' parameter to the template expression `" + sp.payload + "`; the response's body reflected its evaluated result rather than the literal text -- meaning the server executed it as a template",
+					Confidence: ConfidenceLikely,
 				})
 				break
 			}
@@ -227,6 +341,7 @@ var injectionsModule = moduleDef{
 		var findings []Finding
 		for _, pt := range targets {
 			findings = append(findings, checkSQLInjection(ctx, c, pt)...)
+			findings = append(findings, checkTimeBasedSQLi(ctx, c, pt)...)
 			findings = append(findings, checkPathTraversal(ctx, c, pt)...)
 			findings = append(findings, checkSSTI(ctx, c, pt)...)
 		}

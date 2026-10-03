@@ -2,11 +2,13 @@ package probescan
 
 import (
 	"context"
-	"crypto/tls"
 	"io"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/Indigo6415/Aperture/internal/fingerprint"
+	"github.com/Indigo6415/Aperture/internal/netgov"
 )
 
 // probeTimeout bounds a single request against the target -- same posture
@@ -39,6 +41,10 @@ type probeClient struct {
 	follow   *http.Client
 	noFollow *http.Client
 	sem      chan struct{}
+	// profile is the host's catch-all fingerprint for this scan. It is nil
+	// when the probe that builds it failed, and then nothing is filtered as a
+	// soft-404.
+	profile *fingerprint.Profile
 	// headers is applied to every request this client issues (get and
 	// post alike) -- e.g. a saved credential's Authorization/Cookie header,
 	// set once here rather than threaded through every check module.
@@ -52,20 +58,11 @@ type probeClient struct {
 // reasonably-paced burst rather than a request flood. headers (may be nil)
 // is applied to every request issued by the returned client.
 func newProbeClient(concurrency int, headers map[string]string) *probeClient {
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // deliberate: authorized testing against lab/CTF/self-signed targets
-	}
 	return &probeClient{
-		follow: &http.Client{Timeout: probeTimeout, Transport: tr},
-		noFollow: &http.Client{
-			Timeout:   probeTimeout,
-			Transport: tr,
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		},
-		sem:     make(chan struct{}, concurrency),
-		headers: headers,
+		follow:   netgov.NewClient(probeTimeout, true),
+		noFollow: netgov.NewClient(probeTimeout, false),
+		sem:      make(chan struct{}, concurrency),
+		headers:  headers,
 	}
 }
 

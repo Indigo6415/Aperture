@@ -9,6 +9,19 @@ import (
 	"time"
 )
 
+// TriageStatus is a finding's place in the operator's own review workflow --
+// set after the fact via api.handleUpdateFindingTriage, never by an adapter.
+// Every finding starts TriageNew the moment it's first persisted (see
+// store.SaveFinding).
+type TriageStatus string
+
+const (
+	TriageNew           TriageStatus = "new"
+	TriageConfirmed     TriageStatus = "confirmed"
+	TriageFalsePositive TriageStatus = "false_positive"
+	TriageReported      TriageStatus = "reported"
+)
+
 // Finding is one normalized result (typically an HTTP response observed
 // during a scan) flowing through the node graph.
 type Finding struct {
@@ -27,6 +40,22 @@ type Finding struct {
 	RunID         string            `json:"runId"`
 	Tags          []string          `json:"tags,omitempty"`
 	Timestamp     time.Time         `json:"timestamp"`
+	// TriageStatus/TriageNote are the operator's own triage state on this
+	// finding -- absent from whatever an adapter emits, filled in by
+	// SaveFinding/ListFindings (defaulted to TriageNew) and updated
+	// in-place by UpdateFindingTriage.
+	TriageStatus TriageStatus `json:"triageStatus"`
+	TriageNote   string       `json:"triageNote,omitempty"`
+	// Detail fields, filled by adapters that identify the rule behind a result
+	// (nuclei) and by checks that report how strongly they are sure. Template
+	// is the rule ID, Severity the rule's own rating, Matcher the part of the
+	// rule that fired, Reproduce a command that repeats the request, and
+	// Confidence one of "confirmed", "likely", or "heuristic" (empty = not stated).
+	Template   string `json:"template,omitempty"`
+	Severity   string `json:"severity,omitempty"`
+	Matcher    string `json:"matcher,omitempty"`
+	Reproduce  string `json:"reproduce,omitempty"`
+	Confidence string `json:"confidence,omitempty"`
 }
 
 // DedupKey identifies findings that represent the "same" result for the

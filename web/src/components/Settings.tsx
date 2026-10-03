@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
 import type { SettingsInfo } from '../types'
+import { applyMode, applyTheme, getStoredMode, getStoredTheme, THEMES, type Mode, type Theme } from '../theme'
 
 // KeyCard (below) renders one API-key card: DNSDumpster and NVD share the
 // exact same save/clear/status shape (see internal/api/settings.go's
@@ -16,8 +17,13 @@ export function Settings() {
   }, [])
 
   return (
+    // Scroll container: the app shell clips overflow, so each page must scroll itself
+    <div className="h-full overflow-y-auto">
     <div className="mx-auto max-w-lg space-y-6 p-6">
       <h1 className="text-sm font-semibold uppercase tracking-wide text-neutral-400">Settings</h1>
+
+      <ModeToggle />
+      <ThemePicker />
 
       <KeyCard
         title="DNSDumpster API key"
@@ -57,6 +63,25 @@ export function Settings() {
         save={(apiKey) => api.setNVDKey(apiKey)}
         onSaved={setInfo}
       />
+
+      <KeyCard
+        title="HaveIBeenPwned API key"
+        description={
+          <>
+            Powers the Breach Check tab, which looks up email addresses against HaveIBeenPwned's breach database. Requires a
+            key from{' '}
+            <a href="https://haveibeenpwned.com/API/Key" className="text-sky-400 hover:text-sky-300" target="_blank" rel="noreferrer">
+              haveibeenpwned.com
+            </a>
+            -- unlike DNSDumpster/NVD, this one is required: HIBP's breached-account endpoint has rejected keyless requests
+            since 2024.
+          </>
+        }
+        configured={info?.hibpApiKeySet ?? null}
+        save={(apiKey) => api.setHIBPKey(apiKey)}
+        onSaved={setInfo}
+      />
+    </div>
     </div>
   )
 }
@@ -126,6 +151,77 @@ function KeyCard({
         )}
       </div>
       {message && <p className="text-xs text-neutral-500">{message}</p>}
+    </div>
+  )
+}
+
+// ModeToggle is light/dark's own control, independent of ThemePicker below
+// -- every palette in THEMES supports both (see index.css: each theme is
+// defined once per mode), so which one is active is a separate choice from
+// which palette is active, per explicit product decision (there used to be
+// a single "Dark"/"Light" pair of palette entries; those are gone now that
+// every palette can be either).
+function ModeToggle() {
+  const [mode, setMode] = useState<Mode>(() => getStoredMode())
+
+  const pick = (m: Mode) => {
+    applyMode(m)
+    setMode(m)
+  }
+
+  return (
+    <div className="space-y-2 rounded-lg border border-neutral-800 bg-neutral-900 p-4">
+      <h2 className="text-sm font-medium text-neutral-100">Appearance</h2>
+      <p className="text-xs text-neutral-500">Light or dark mode -- applies to whichever theme is selected below.</p>
+      <div className="flex gap-2 pt-1">
+        {(['light', 'dark'] as Mode[]).map((m) => (
+          <button
+            key={m}
+            type="button"
+            onClick={() => pick(m)}
+            className={`flex-1 rounded border px-3 py-2 text-center text-xs font-medium capitalize ${
+              mode === m ? 'border-sky-500 bg-sky-950/40 text-sky-300' : 'border-neutral-700 bg-neutral-950 text-neutral-300 hover:border-sky-600'
+            }`}
+          >
+            {m}
+          </button>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+// ThemePicker is a per-browser display preference (see theme.ts) rather
+// than an account setting -- it applies instantly and never touches the
+// backend, unlike every KeyCard above it on this page.
+function ThemePicker() {
+  const [theme, setTheme] = useState<Theme>(() => getStoredTheme())
+
+  const pick = (id: Theme) => {
+    applyTheme(id)
+    setTheme(id)
+  }
+
+  return (
+    <div className="space-y-2 rounded-lg border border-neutral-800 bg-neutral-900 p-4">
+      <h2 className="text-sm font-medium text-neutral-100">Theme</h2>
+      <p className="text-xs text-neutral-500">Changes how Aperture looks in this browser -- applies instantly, nothing to save.</p>
+      <div className="grid grid-cols-2 gap-2 pt-1 sm:grid-cols-3">
+        {THEMES.map((t) => (
+          <button
+            key={t.id}
+            type="button"
+            onClick={() => pick(t.id)}
+            title={t.description}
+            className={`rounded border px-3 py-2 text-left text-xs ${
+              theme === t.id ? 'border-sky-500 bg-sky-950/40 text-sky-300' : 'border-neutral-700 bg-neutral-950 text-neutral-300 hover:border-sky-600'
+            }`}
+          >
+            <span className="block font-medium">{t.label}</span>
+            <span className="mt-0.5 block text-[11px] text-neutral-500">{t.description}</span>
+          </button>
+        ))}
+      </div>
     </div>
   )
 }

@@ -2,3 +2,6 @@
 *.db
 *.db-journal
 .DS_Store
+
+# feroxbuster resume/state files written by manual runs
+*.state

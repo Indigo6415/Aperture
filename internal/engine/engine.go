@@ -20,7 +20,7 @@ type StatusFunc func(nodeID string, status NodeStatus, message string)
 type ProgressFunc func(nodeID string, done, total int)
 
 // maxConcurrentSourceNodes bounds how many source-node subprocesses (ffuf,
-// feroxbuster, nmap, nuclei, subfinder, amass, katana, httpx, whatweb) run
+// feroxbuster, nmap, nuclei, subfinder, katana) run
 // at once across the whole server. Without
 // this, a flow with many source nodes -- e.g. content discovery built with
 // one ffuf+feroxbuster pair per selected subdomain -- launches all of them

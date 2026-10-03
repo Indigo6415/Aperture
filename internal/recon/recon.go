@@ -298,18 +298,32 @@ func detectTakeover(domain string, dnsCheck, httpCheck Check) (Check, bool) {
 	aaaa, _ := dnsCheck.Data["aaaa"].([]string)
 	danglingDNS := len(a) == 0 && len(aaaa) == 0
 
-	bodyConfirms := false
+	// Two kinds of evidence are graded separately. The DNS evidence is that
+	// the name points at a provider but resolves to nothing. The HTTP evidence
+	// is either the provider's own "unclaimed" page, or a failed connection,
+	// which is weaker because many things fail to connect.
+	pageMatched := false
+	connectFailed := false
 	if httpCheck.Status == StatusDone {
 		body, _ := httpCheck.Data["bodySnippet"].(string)
-		bodyConfirms = bodyMatchesProvider(provider, body)
+		pageMatched = providerHasFingerprint(provider) && bodyMatchesProvider(provider, body)
 	} else if httpCheck.Status == StatusError {
-		// A dangling CNAME frequently can't even be connected to -- that
-		// failure is itself corroborating evidence, not a reason to skip.
-		bodyConfirms = true
+		connectFailed = true
 	}
 
-	if !danglingDNS && !bodyConfirms {
+	if !danglingDNS && !pageMatched {
 		return Check{}, false
+	}
+
+	// Confirmed needs the dangling DNS and the provider's own unclaimed page
+	// together. One signal alone is likely. A bare CNAME to a provider, with
+	// nothing further, is only a lead.
+	confidence := "heuristic"
+	switch {
+	case danglingDNS && pageMatched:
+		confidence = "confirmed"
+	case pageMatched, danglingDNS && connectFailed:
+		confidence = "likely"
 	}
 
 	return Check{
@@ -318,8 +332,9 @@ func detectTakeover(domain string, dnsCheck, httpCheck Check) (Check, bool) {
 		Status:    StatusDone,
 		StartedAt: time.Now(),
 		Data: map[string]any{
-			"cname":    cname,
-			"provider": provider,
+			"cname":      cname,
+			"provider":   provider,
+			"confidence": confidence,
 		},
 		FinishedAt: time.Now(),
 	}, true

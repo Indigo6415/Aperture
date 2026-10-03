@@ -24,6 +24,10 @@ type Detection struct {
 	Name     string   `json:"name"`
 	Category Category `json:"category"`
 	Version  string   `json:"version,omitempty"`
+	// Confidence is "high" when a version was extracted, "medium" when a response
+	// header matched, and "low" when only body markup matched. Version lookups
+	// (CVE matching) only run for versioned detections.
+	Confidence string `json:"confidence"`
 }
 
 // pattern is one way to recognize (and optionally version) a technology.
@@ -132,6 +136,7 @@ func Detect(headers map[string]string, body, finalURL string) []Detection {
 	for _, sig := range signatures {
 		version := ""
 		matched := false
+		viaHeader := false
 		for _, p := range sig.patterns {
 			haystack := body
 			if p.header != "" {
@@ -146,12 +151,15 @@ func Detect(headers map[string]string, body, finalURL string) []Detection {
 				continue
 			}
 			matched = true
+			if p.header != "" {
+				viaHeader = true
+			}
 			if len(m) > 1 && m[1] != "" && version == "" {
 				version = m[1]
 			}
 		}
 		if matched {
-			out = append(out, Detection{Name: sig.name, Category: sig.category, Version: version})
+			out = append(out, Detection{Name: sig.name, Category: sig.category, Version: version, Confidence: detectionConfidence(version, viaHeader)})
 		}
 	}
 	return out

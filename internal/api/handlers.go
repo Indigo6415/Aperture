@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/Indigo6415/Aperture/internal/netgov"
 	"net/http"
 
 	"github.com/Indigo6415/Aperture/internal/engine"
@@ -27,10 +29,9 @@ func newID() string {
 // ffuf-vhost) -- see handleStartJob in handlers_jobs.go, which builds the
 // flow and creates the job+run rows before calling this. Cancellation and
 // event delivery are keyed by jobID, not runID, so the client only ever
-// needs to know one ID per job. caseID is only used to log the job's
-// completion to the case's activity timeline.
-func (s *Server) executeToolJob(caseID string, flow engine.Flow, jobID, runID string) {
-	ctx, cancel := context.WithCancel(context.Background())
+// needs to know one ID per job.
+func (s *Server) executeToolJob(caseID string, flow engine.Flow, jobID, runID string, pol netgov.Policy) {
+	ctx, cancel := context.WithCancel(netgov.WithPolicy(context.Background(), pol))
 	s.trackJobCancel(jobID, cancel)
 	defer func() {
 		s.untrackJobCancel(jobID)
@@ -39,6 +40,14 @@ func (s *Server) executeToolJob(caseID string, flow engine.Flow, jobID, runID st
 
 	onResult := func(nodeID string, f model.Finding) {
 		f.RunID = runID
+		// Adapters never set TriageStatus (see model.Finding's doc comment)
+		// -- SaveFinding's INSERT leaves it at the schema default ('new') in
+		// the DB, but f itself is published to the websocket as-is, so
+		// without this the live-streamed copy carries the zero value ("")
+		// instead, which the UI's TRIAGE_META lookup has no entry for.
+		if f.TriageStatus == "" {
+			f.TriageStatus = model.TriageNew
+		}
 		if err := s.store.SaveFinding(runID, nodeID, f); err != nil {
 			// The job continues even if a single write fails; the finding
 			// is still delivered live over the websocket.
@@ -67,7 +76,6 @@ func (s *Server) executeToolJob(caseID string, flow engine.Flow, jobID, runID st
 	}
 	_ = s.store.FinishRun(runID, final, errMsg)
 	_ = s.store.FinishJob(jobID, final, errMsg)
-	_ = s.store.LogActivity(caseID, "job_finished", fmt.Sprintf("Job %s finished: %s", jobID, final))
 	s.hub.publish(jobID, RunEvent{Type: "done", Status: engine.NodeStatus(final), Message: errMsg})
 }
 
@@ -92,4 +100,43 @@ func (s *Server) handleListFindings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, findings)
+}
+
+// validTriageStatuses is every value handleUpdateFindingTriage accepts --
+// kept in sync by hand with model.Triage* since that's a small, closed set.
+var validTriageStatuses = map[model.TriageStatus]bool{
+	model.TriageNew:           true,
+	model.TriageConfirmed:     true,
+	model.TriageFalsePositive: true,
+	model.TriageReported:      true,
+}
+
+type updateFindingTriageRequest struct {
+	Status model.TriageStatus `json:"status"`
+	Note   string             `json:"note,omitempty"`
+}
+
+// handleUpdateFindingTriage sets one finding's operator-assigned triage
+// status/note -- the only mutation a finding (otherwise a plain scan result)
+// ever undergoes after the job that produced it finishes.
+func (s *Server) handleUpdateFindingTriage(w http.ResponseWriter, r *http.Request) {
+	var req updateFindingTriageRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if !validTriageStatuses[req.Status] {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid triage status %q", req.Status))
+		return
+	}
+	id := r.PathValue("id")
+	if err := s.store.UpdateFindingTriage(id, req.Status, req.Note); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, err)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, updateFindingTriageRequest{Status: req.Status, Note: req.Note})
 }

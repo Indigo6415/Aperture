@@ -11,9 +11,11 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"strings"
 	"sync"
 
 	"github.com/Indigo6415/Aperture/internal/adapters"
+	"github.com/Indigo6415/Aperture/internal/collaborator"
 	"github.com/Indigo6415/Aperture/internal/engine"
 	"github.com/Indigo6415/Aperture/internal/store"
 )
@@ -53,6 +55,37 @@ type Server struct {
 	// even completes its handshake.
 	probeMu           sync.Mutex
 	pendingProbeScans map[string]pendingProbeScan
+
+	// domainScanMu/pendingDomainScans is domain scan's counterpart to
+	// probeMu/pendingProbeScans above -- same registered-but-unclaimed
+	// pattern, same reason (see handleDomainScan in
+	// handlers_domainscan.go).
+	domainScanMu       sync.Mutex
+	pendingDomainScans map[string]pendingDomainScan
+
+	// apiEnumMu/pendingApiEnumScans is the API enumerator's counterpart to
+	// probeMu/pendingProbeScans above -- same registered-but-unclaimed
+	// pattern, same reason (see handleApiEnumScan in
+	// handlers_apienum.go).
+	apiEnumMu           sync.Mutex
+	pendingApiEnumScans map[string]pendingApiEnumScan
+
+	// streamMu/pendingScans is the shared registry for every scanner that
+	// streams per-check progress (see scan_stream.go). Same registered-
+	// but-unclaimed pattern as the per-tool maps above, one map for all of
+	// them since the claim/run/publish shape is identical.
+	streamMu     sync.Mutex
+	pendingScans map[string]streamedScan
+
+	// collab is the shared out-of-band interaction listener backing
+	// /api/collaborator/* and the unauthenticated /collab/{token} callback
+	// route -- see internal/collaborator's package doc comment and
+	// handlers_collaborator.go. collabMu guards collabDNSStop, the running
+	// DNS listener's stop func (nil when it isn't running, e.g. no domain
+	// has been configured yet, or the bind itself failed).
+	collab        *collaborator.Registry
+	collabMu      sync.Mutex
+	collabDNSStop func()
 }
 
 // maxConcurrentScreenshots is screenshotSem's capacity.
@@ -68,15 +101,30 @@ const maxConcurrentTechLookups = 4
 // the wordlist-management endpoints both read/write it.
 func NewServer(st *store.Store, eng *engine.Engine, uiFS fs.FS, wordlistsDir string) *Server {
 	s := &Server{
-		store:             st,
-		engine:            eng,
-		hub:               newHub(),
-		mux:               http.NewServeMux(),
-		wordlistsDir:      wordlistsDir,
-		jobCancels:        map[string]context.CancelFunc{},
-		screenshotSem:     make(chan struct{}, maxConcurrentScreenshots),
-		techSem:           make(chan struct{}, maxConcurrentTechLookups),
-		pendingProbeScans: map[string]pendingProbeScan{},
+		store:               st,
+		engine:              eng,
+		hub:                 newHub(),
+		mux:                 http.NewServeMux(),
+		wordlistsDir:        wordlistsDir,
+		jobCancels:          map[string]context.CancelFunc{},
+		screenshotSem:       make(chan struct{}, maxConcurrentScreenshots),
+		techSem:             make(chan struct{}, maxConcurrentTechLookups),
+		pendingProbeScans:   map[string]pendingProbeScan{},
+		pendingDomainScans:  map[string]pendingDomainScan{},
+		pendingApiEnumScans: map[string]pendingApiEnumScan{},
+		pendingScans:        map[string]streamedScan{},
+		collab:              collaborator.NewRegistry(),
+	}
+
+	// Resume the DNS listener across a restart if it was previously
+	// configured -- best-effort, same posture as every other background
+	// setup in this constructor: a bind failure here (e.g. the process no
+	// longer has the privilege it once did) is logged, not fatal, since the
+	// HTTP half of the collaborator listener works regardless.
+	if cfg := s.loadCollaboratorConfig(); cfg.Domain != "" && cfg.AnswerIP != "" {
+		if err := s.startCollabDNSLocked(cfg); err != nil {
+			log.Printf("collaborator: DNS listener not started: %v", err)
+		}
 	}
 
 	// Login (and its own probe, handleMe, and logout) are the only
@@ -94,6 +142,7 @@ func NewServer(st *store.Store, eng *engine.Engine, uiFS fs.FS, wordlistsDir str
 	s.mux.HandleFunc("GET /api/settings", s.requireAuth(s.handleGetSettings))
 	s.mux.HandleFunc("PUT /api/settings/dnsdumpster-key", s.requireAuth(s.handleSetDNSDumpsterKey))
 	s.mux.HandleFunc("PUT /api/settings/nvd-key", s.requireAuth(s.handleSetNVDKey))
+	s.mux.HandleFunc("PUT /api/settings/hibp-key", s.requireAuth(s.handleSetHIBPKey))
 
 	s.mux.HandleFunc("POST /api/cases", s.requireAuth(s.handleStartCase))
 	s.mux.HandleFunc("GET /api/cases", s.requireAuth(s.handleListCases))
@@ -103,12 +152,16 @@ func NewServer(st *store.Store, eng *engine.Engine, uiFS fs.FS, wordlistsDir str
 	s.mux.HandleFunc("GET /api/cases/{id}/report", s.requireAuth(s.handleCaseReport))
 	s.mux.HandleFunc("GET /api/cases/{id}/screenshots", s.requireAuth(s.handleListCaseScreenshots))
 	s.mux.HandleFunc("GET /api/cases/{id}/screenshots/{target}", s.requireAuth(s.handleGetCaseScreenshot))
-	s.mux.HandleFunc("GET /api/cases/{id}/activity", s.requireAuth(s.handleListActivity))
 	s.mux.HandleFunc("GET /api/cases/{id}/scans", s.requireAuth(s.handleListCaseScans))
+	s.mux.HandleFunc("GET /api/scans/{id}", s.requireAuth(s.handleGetCaseScan))
 
 	s.mux.HandleFunc("GET /api/cases/{id}/credentials", s.requireAuth(s.handleListCredentials))
 	s.mux.HandleFunc("POST /api/cases/{id}/credentials", s.requireAuth(s.handleAddCredential))
 	s.mux.HandleFunc("DELETE /api/credentials/{id}", s.requireAuth(s.handleDeleteCredential))
+	s.mux.HandleFunc("POST /api/credentials/{id}/session", s.requireAuth(s.handleCreateCredentialSession))
+
+	s.mux.HandleFunc("GET /api/cases/{id}/cookie-vault", s.requireAuth(s.handleListCookieVault))
+	s.mux.HandleFunc("PUT /api/cases/{id}/cookie-vault/{domain}", s.requireAuth(s.handleSetCookieVaultEntry))
 
 	s.mux.HandleFunc("GET /api/job-templates", s.requireAuth(s.handleListJobTemplates))
 	s.mux.HandleFunc("POST /api/job-templates", s.requireAuth(s.handleSaveJobTemplate))
@@ -118,6 +171,11 @@ func NewServer(st *store.Store, eng *engine.Engine, uiFS fs.FS, wordlistsDir str
 	s.mux.HandleFunc("POST /api/cases/{id}/targets", s.requireAuth(s.handleAddTarget))
 	s.mux.HandleFunc("POST /api/cases/{id}/targets/promote", s.requireAuth(s.handlePromoteTargets))
 	s.mux.HandleFunc("DELETE /api/targets/{id}", s.requireAuth(s.handleDeleteTarget))
+	s.mux.HandleFunc("GET /api/cases/{id}/target-lists", s.requireAuth(s.handleListTargetLists))
+	s.mux.HandleFunc("POST /api/cases/{id}/target-lists", s.requireAuth(s.handleCreateTargetList))
+	s.mux.HandleFunc("PATCH /api/target-lists/{id}", s.requireAuth(s.handleRenameTargetList))
+	s.mux.HandleFunc("DELETE /api/target-lists/{id}", s.requireAuth(s.handleDeleteTargetList))
+	s.mux.HandleFunc("POST /api/target-lists/{id}/ping", s.requireAuth(s.handlePingTargetList))
 
 	s.mux.HandleFunc("GET /api/cases/{id}/jobs", s.requireAuth(s.handleListCaseJobs))
 	s.mux.HandleFunc("POST /api/cases/{id}/jobs", s.requireAuth(s.handleStartJob))
@@ -135,16 +193,53 @@ func NewServer(st *store.Store, eng *engine.Engine, uiFS fs.FS, wordlistsDir str
 
 	s.mux.HandleFunc("GET /api/runs/{id}", s.requireAuth(s.handleGetRun))
 	s.mux.HandleFunc("GET /api/runs/{id}/findings", s.requireAuth(s.handleListFindings))
+	s.mux.HandleFunc("PATCH /api/findings/{id}/triage", s.requireAuth(s.handleUpdateFindingTriage))
 
 	s.mux.HandleFunc("POST /api/jwt/scan", s.requireAuth(s.handleJWTScan))
 	s.mux.HandleFunc("GET /api/probe/modules", s.requireAuth(s.handleProbeModules))
 	s.mux.HandleFunc("POST /api/probe/scan", s.requireAuth(s.handleProbeScan))
 	s.mux.HandleFunc("GET /ws/probe/{id}", s.requireAuth(s.handleWatchProbeScan))
 
+	s.mux.HandleFunc("GET /api/domainscan/modules", s.requireAuth(s.handleDomainScanModules))
+	s.mux.HandleFunc("POST /api/domainscan/scan", s.requireAuth(s.handleDomainScan))
+	s.mux.HandleFunc("GET /ws/domainscan/{id}", s.requireAuth(s.handleWatchDomainScan))
+
+	s.mux.HandleFunc("POST /api/apienum/scan", s.requireAuth(s.handleApiEnumScan))
+	s.mux.HandleFunc("GET /ws/apienum/{id}", s.requireAuth(s.handleWatchApiEnumScan))
+
+	// Shared streaming route for every scanner that reports per-check
+	// progress (see scan_stream.go) -- each POST /api/<tool>/scan registers
+	// its scan here and hands back the ID this route is watched by.
+	s.mux.HandleFunc("GET /ws/scans/{id}", s.requireAuth(s.handleWatchScan))
+
 	s.mux.HandleFunc("POST /api/secrets/scan", s.requireAuth(s.handleSecretScan))
-	s.mux.HandleFunc("POST /api/repeater/send", s.requireAuth(s.handleRepeaterSend))
-	s.mux.HandleFunc("GET /api/cases/{id}/repeater/history", s.requireAuth(s.handleListRepeaterHistory))
-	s.mux.HandleFunc("DELETE /api/repeater/history/{id}", s.requireAuth(s.handleDeleteRepeaterHistoryEntry))
+	s.mux.HandleFunc("POST /api/breach/check", s.requireAuth(s.handleBreachCheck))
+	s.mux.HandleFunc("POST /api/breach/crawl-emails", s.requireAuth(s.handleBreachCrawlEmails))
+	s.mux.HandleFunc("POST /api/bypass403/run", s.requireAuth(s.handleBypass403))
+	s.mux.HandleFunc("POST /api/pwreset/scan", s.requireAuth(s.handlePwReset))
+	s.mux.HandleFunc("POST /api/graphqlenum/scan", s.requireAuth(s.handleGraphQLEnum))
+	s.mux.HandleFunc("POST /api/corsscan/scan", s.requireAuth(s.handleCORSScan))
+	s.mux.HandleFunc("POST /api/openredirect/scan", s.requireAuth(s.handleOpenRedirect))
+	s.mux.HandleFunc("POST /api/ssrf/scan", s.requireAuth(s.handleSSRF))
+	s.mux.HandleFunc("POST /api/csrf/scan", s.requireAuth(s.handleCSRF))
+	s.mux.HandleFunc("POST /api/xss/scan", s.requireAuth(s.handleXSSScan))
+	s.mux.HandleFunc("POST /api/sstiscan/scan", s.requireAuth(s.handleSSTIScan))
+
+	s.mux.HandleFunc("POST /api/tester/send", s.requireAuth(s.handleTesterSend))
+
+	// The collaborator's own config/token/poll endpoints need a session
+	// (they're Aperture's own UI talking to itself), but the callback route
+	// below deliberately doesn't -- see handleCollaboratorCallback.
+	s.mux.HandleFunc("GET /api/collaborator/config", s.requireAuth(s.handleGetCollaboratorConfig))
+	s.mux.HandleFunc("PUT /api/collaborator/config", s.requireAuth(s.handleSetCollaboratorConfig))
+	s.mux.HandleFunc("POST /api/collaborator/new", s.requireAuth(s.handleCollaboratorNew))
+	s.mux.HandleFunc("GET /api/collaborator/poll", s.requireAuth(s.handleCollaboratorPoll))
+	s.mux.HandleFunc("GET /api/collaborator/active", s.requireAuth(s.handleListActiveCallbackServers))
+	s.mux.HandleFunc("DELETE /api/collaborator/active", s.requireAuth(s.handleRemoveActiveCallbackServer))
+	s.mux.HandleFunc("POST /api/collaborator/webhooksite/new", s.requireAuth(s.handleWebhookSiteNew))
+	s.mux.HandleFunc("GET /api/collaborator/webhooksite/poll", s.requireAuth(s.handleWebhookSitePoll))
+	s.mux.HandleFunc("/collab/{token}", s.handleCollaboratorCallback)
+	s.mux.HandleFunc("/collab/{token}/{path...}", s.handleCollaboratorCallback)
 
 	if uiFS != nil {
 		s.mux.Handle("/", spaHandler(uiFS))
@@ -169,8 +264,17 @@ func spaHandler(uiFS fs.FS) http.Handler {
 	fileServer := http.FileServer(http.FS(uiFS))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cleaned := path.Clean(r.URL.Path)
+		// A missing file is only an error if it exists on disk; anything else
+		// (a deleted API route, a stale hashed bundle) is a real miss.
 		if _, err := fs.Stat(uiFS, trimLeadingSlash(cleaned)); err != nil {
 			if os.IsNotExist(err) {
+				// Backend and asset paths must 404 instead of falling back: an
+				// index.html reply with status 200 is what the frontend then tries
+				// to parse as JSON or run as a module, which fails with no clear cause.
+				if isBackendPath(cleaned) {
+					http.NotFound(w, r)
+					return
+				}
 				r2 := new(http.Request)
 				*r2 = *r
 				r2.URL.Path = "/"
@@ -180,6 +284,13 @@ func spaHandler(uiFS fs.FS) http.Handler {
 		}
 		fileServer.ServeHTTP(w, r)
 	})
+}
+
+// isBackendPath reports whether a cleaned request path belongs to the API or
+// the built asset tree, which are never client-side routes and so must never
+// receive the SPA index.html fallback.
+func isBackendPath(cleaned string) bool {
+	return cleaned == "/api" || strings.HasPrefix(cleaned, "/api/") || strings.HasPrefix(cleaned, "/assets/")
 }
 
 func trimLeadingSlash(p string) string {
@@ -194,11 +305,17 @@ func (s *Server) handleListTools(w http.ResponseWriter, r *http.Request) {
 		Name      string `json:"name"`
 		Available bool   `json:"available"`
 	}
-	out := make([]toolInfo, 0, len(adapters.Registry))
+	out := make([]toolInfo, 0, len(adapters.Registry)+1)
 	for name := range adapters.Registry {
 		_, err := exec.LookPath(name)
 		out = append(out, toolInfo{Name: name, Available: err == nil})
 	}
+	// retire.js isn't an adapters.Registry entry -- it's driven by
+	// internal/domainscan, not the node-graph engine -- but it's still an
+	// external binary the frontend should be able to check for, same as
+	// every tool above.
+	_, retireErr := exec.LookPath("retire")
+	out = append(out, toolInfo{Name: "retire", Available: retireErr == nil})
 	writeJSON(w, http.StatusOK, out)
 }
 

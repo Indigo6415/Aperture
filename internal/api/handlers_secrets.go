@@ -9,16 +9,18 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Indigo6415/Aperture/internal/scanprogress"
 	"github.com/Indigo6415/Aperture/internal/secretscan"
 	"github.com/Indigo6415/Aperture/internal/store"
 )
 
 // secretScanRequest is the request body for POST /api/secrets/scan.
 type secretScanRequest struct {
-	URL            string            `json:"url"`
-	RecursionDepth int               `json:"recursionDepth,omitempty"`
-	Entropy        bool              `json:"entropy,omitempty"`
-	Headers        map[string]string `json:"headers,omitempty"`
+	URL                string            `json:"url"`
+	RecursionDepth     int               `json:"recursionDepth,omitempty"`
+	Entropy            bool              `json:"entropy,omitempty"`
+	SecretFinderEngine bool              `json:"secretFinderEngine,omitempty"`
+	Headers            map[string]string `json:"headers,omitempty"`
 	// CredentialID optionally names a saved case credential (see
 	// handlers_credentials.go) merged into Headers.
 	CredentialID string `json:"credentialId,omitempty"`
@@ -72,35 +74,35 @@ func (s *Server) handleSecretScan(w http.ResponseWriter, r *http.Request) {
 		}
 		req.Headers = mergedCredentialHeaders(cred, req.Headers)
 	}
+	req.Headers = s.applyDomainCookie(req.CaseID, req.URL, req.Headers)
 
-	ctx, cancel := context.WithTimeout(r.Context(), secretScanTimeout)
-	defer cancel()
+	s.queueScan(w, streamedScan{
+		caseID:  req.CaseID,
+		target:  req.URL,
+		tool:    "secrets",
+		timeout: secretScanTimeout,
+		run: func(ctx context.Context, rep scanprogress.Reporter) (scanOutcome, error) {
+			resp, err := secretscan.Run(ctx, secretscan.Request{Progress: rep,
+				URL:                req.URL,
+				RecursionDepth:     req.RecursionDepth,
+				Entropy:            req.Entropy,
+				SecretFinderEngine: req.SecretFinderEngine,
+				Headers:            req.Headers,
+			})
+			if err != nil {
+				return scanOutcome{}, err
+			}
 
-	resp, err := secretscan.Run(ctx, secretscan.Request{
-		URL:            req.URL,
-		RecursionDepth: req.RecursionDepth,
-		Entropy:        req.Entropy,
-		Headers:        req.Headers,
+			// Any matched secret is inherently a high-severity finding (a live
+			// credential/key, not a theoretical weakness) -- unlike probe's
+			// per-module severities, secretscan has no graded scale of its own
+			// to roll up.
+			severity := "info"
+			if len(resp.Matches) > 0 {
+				severity = "high"
+			}
+			summary := fmt.Sprintf("%d secret(s) across %d page(s)", len(resp.Matches), len(resp.PagesScanned))
+			return scanOutcome{result: resp, severity: severity, summary: summary}, nil
+		},
 	})
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-
-	if req.CaseID != "" {
-		// Any matched secret is inherently a high-severity finding (a live
-		// credential/key, not a theoretical weakness) -- unlike probe's
-		// per-module severities, secretscan has no graded scale of its own
-		// to roll up.
-		severity := "info"
-		if len(resp.Matches) > 0 {
-			severity = "high"
-		}
-		summary := fmt.Sprintf("%d secret(s) across %d page(s)", len(resp.Matches), len(resp.PagesScanned))
-		if data, err := json.Marshal(resp); err == nil {
-			s.saveCaseScan(req.CaseID, req.URL, "secrets", severity, summary, data)
-		}
-	}
-
-	writeJSON(w, http.StatusOK, resp)
 }

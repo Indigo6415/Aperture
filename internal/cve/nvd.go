@@ -22,6 +22,9 @@ type CVE struct {
 	Score       float64   `json:"score"`
 	Published   time.Time `json:"published"`
 	References  []string  `json:"references"`
+	// MatchType says how this CVE was found: MatchRange (NVD checked the exact
+	// version against the affected range) or MatchKeyword (free-text search).
+	MatchType string `json:"matchType,omitempty"`
 	// KEV/EPSS are exploit-likelihood signals layered on top of NVD's own
 	// CVSS severity -- filled in by EnrichExploitSignals, not by Lookup
 	// itself (NVD's API knows nothing about either). KEV is true when this
@@ -35,8 +38,10 @@ type CVE struct {
 	EPSS float64 `json:"epss,omitempty"`
 }
 
+// nvdEndpoint is a variable so tests can point the lookup at a fixture server.
+var nvdEndpoint = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+
 const (
-	nvdEndpoint = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 	// resultsPerLookup caps how many CVEs one product+version lookup keeps
 	// -- NVD's keyword search can return far more than are useful to show
 	// per detected technology.
@@ -77,16 +82,12 @@ type nvdCVSSMetric struct {
 	BaseSeverity string `json:"baseSeverity"` // CVSS v2 carries severity alongside, not inside, cvssData
 }
 
-// Lookup queries NVD for CVEs matching "product version" as a keyword
-// search. This is an approximation, not exact CPE version-range matching --
-// building a correct vendor:product CPE URI for every curated technology
-// signature (internal/techfp) would need its own maintained mapping table,
-// which is out of scope here. Keyword search is NVD's own documented
-// fallback for exactly this case and is precise enough for well-known
-// products/versions to be useful. apiKey is optional (raises NVD's rate
-// limit from 5 to 50 requests/30s, see rateLimiter below); an empty
-// version returns no results without making a request, since a versionless
-// lookup can't usefully be scoped.
+// Lookup finds CVEs for a product at a version. When the product has a known
+// CPE (see vendorProduct), NVD matches the version against each CVE's affected
+// range, which is exact. Otherwise it falls back to a free-text keyword search,
+// and every result is labeled with how it was found. apiKey is optional (raises
+// NVD's rate limit, see rateLimiter). An empty version returns nothing without a
+// request, since a versionless lookup cannot be scoped.
 func Lookup(ctx context.Context, product, version, apiKey string) ([]CVE, error) {
 	if version == "" {
 		return nil, nil
@@ -97,7 +98,13 @@ func Lookup(ctx context.Context, product, version, apiKey string) ([]CVE, error)
 	}
 
 	q := url.Values{}
-	q.Set("keywordSearch", product+" "+version)
+	matchType := MatchKeyword
+	if cpe, ok := cpeMatchString(product, version); ok {
+		q.Set("virtualMatchString", cpe)
+		matchType = MatchRange
+	} else {
+		q.Set("keywordSearch", product+" "+version)
+	}
 	q.Set("resultsPerPage", fmt.Sprintf("%d", resultsPerLookup))
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, nvdEndpoint+"?"+q.Encode(), nil)
@@ -127,7 +134,7 @@ func Lookup(ctx context.Context, product, version, apiKey string) ([]CVE, error)
 
 	out := make([]CVE, 0, len(parsed.Vulnerabilities))
 	for _, v := range parsed.Vulnerabilities {
-		c := CVE{ID: v.CVE.ID}
+		c := CVE{ID: v.CVE.ID, MatchType: matchType}
 		for _, d := range v.CVE.Descriptions {
 			if d.Lang == "en" {
 				c.Description = d.Value

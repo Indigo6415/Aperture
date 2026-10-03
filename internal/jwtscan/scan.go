@@ -1,10 +1,15 @@
 package jwtscan
 
 import (
+	"crypto/hmac"
 	"crypto/rsa"
-	"crypto/tls"
+	"crypto/sha256"
+	"crypto/sha512"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"github.com/Indigo6415/Aperture/internal/netgov"
+	"hash"
 	"io"
 	"net/http"
 	"strings"
@@ -30,15 +35,7 @@ const probeTimeout = 5 * time.Second
 // CLI's requests.Session sets trust_env=False: consistent, un-intercepted
 // behavior regardless of the host machine's proxy configuration.
 func newHTTPClient() *http.Client {
-	return &http.Client{
-		Timeout: probeTimeout,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // deliberate: authorized testing against lab/CTF targets
-		},
-	}
+	return netgov.NewClient(probeTimeout, false)
 }
 
 // probeResult is the trimmed-down shape every test cares about: enough to
@@ -47,6 +44,9 @@ func newHTTPClient() *http.Client {
 type probeResult struct {
 	StatusCode int
 	Length     int
+	// Body is kept for identity checks: whether a forged token was accepted is
+	// judged by whether the account named in the real token shows up.
+	Body []byte
 }
 
 // probe sends token to targetURL via method, carrying it in a cookie named
@@ -75,28 +75,48 @@ func probe(client *http.Client, targetURL, token, method, cookie string, extraHe
 	if err != nil {
 		return nil, err
 	}
-	return &probeResult{StatusCode: resp.StatusCode, Length: len(body)}, nil
+	return &probeResult{StatusCode: resp.StatusCode, Length: len(body), Body: body}, nil
 }
 
-// isHit decides whether resp looks like the authenticated (ok) baseline
-// rather than the rejected (fail) one. A different status code is never a
-// hit; identical status codes across both baselines fall back to a
-// content-length tiebreaker. Ported directly from JWTear's core/http.py.
-func isHit(resp, ok, fail *probeResult) bool {
-	if resp.StatusCode != ok.StatusCode {
-		return false
+// identityClaims are payload claims that name the account a token belongs to.
+// A forged token that the server accepts gets the same account back, so an
+// identity value that appears for the real token and not for an invalid one is
+// the strongest acceptance signal available.
+var identityClaims = []string{"sub", "email", "username", "preferred_username", "user_id", "uid", "name"}
+
+// identityMarkers returns the identity values from a token payload that are
+// long enough to be distinctive, lowercased for case-insensitive matching.
+func identityMarkers(payload map[string]any) []string {
+	var out []string
+	for _, k := range identityClaims {
+		v, ok := payload[k]
+		if !ok {
+			continue
+		}
+		s := strings.ToLower(strings.TrimSpace(fmt.Sprint(v)))
+		if len(s) >= 3 {
+			out = append(out, s)
+		}
 	}
-	if ok.StatusCode != fail.StatusCode {
-		return true
-	}
-	return absInt(resp.Length-ok.Length) < absInt(resp.Length-fail.Length)
+	return out
 }
 
-func absInt(n int) int {
-	if n < 0 {
-		return -n
+// presentIn keeps the markers that occur in body. A marker the valid response
+// does not show can't tell an accepted token from a rejected one.
+func presentIn(body []byte, markers []string) []string {
+	lower := strings.ToLower(string(body))
+	var out []string
+	for _, m := range markers {
+		if strings.Contains(lower, m) {
+			out = append(out, m)
+		}
 	}
-	return n
+	return out
+}
+
+// bodyHasMarker reports whether body contains any of markers.
+func bodyHasMarker(body []byte, markers []string) bool {
+	return len(presentIn(body, markers)) > 0
 }
 
 // TestStatus is the outcome of one misconfiguration check.
@@ -145,6 +165,10 @@ type scanCtx struct {
 	payload map[string]any
 	ok      *probeResult
 	fail    *probeResult
+	// markers are identity values present in the valid response (see
+	// identityMarkers). rawToken is the source token, used for offline HMAC.
+	markers  []string
+	rawToken string
 }
 
 func (c *scanCtx) probeToken(token string) (*probeResult, error) {
@@ -152,7 +176,30 @@ func (c *scanCtx) probeToken(token string) (*probeResult, error) {
 }
 
 func (c *scanCtx) hit(resp *probeResult) bool {
-	return isHit(resp, c.ok, c.fail)
+	return c.hitWith(resp, c.markers)
+}
+
+// hitWith judges a response against the given identity markers: the status must
+// match the valid baseline, a marker must appear in the response, and none may
+// appear in the invalid baseline. With no markers nothing can be judged.
+func (c *scanCtx) hitWith(resp *probeResult, markers []string) bool {
+	if len(markers) == 0 || resp.StatusCode != c.ok.StatusCode {
+		return false
+	}
+	return bodyHasMarker(resp.Body, markers) && !bodyHasMarker(c.fail.Body, markers)
+}
+
+// attemptWithClaims is attempt for a forged token whose claims were changed.
+// An accepting server may answer with the changed identity (sub → admin), so
+// the patched payload's identity values count as markers alongside the
+// original ones.
+func (c *scanCtx) attemptWithClaims(label, token string, claims map[string]any) Attempt {
+	resp, err := c.probeToken(token)
+	if err != nil {
+		return Attempt{Label: label, Token: token, Error: err.Error()}
+	}
+	markers := append(append([]string{}, c.markers...), identityMarkers(claims)...)
+	return Attempt{Label: label, Token: token, HTTPStatus: resp.StatusCode, Hit: c.hitWith(resp, markers)}
 }
 
 // attempt runs one forged token against the target and records it,
@@ -213,37 +260,106 @@ func (c *scanCtx) testEmptySig() TestResult {
 	return res
 }
 
-// testWeakSecret brute-forces the HMAC secret against secrets (the built-in
-// list plus any caller-supplied extras, already capped by RunScan). Skipped
-// entirely for non-HMAC algorithms, since there's no secret to guess.
+// hmacHash returns the hash for an HMAC JWS algorithm, or false for anything
+// that is not HMAC-based.
+func hmacHash(alg string) (func() hash.Hash, bool) {
+	switch strings.ToUpper(alg) {
+	case "HS256":
+		return sha256.New, true
+	case "HS384":
+		return sha512.New384, true
+	case "HS512":
+		return sha512.New, true
+	}
+	return nil, false
+}
+
+// testWeakSecret recovers the HMAC secret of the source token by checking each
+// candidate offline. An HMAC can be verified locally: compute the MAC of the
+// signing input with the candidate and compare it to the token's signature. A
+// match proves the secret signed this token, and it costs no requests to the
+// target. Earlier versions sent one request per candidate, which was slow,
+// noisy, and easy to block, and treated server acceptance as the crack.
 func (c *scanCtx) testWeakSecret(secrets []string) (TestResult, *string) {
 	res := TestResult{ID: "weak_secret", Name: "Weak HMAC Secret Brute-Force"}
 	alg, _ := c.header["alg"].(string)
-	if !strings.HasPrefix(strings.ToUpper(alg), "HS") {
+	newHash, ok := hmacHash(alg)
+	if !ok {
 		res.Status = StatusSkipped
 		res.Summary = fmt.Sprintf("alg=%q is not HMAC-based -- skipping", alg)
 		return res, nil
 	}
 
-	for _, secret := range secrets {
-		token, err := buildJWT(c.header, c.payload, []byte(secret))
-		if err != nil {
-			continue
-		}
-		resp, err := c.probeToken(token)
-		if err != nil {
-			continue
-		}
-		if c.hit(resp) {
+	parts := strings.Split(c.rawToken, ".")
+	if len(parts) != 3 {
+		res.Status = StatusSkipped
+		res.Summary = "source token is not a three-part JWS -- skipping"
+		return res, nil
+	}
+	signingInput := parts[0] + "." + parts[1]
+	sig, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil {
+		res.Status = StatusSkipped
+		res.Summary = "source token signature is not valid base64url -- skipping"
+		return res, nil
+	}
+
+	for i := range secrets {
+		secret := secrets[i]
+		mac := hmac.New(newHash, []byte(secret))
+		mac.Write([]byte(signingInput))
+		if hmac.Equal(mac.Sum(nil), sig) {
 			res.Status = StatusVulnerable
-			res.Summary = fmt.Sprintf("Cracked HMAC secret after trying %d candidate(s): %q", len(secrets), secret)
-			res.Token = token
+			res.Summary = fmt.Sprintf("Recovered the HMAC secret offline: %q signs this token (checked locally, no requests to the target)", secret)
 			return res, &secret
 		}
 	}
 	res.Status = StatusSafe
-	res.Summary = fmt.Sprintf("No match found across %d candidate secret(s)", len(secrets))
+	res.Summary = fmt.Sprintf("None of %d candidate secret(s) signs this token", len(secrets))
 	return res, nil
+}
+
+// offlineAdvisories reports token properties visible without contacting the
+// target: an unsigned algorithm, no expiry, an excessive lifetime, and header
+// fields that make the server fetch keys from elsewhere.
+func offlineAdvisories(header, payload map[string]any) []string {
+	var out []string
+	if alg, _ := header["alg"].(string); strings.EqualFold(alg, "none") {
+		out = append(out, "Token declares alg \"none\": it carries no signature at all.")
+	}
+	exp, hasExp := payload["exp"]
+	if !hasExp {
+		out = append(out, "Token has no exp claim, so it never expires on its own.")
+	} else if iat, ok := payload["iat"]; ok {
+		expN, okE := asUnix(exp)
+		iatN, okI := asUnix(iat)
+		if okE && okI && expN-iatN > 365*24*3600 {
+			out = append(out, "Token lifetime exceeds one year (exp minus iat).")
+		}
+	}
+	for _, k := range []string{"jku", "x5u"} {
+		if _, ok := header[k]; ok {
+			out = append(out, fmt.Sprintf("Header carries %q: the server may fetch its verification key from a URL the client chooses.", k))
+		}
+	}
+	if _, ok := header["kid"]; ok {
+		out = append(out, "Header carries \"kid\": a client-controlled key identifier is a common injection point.")
+	}
+	return out
+}
+
+// asUnix converts a numeric claim to whole seconds. JSON decoding yields float64,
+// but payloads built in code may carry integers, so every numeric type is accepted.
+func asUnix(v any) (int64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return int64(n), true
+	case int:
+		return int64(n), true
+	case int64:
+		return n, true
+	}
+	return 0, false
 }
 
 // rsaKeypair is generated once, lazily, and reused by every JWK-injection
@@ -360,7 +476,7 @@ func (c *scanCtx) testClaimTampering(foundSecret *string) TestResult {
 		hNone["alg"] = "none"
 		token, err := buildJWT(hNone, p, nil)
 		if err == nil {
-			a := c.attempt(cp.Desc+" (alg:none)", token)
+			a := c.attemptWithClaims(cp.Desc+" (alg:none)", token, p)
 			res.Attempts = append(res.Attempts, a)
 			if a.Hit {
 				found = true
@@ -373,7 +489,7 @@ func (c *scanCtx) testClaimTampering(foundSecret *string) TestResult {
 		if foundSecret != nil && strings.HasPrefix(strings.ToUpper(alg), "HS") {
 			token, err := buildJWT(c.header, p, []byte(*foundSecret))
 			if err == nil {
-				a := c.attempt(cp.Desc+" (re-signed with cracked secret)", token)
+				a := c.attemptWithClaims(cp.Desc+" (re-signed with cracked secret)", token, p)
 				res.Attempts = append(res.Attempts, a)
 				if a.Hit {
 					found = true
@@ -442,4 +558,41 @@ func (c *scanCtx) testRS256HS256(manualPEM string, discovered []pemCandidate) Te
 		res.Summary = fmt.Sprintf("Auto-discovered a public key (%s) but the server rejected it as an HMAC secret", candidates[0].Source)
 	}
 	return res
+}
+
+// baselineSamples is how many times each reference request is sent. One sample
+// cannot show whether the server is stable, and several tests are judged
+// against these responses.
+const baselineSamples = 3
+
+// sampleBaseline sends the same request baselineSamples times. It returns the
+// first response as the baseline and every sampled status, so the caller can
+// tell whether the server answers consistently.
+func sampleBaseline(client *http.Client, url, token, method, cookie string, headers map[string]string) (*probeResult, []int, error) {
+	var first *probeResult
+	statuses := make([]int, 0, baselineSamples)
+	for i := 0; i < baselineSamples; i++ {
+		r, err := probe(client, url, token, method, cookie, headers)
+		if err != nil {
+			if first == nil {
+				return nil, nil, err
+			}
+			continue
+		}
+		if first == nil {
+			first = r
+		}
+		statuses = append(statuses, r.StatusCode)
+	}
+	return first, statuses, nil
+}
+
+// allSame reports whether every value in xs is equal.
+func allSame(xs []int) bool {
+	for _, x := range xs {
+		if x != xs[0] {
+			return false
+		}
+	}
+	return true
 }

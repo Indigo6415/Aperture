@@ -1,37 +1,61 @@
 import type {
-  ActivityEvent,
+  ActiveCallbackServer,
+  ApiEnumRequest,
+  ApiEnumStartResult,
   AuthUser,
+  BreachCheckRequest,
+  BreachCrawlRequest,
+  Bypass403Request,
   Case,
   CaseScan,
   CaseSummary,
   Check,
+  CollaboratorConfig,
+  CollaboratorConfigResponse,
+  CollaboratorInteraction,
+  CollaboratorNewTokenResponse,
+  CookieVaultEntry,
+  CorsScanRequest,
   Credential,
+  CsrfScanRequest,
+  DomainScanModuleInfo,
+  DomainScanRequest,
+  DomainScanStartResult,
   Finding,
+  GraphqlEnumRequest,
   Job,
   JobOptions,
   JobStartResult,
   JobTemplate,
   JwtScanRequest,
-  JwtScanResponse,
+  OpenRedirectRequest,
   ProbeModuleInfo,
   ProbeScanRequest,
   ProbeScanStartResult,
-  RepeaterHistoryEntry,
-  RepeaterRequest,
-  RepeaterResponse,
+  PwResetRequest,
   Run,
   RunEvent,
+  ScanStartResult,
+  ScanTool,
   ScreenshotMeta,
   SecretScanRequest,
-  SecretScanResponse,
   SettingsInfo,
+  SsrfRequest,
+  SstiScanRequest,
   Target,
-  TargetKind,
+  TargetList,
+  TargetListKind,
+  TargetPingResult,
+  TesterRequest,
+  TesterResponse,
   Tool,
   ToolInfo,
+  TriageStatus,
+  WebhookSiteToken,
   WordlistCatalogEntry,
   WordlistCategory,
   WordlistInfo,
+  XssRequest,
 } from './types'
 
 // ApiError carries the HTTP status alongside the usual message so callers
@@ -76,12 +100,19 @@ export const api = {
     req<SettingsInfo>('/api/settings/dnsdumpster-key', { method: 'PUT', body: JSON.stringify({ apiKey }) }),
   setNVDKey: (apiKey: string) =>
     req<SettingsInfo>('/api/settings/nvd-key', { method: 'PUT', body: JSON.stringify({ apiKey }) }),
+  setHIBPKey: (apiKey: string) =>
+    req<SettingsInfo>('/api/settings/hibp-key', { method: 'PUT', body: JSON.stringify({ apiKey }) }),
 
   listTools: () => req<ToolInfo[]>('/api/tools'),
 
   getRun: (runId: string) => req<Run>(`/api/runs/${runId}`),
   listFindings: (runId: string, nodeId?: string) =>
     req<Finding[]>(`/api/runs/${runId}/findings${nodeId ? `?nodeId=${encodeURIComponent(nodeId)}` : ''}`),
+  updateFindingTriage: (id: string, status: TriageStatus, note?: string) =>
+    req<{ status: TriageStatus; note?: string }>(`/api/findings/${id}/triage`, {
+      method: 'PATCH',
+      body: JSON.stringify({ status, note }),
+    }),
 
   createCase: (name: string, description?: string) =>
     req<{ caseId: string }>('/api/cases', { method: 'POST', body: JSON.stringify({ name, description }) }),
@@ -90,20 +121,59 @@ export const api = {
   deleteCase: (id: string) => req<void>(`/api/cases/${id}`, { method: 'DELETE' }),
   listCaseChecks: (caseId: string) => req<Check[]>(`/api/cases/${caseId}/checks`),
   reportUrl: (caseId: string, format: 'json' | 'html' | 'pdf') => `/api/cases/${caseId}/report?format=${format}`,
-  listActivity: (caseId: string) => req<ActivityEvent[]>(`/api/cases/${caseId}/activity`),
-  listCaseScans: (caseId: string) => req<CaseScan[]>(`/api/cases/${caseId}/scans`),
+  // tool narrows the list to one scan tool's own history (e.g. its "Scans"
+  // tab); omit it for the case-wide list.
+  listCaseScans: (caseId: string, tool?: ScanTool) =>
+    req<CaseScan[]>(`/api/cases/${caseId}/scans${tool ? `?tool=${encodeURIComponent(tool)}` : ''}`),
+  // getCaseScan fetches one scan's full record, including its raw result
+  // payload -- listCaseScans above omits it, matching the backend's list
+  // view (see store.ListCaseScans' doc comment).
+  getCaseScan: (id: string) => req<CaseScan>(`/api/scans/${id}`),
 
   listTargets: (caseId: string) => req<Target[]>(`/api/cases/${caseId}/targets`),
-  addTarget: (caseId: string, value: string, kind?: TargetKind, notes?: string) =>
-    req<Target>(`/api/cases/${caseId}/targets`, { method: 'POST', body: JSON.stringify({ value, kind, notes }) }),
-  promoteTargets: (caseId: string, jobId: string, values: string[]) =>
-    req<Target[]>(`/api/cases/${caseId}/targets/promote`, { method: 'POST', body: JSON.stringify({ jobId, values }) }),
+  addTarget: (caseId: string, value: string, listId: string, notes?: string) =>
+    req<Target>(`/api/cases/${caseId}/targets`, { method: 'POST', body: JSON.stringify({ value, listId, notes }) }),
+  promoteTargets: (caseId: string, jobId: string, listId: string, values: string[]) =>
+    req<Target[]>(`/api/cases/${caseId}/targets/promote`, { method: 'POST', body: JSON.stringify({ jobId, listId, values }) }),
   deleteTarget: (id: string) => req<void>(`/api/targets/${id}`, { method: 'DELETE' }),
 
+  listTargetLists: (caseId: string) => req<TargetList[]>(`/api/cases/${caseId}/target-lists`),
+  createTargetList: (caseId: string, name: string, kind: TargetListKind) =>
+    req<TargetList>(`/api/cases/${caseId}/target-lists`, { method: 'POST', body: JSON.stringify({ name, kind }) }),
+  renameTargetList: (id: string, name: string) =>
+    req<TargetList>(`/api/target-lists/${id}`, { method: 'PATCH', body: JSON.stringify({ name }) }),
+  deleteTargetList: (id: string) => req<void>(`/api/target-lists/${id}`, { method: 'DELETE' }),
+  pingTargetList: (id: string) => req<TargetPingResult[]>(`/api/target-lists/${id}/ping`, { method: 'POST' }),
+
   listCredentials: (caseId: string) => req<Credential[]>(`/api/cases/${caseId}/credentials`),
-  addCredential: (caseId: string, name: string, headers?: Record<string, string>, cookie?: string, notes?: string) =>
-    req<Credential>(`/api/cases/${caseId}/credentials`, { method: 'POST', body: JSON.stringify({ name, headers, cookie, notes }) }),
+  addCredential: (
+    caseId: string,
+    fields: {
+      name: string
+      headers?: Record<string, string>
+      cookie?: string
+      notes?: string
+      username?: string
+      password?: string
+      loginUrl?: string
+      loginMethod?: string
+      usernameField?: string
+      passwordField?: string
+      tokenField?: string
+    },
+  ) => req<Credential>(`/api/cases/${caseId}/credentials`, { method: 'POST', body: JSON.stringify(fields) }),
   deleteCredential: (id: string) => req<void>(`/api/credentials/${id}`, { method: 'DELETE' }),
+  // createCredentialSession logs a saved test credential in (see
+  // handleCreateCredentialSession) and returns it with headers/cookie
+  // overwritten by the resulting session.
+  createCredentialSession: (id: string) => req<Credential>(`/api/credentials/${id}/session`, { method: 'POST' }),
+
+  listCookieVault: (caseId: string) => req<CookieVaultEntry[]>(`/api/cases/${caseId}/cookie-vault`),
+  setCookieVaultEntry: (caseId: string, domain: string, cookie: string) =>
+    req<CookieVaultEntry>(`/api/cases/${caseId}/cookie-vault/${encodeURIComponent(domain)}`, {
+      method: 'PUT',
+      body: JSON.stringify({ cookie }),
+    }),
 
   listJobTemplates: (tool: Tool) => req<JobTemplate[]>(`/api/job-templates?tool=${encodeURIComponent(tool)}`),
   saveJobTemplate: (tool: Tool, name: string, options: JobOptions) =>
@@ -158,17 +228,59 @@ export const api = {
       body: JSON.stringify({ newName }),
     }),
 
-  jwtScan: (scanReq: JwtScanRequest) => req<JwtScanResponse>('/api/jwt/scan', { method: 'POST', body: JSON.stringify(scanReq) }),
+  jwtScan: (scanReq: JwtScanRequest) => req<ScanStartResult>('/api/jwt/scan', { method: 'POST', body: JSON.stringify(scanReq) }),
 
   listProbeModules: () => req<ProbeModuleInfo[]>('/api/probe/modules'),
   probeScan: (scanReq: ProbeScanRequest) =>
     req<ProbeScanStartResult>('/api/probe/scan', { method: 'POST', body: JSON.stringify(scanReq) }),
 
-  secretScan: (scanReq: SecretScanRequest) => req<SecretScanResponse>('/api/secrets/scan', { method: 'POST', body: JSON.stringify(scanReq) }),
+  listDomainScanModules: () => req<DomainScanModuleInfo[]>('/api/domainscan/modules'),
+  domainScan: (scanReq: DomainScanRequest) =>
+    req<DomainScanStartResult>('/api/domainscan/scan', { method: 'POST', body: JSON.stringify(scanReq) }),
 
-  repeaterSend: (sendReq: RepeaterRequest) => req<RepeaterResponse>('/api/repeater/send', { method: 'POST', body: JSON.stringify(sendReq) }),
-  listRepeaterHistory: (caseId: string) => req<RepeaterHistoryEntry[]>(`/api/cases/${caseId}/repeater/history`),
-  deleteRepeaterHistoryEntry: (id: string) => req<void>(`/api/repeater/history/${id}`, { method: 'DELETE' }),
+  apiEnumScan: (scanReq: ApiEnumRequest) =>
+    req<ApiEnumStartResult>('/api/apienum/scan', { method: 'POST', body: JSON.stringify(scanReq) }),
+
+  secretScan: (scanReq: SecretScanRequest) => req<ScanStartResult>('/api/secrets/scan', { method: 'POST', body: JSON.stringify(scanReq) }),
+
+  breachCheck: (checkReq: BreachCheckRequest) =>
+    req<ScanStartResult>('/api/breach/check', { method: 'POST', body: JSON.stringify(checkReq) }),
+  crawlEmails: (crawlReq: BreachCrawlRequest) =>
+    req<ScanStartResult>('/api/breach/crawl-emails', { method: 'POST', body: JSON.stringify(crawlReq) }),
+
+  bypass403: (runReq: Bypass403Request) => req<ScanStartResult>('/api/bypass403/run', { method: 'POST', body: JSON.stringify(runReq) }),
+
+  pwReset: (scanReq: PwResetRequest) => req<ScanStartResult>('/api/pwreset/scan', { method: 'POST', body: JSON.stringify(scanReq) }),
+
+  graphqlEnum: (scanReq: GraphqlEnumRequest) =>
+    req<ScanStartResult>('/api/graphqlenum/scan', { method: 'POST', body: JSON.stringify(scanReq) }),
+
+  corsScan: (scanReq: CorsScanRequest) => req<ScanStartResult>('/api/corsscan/scan', { method: 'POST', body: JSON.stringify(scanReq) }),
+
+  openRedirect: (scanReq: OpenRedirectRequest) =>
+    req<ScanStartResult>('/api/openredirect/scan', { method: 'POST', body: JSON.stringify(scanReq) }),
+
+  ssrfScan: (scanReq: SsrfRequest) => req<ScanStartResult>('/api/ssrf/scan', { method: 'POST', body: JSON.stringify(scanReq) }),
+
+  csrfScan: (scanReq: CsrfScanRequest) => req<ScanStartResult>('/api/csrf/scan', { method: 'POST', body: JSON.stringify(scanReq) }),
+
+  sstiScan: (scanReq: SstiScanRequest) => req<ScanStartResult>('/api/sstiscan/scan', { method: 'POST', body: JSON.stringify(scanReq) }),
+
+  xssScan: (scanReq: XssRequest) => req<ScanStartResult>('/api/xss/scan', { method: 'POST', body: JSON.stringify(scanReq) }),
+
+  testerSend: (sendReq: TesterRequest) => req<TesterResponse>('/api/tester/send', { method: 'POST', body: JSON.stringify(sendReq) }),
+
+  getCollaboratorConfig: () => req<CollaboratorConfigResponse>('/api/collaborator/config'),
+  setCollaboratorConfig: (cfg: CollaboratorConfig) =>
+    req<CollaboratorConfigResponse>('/api/collaborator/config', { method: 'PUT', body: JSON.stringify(cfg) }),
+  newCollaboratorToken: () => req<CollaboratorNewTokenResponse>('/api/collaborator/new', { method: 'POST' }),
+  pollCollaborator: (token: string) => req<CollaboratorInteraction[]>(`/api/collaborator/poll?token=${encodeURIComponent(token)}`),
+  newWebhookSiteToken: () => req<WebhookSiteToken>('/api/collaborator/webhooksite/new', { method: 'POST' }),
+  pollWebhookSite: (uuid: string) =>
+    req<CollaboratorInteraction[]>(`/api/collaborator/webhooksite/poll?uuid=${encodeURIComponent(uuid)}`),
+  listActiveCallbackServers: () => req<ActiveCallbackServer[]>('/api/collaborator/active'),
+  removeActiveCallbackServer: (token: string) =>
+    req<void>(`/api/collaborator/active?token=${encodeURIComponent(token)}`, { method: 'DELETE' }),
 }
 
 // watchJob opens a WebSocket streaming live RunEvents for one job (whatever
@@ -189,7 +301,35 @@ export function watchProbeScan(scanId: string, onEvent: (ev: RunEvent) => void):
   return watchSocket(`/ws/probe/${scanId}`, onEvent)
 }
 
-function watchSocket(path: string, onEvent: (ev: RunEvent) => void): () => void {
+// watchDomainScan is watchProbeScan's counterpart for a domain scan (see
+// handleDomainScan/runDomainScan in internal/api) -- same RunEvent stream,
+// emitting "domainModule" events as each module finishes and a terminal
+// "done" event with the resolved target once every module has.
+export function watchDomainScan(scanId: string, onEvent: (ev: RunEvent) => void): () => void {
+  return watchSocket(`/ws/domainscan/${scanId}`, onEvent)
+}
+
+// watchApiEnumScan is watchProbeScan's counterpart for an API enumeration
+// run (see handleApiEnumScan/runApiEnumScan in internal/api) -- same
+// RunEvent stream, emitting "apiEnumPhase" events as each discovery phase
+// progresses, "apiEnumRoute" events as each route finishes
+// characterization, and a terminal "done" event with the resolved target/
+// schema/GraphQL summary/injection points/stats once the run finishes.
+export function watchApiEnumScan(scanId: string, onEvent: (ev: RunEvent) => void): () => void {
+  return watchSocket(`/ws/apienum/${scanId}`, onEvent)
+}
+
+// watchScan is the shared streaming route for every scanner that reports
+// per-check progress (see internal/api/scan_stream.go) -- the same RunEvent
+// stream as the per-tool watchers above, keyed by the scanId its POST
+// /scan endpoint returned. onClose fires if the socket drops, so a caller
+// can tell a lost connection apart from a scan that finished cleanly (which
+// always ends on a "done" event first).
+export function watchScan(scanId: string, onEvent: (ev: RunEvent) => void, onClose?: () => void): () => void {
+  return watchSocket(`/ws/scans/${scanId}`, onEvent, onClose)
+}
+
+function watchSocket(path: string, onEvent: (ev: RunEvent) => void, onClose?: () => void): () => void {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
   const ws = new WebSocket(`${proto}//${location.host}${path}`)
   ws.onmessage = (ev) => {
@@ -199,5 +339,6 @@ function watchSocket(path: string, onEvent: (ev: RunEvent) => void): () => void 
       // ignore malformed frames
     }
   }
+  if (onClose) ws.onclose = onClose
   return () => ws.close()
 }
