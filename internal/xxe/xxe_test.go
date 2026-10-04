@@ -2,6 +2,7 @@ package xxe
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -53,6 +54,35 @@ func fakeParser(mode string) http.HandlerFunc {
 			w.Header().Set("Content-Type", "application/xml")
 			_, _ = w.Write(raw)
 			return
+		}
+
+		// A local DTD redefinition makes the parser fail on a path that embeds
+		// the first line of /etc/passwd. The real parser does the same when the
+		// DTD exists on the server, which is the case the payload targets.
+		if mode == "vuln" && strings.Contains(body, "docbookx.dtd") {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, `parser error: failed to load external entity "file:///nonexistent/`+strings.TrimSpace(passwdText)+`"`)
+			return
+		}
+		// An external-subset DOCTYPE is fetched before the document is read.
+		if mode == "oob" {
+			if m := externalSubsetPattern.FindStringSubmatch(body); m != nil {
+				if resp, err := http.Get(m[1]); err == nil {
+					_ = resp.Body.Close()
+				}
+			}
+			// The file-exfil chain: the parameter entity holds the file, the eval
+			// entity expands it into the exfil declaration, and the exfil URL
+			// carries the file. A parser that refuses a multi-line URL would not
+			// send this, so the fake uses the first line only.
+			if strings.Contains(body, "ENTITY % eval") {
+				if m := exfilURLPattern.FindStringSubmatch(body); m != nil {
+					target := strings.ReplaceAll(m[1], "%file;", strings.TrimSpace(passwdText))
+					if resp, err := http.Get(target); err == nil {
+						_ = resp.Body.Close()
+					}
+				}
+			}
 		}
 
 		noDoctype := doctypePattern.ReplaceAllString(body, "")
@@ -115,6 +145,15 @@ func fakeParser(mode string) http.HandlerFunc {
 
 const passwdText = "root:x:0:0:root:/root:/bin/sh\n"
 
+// externalSubsetPattern matches a DOCTYPE that names an external DTD by its
+// SYSTEM identifier, with no internal subset: the form the external-subset
+// variant sends.
+var externalSubsetPattern = regexp.MustCompile(`<!DOCTYPE\s+\w+\s+SYSTEM\s+"(http[^"]+)"\s*>`)
+
+// exfilURLPattern captures the SYSTEM URL of the exfil declaration built by the
+// file-exfil variant, which is the URL the parser sends the file to.
+var exfilURLPattern = regexp.MustCompile(`SYSTEM '([^']*)'`)
+
 // resolveEntity returns what the fake parser substitutes for one declared
 // entity. val is either an inline value (returned with its character
 // references decoded) or "SYSTEM:<url>" for an external one.
@@ -126,6 +165,9 @@ func resolveEntity(val, mode string) (string, error) {
 	switch {
 	case sys == "file:///etc/passwd":
 		return passwdText, nil
+	case strings.HasPrefix(sys, "php://filter/convert.base64-encode/resource=/etc/passwd"):
+		// The PHP base64 wrapper returns the file encoded, not as plain text.
+		return base64.StdEncoding.EncodeToString([]byte(passwdText)), nil
 	case sys == "file:///C:/Windows/win.ini":
 		return "; for 16-bit app support\n[fonts]\n", nil
 	case strings.HasPrefix(sys, "file:///aperture-xxe-"):
@@ -354,7 +396,7 @@ func TestRunOOBCallbackConfirmsBlindXXE(t *testing.T) {
 		if len(parts) >= 3 && parts[0] == "collab" {
 			reg.Record(parts[1], collaborator.Interaction{
 				ID: fmt.Sprint(len(reg.Poll(parts[1]))), Protocol: "http", RemoteAddr: "203.0.113.9",
-				Identifier: parts[2],
+				Identifier: parts[2], Query: r.URL.RawQuery,
 			})
 		}
 	}))
@@ -400,7 +442,7 @@ func TestRunOOBSharedTokenAttributesHits(t *testing.T) {
 		if len(parts) >= 3 && parts[0] == "collab" {
 			reg.Record(parts[1], collaborator.Interaction{
 				ID: fmt.Sprint(len(reg.Poll(parts[1]))), Protocol: "http", RemoteAddr: "203.0.113.9",
-				Identifier: parts[2],
+				Identifier: parts[2], Query: r.URL.RawQuery,
 			})
 		}
 	}))

@@ -223,6 +223,10 @@ func TestForwardedHostRedirectKeepsIdentifierPath(t *testing.T) {
 	if strings.Contains(f.Detail, "rebuilt") || strings.Contains(f.Detail, "did not keep") {
 		t.Errorf("detail should not say the scanner rebuilt the callback: %q", f.Detail)
 	}
+	// The redirect kept the identifier, so the target's own URL is the proof.
+	if f.Confidence != ConfidenceConfirmed {
+		t.Errorf("confidence = %q, want %q when the redirect kept the identifier", f.Confidence, ConfidenceConfirmed)
+	}
 	// /fwd redirects to the sent value plus "/home", so the confirming hop must
 	// be exactly that redirect target.
 	want := "https://" + f.Request.Headers["X-Forwarded-Host"] + "/home"
@@ -247,6 +251,11 @@ func TestForwardedHostRedirectRebuildsDroppedPath(t *testing.T) {
 	f := got[0]
 	if !strings.Contains(f.Detail, "did not keep this probe's identifier path") {
 		t.Errorf("detail %q should say the redirect dropped the identifier path", f.Detail)
+	}
+	// The scanner built the callback URL, so the hit does not prove the target
+	// followed its own redirect to it.
+	if f.Confidence != ConfidenceLikely {
+		t.Errorf("confidence = %q, want %q when the scanner rebuilt the callback", f.Confidence, ConfidenceLikely)
 	}
 	if !strings.Contains(f.Chain[len(f.Chain)-1].URL, "/collab/") {
 		t.Errorf("final hop %q should be the rebuilt callback URL", f.Chain[len(f.Chain)-1].URL)
@@ -452,6 +461,12 @@ func TestBrowserResolve(t *testing.T) {
 		{"https:evil.example/x", "evil.example"},
 		{"https:/\\evil.example/x", "evil.example"},
 		{"https://target.example@evil.example/x", "evil.example"},
+		{"///evil.example/x", "evil.example"},
+		{"/\\/evil.example/x", "evil.example"},
+		{"https:\\\\evil.example/x", "evil.example"},
+		{"https:///evil.example/x", "evil.example"},
+		{"https://evil.example/#target.example", "evil.example"},
+		{"https://evil.example/target.example", "evil.example"},
 		{"/dashboard", "target.example"},
 	}
 	for _, c := range cases {
@@ -656,5 +671,100 @@ func TestBaselineFailureDoesNotAbortRun(t *testing.T) {
 	}
 	if len(res.Modules) == 0 {
 		t.Error("run should still report its modules after a failed baseline")
+	}
+}
+
+// TestNewVectorsBypassNaiveFilter checks the vectors added to the module list
+// against the same naive /login filter. Backslash and scheme-backslash values
+// start with neither "//" nor "https://", so the filter passes them and the
+// browser-resolved host confirms them. Triple-slash values begin with "//", so
+// that filter rejects them and they produce no finding.
+func TestNewVectorsBypassNaiveFilter(t *testing.T) {
+	reg := collaborator.NewRegistry()
+	cb := newCallbackServer(t, reg)
+	target := newTargetServer(t)
+
+	res := runAgainst(t, target.URL+"/login?next=/dashboard", cb, reg, true)
+	for _, id := range []string{"backslash-slash", "https-backslash"} {
+		if got := findingsIn(t, res, id); len(got) != 1 {
+			t.Errorf("%s should bypass /login, got %d finding(s)", id, len(got))
+		}
+	}
+	for _, id := range []string{"triple-slash", "https-triple-slash", "allowlist-fragment"} {
+		if got := findingsIn(t, res, id); len(got) != 0 {
+			t.Errorf("%s should be rejected by /login's filter, got %d finding(s)", id, len(got))
+		}
+	}
+}
+
+// TestClientSideRedirectConfirmed checks the client-side branch in the case it
+// should confirm. The page puts the echoed value into a window.location.href
+// assignment, so the redirect literal names the callback host and the probe's
+// identifier. The finding is "likely", because the scanner requested the
+// callback itself rather than following a 3xx.
+func TestClientSideRedirectConfirmed(t *testing.T) {
+	reg := collaborator.NewRegistry()
+	cb := newCallbackServer(t, reg)
+	page := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next := r.URL.Query().Get("next")
+		fmt.Fprintf(w, `<html><body><script>window.location.href = "%s";</script></body></html>`, next)
+	}))
+	t.Cleanup(page.Close)
+
+	res := runAgainst(t, page.URL+"/bounce?next=/dashboard", cb, reg, true)
+	got := findingsIn(t, res, "absolute-url")
+	if len(got) != 1 {
+		t.Fatalf("absolute-url findings = %d, want 1 (%+v)", len(got), got)
+	}
+	if got[0].Confidence != ConfidenceLikely {
+		t.Errorf("confidence = %q, want %q for a client-side redirect", got[0].Confidence, ConfidenceLikely)
+	}
+	if !strings.Contains(got[0].Detail, "client-side redirect") {
+		t.Errorf("detail %q should say the redirect was client-side", got[0].Detail)
+	}
+}
+
+// TestClientSideLiteralMustNameProbe checks clientRedirectTo directly. A
+// literal with the callback host but another identifier, or with the
+// identifier but another host, is not a redirect to this probe's callback.
+func TestClientSideLiteralMustNameProbe(t *testing.T) {
+	const cb, id = "aperture.example:8443", "or-absolute-url-x-1-2"
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"meta refresh names both", `<meta http-equiv="refresh" content="0;url=https://` + cb + `/collab/t/` + id + `/">`, true},
+		{"script literal names both", `<script>location.replace("https://` + cb + `/collab/t/` + id + `/")</script>`, true},
+		{"script literal, other identifier", `<script>location.href="https://` + cb + `/collab/t/other/"</script>`, false},
+		{"script literal, other host", `<script>location.href="https://elsewhere.example/` + id + `"</script>`, false},
+		{"echo only, no redirect", `<input value="https://` + cb + `/collab/t/` + id + `/">`, false},
+		{"unrelated assignment", `<script>window.location.href = "/home"; var x = "` + cb + id + `";</script>`, false},
+		{"comparison, not assignment", `<script>if (location.href == "https://` + cb + `/` + id + `") {}</script>`, false},
+	}
+	for _, c := range cases {
+		if got := clientRedirectTo(c.body, cb, id); got != c.want {
+			t.Errorf("%s: clientRedirectTo = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestEchoedValueWithUnrelatedScriptNotReported guards against a false
+// positive in the client-side branch. The page echoes the next parameter into
+// an input, and separately has an ordinary script that sets location.href to
+// its own path. The echo puts the callback host into the body, but nothing
+// redirects to it, so no probe should be reported.
+func TestEchoedValueWithUnrelatedScriptNotReported(t *testing.T) {
+	reg := collaborator.NewRegistry()
+	cb := newCallbackServer(t, reg)
+	page := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next := r.URL.Query().Get("next")
+		fmt.Fprintf(w, `<html><body><input name="q" value="%s"><script>window.location.href = "/home";</script></body></html>`, next)
+	}))
+	t.Cleanup(page.Close)
+
+	res := runAgainst(t, page.URL+"/search?next=/dashboard", cb, reg, true)
+	if n := totalFindings(res); n != 0 {
+		t.Errorf("echoed value next to an unrelated redirect script produced %d finding(s), want 0", n)
 	}
 }

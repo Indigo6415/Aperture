@@ -132,7 +132,20 @@ func (r *httpResult) observation() fingerprint.Observation {
 // isCatchAll reports whether r is the host's soft-404 page. A scan without a
 // profile (the probe that builds it failed) never treats anything as one.
 func (c *probeClient) isCatchAll(r *httpResult) bool {
-	return c.profile.Matches(r.observation())
+	obs := r.observation()
+	if c.profile.Matches(obs) {
+		return true
+	}
+	// Without a stable profile the random-path samples disagree, so filtering
+	// by them is unsafe. The homepage is then the only baseline left, and a 200
+	// identical to it is treated as the front end answering for any path. A
+	// stable profile is authoritative, so it is never overridden here.
+	// A nil profile (the probe that builds it failed) counts as unstable here.
+	unstable := c.profile == nil || !c.profile.Stable
+	if c.home != nil && unstable && obs.Status == 200 && fingerprint.Similar(*c.home, obs) {
+		return true
+	}
+	return false
 }
 
 // runPathChecks runs every check in checks concurrently (bounded by the

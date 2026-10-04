@@ -356,6 +356,7 @@ func runIntrospectionModule(ctx context.Context, client *http.Client, target *ur
 			Method:     methodFor(attempt.id),
 			StatusCode: res.StatusCode,
 			Request:    &res.Request,
+			Confidence: ConfidenceConfirmed,
 		})
 		if schema == nil {
 			schema = built

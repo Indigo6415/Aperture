@@ -2,6 +2,7 @@ package domainscan
 
 import (
 	"context"
+	"fmt"
 	"github.com/Indigo6415/Aperture/internal/netgov"
 	"github.com/Indigo6415/Aperture/internal/robots"
 	"io"
@@ -72,20 +73,25 @@ func newCrawlClient() *http.Client {
 	return netgov.NewClient(crawlRequestTimeout, true)
 }
 
+// fetchBytes GETs target and returns its body. Only a 200 response yields a
+// body: an error page's HTML would otherwise be handed to a library tool as if
+// it were a script. Saved headers go through netgov.ApplyHeaders, so a Host
+// override is honored.
 func fetchBytes(ctx context.Context, client *http.Client, target string, headers map[string]string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; Aperture DomainScan)")
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
+	netgov.ApplyHeaders(req, headers)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("domainscan: %s returned status %d", target, resp.StatusCode)
+	}
 	return io.ReadAll(io.LimitReader(resp.Body, crawlMaxBodyBytes))
 }
 

@@ -57,6 +57,7 @@ export function Bypass403({
   const [scans, setScans] = useState<Record<string, TargetScanState>>({})
   const batch = useScanBatch()
   const [credentialId, setCredentialId] = useState<string | undefined>()
+  const [allowWrites, setAllowWrites] = useState(false)
   const [view, setView] = useState<'scan' | 'history'>('scan')
 
   const hasScans = Object.keys(scans).length > 0
@@ -119,7 +120,7 @@ export function Bypass403({
   // result once it finishes.
   const runOneScan = (targetValue: string, signal?: AbortSignal) =>
     runTrackedScan<Bypass403Response>(
-      () => api.bypass403({ requestsPerSecond: speed.rps ?? undefined, url: toAbsoluteUrl(targetValue), credentialId, caseId }),
+      () => api.bypass403({ requestsPerSecond: speed.rps ?? undefined, url: toAbsoluteUrl(targetValue), credentialId, allowWriteMethods: allowWrites || undefined, caseId }),
       (update) => setScans((prev) => (prev[targetValue] ? { ...prev, [targetValue]: update(prev[targetValue]) } : prev)),
       signal,
     )
@@ -181,6 +182,11 @@ export function Bypass403({
 
 
         <CredentialPicker credentials={credentials} selected={credentialId} onSelect={setCredentialId} />
+
+        <label className="flex items-start gap-2 text-[11px] text-amber-300/90">
+          <input type="checkbox" checked={allowWrites} onChange={(e) => setAllowWrites(e.target.checked)} className="mt-0.5" />
+          <span>Also try PUT, PATCH and DELETE against the path. These can change or delete data on the target.</span>
+        </label>
 
         <button
           onClick={runScan}

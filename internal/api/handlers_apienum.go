@@ -40,6 +40,10 @@ type apiEnumScanRequest struct {
 	// default wordlist the brute-force phase draws from -- see
 	// apienum.Options.ExtraWordlist.
 	ExtraWordlist []string `json:"extraWordlist,omitempty"`
+	// AllowWriteMethods opts into sending PUT, PATCH and DELETE to each route
+	// during characterization. Off by default because those requests can change
+	// or delete data on the target -- see apienum.Options.AllowWriteMethods.
+	AllowWriteMethods bool `json:"allowWriteMethods,omitempty"`
 	// CaseID -- see probeScanRequest.CaseID's doc comment.
 	CaseID string `json:"caseId,omitempty"`
 }
@@ -103,6 +107,7 @@ func (s *Server) handleApiEnumScan(w http.ResponseWriter, r *http.Request) {
 	opts := apienum.Options{
 		Concurrency: resolved.Threads, RateLimit: int(math.Ceil(rps)),
 		CrawlDepth: req.CrawlDepth, MaxPages: req.MaxPages, ExtraWordlist: req.ExtraWordlist,
+		AllowWriteMethods: req.AllowWriteMethods,
 	}
 	if req.CredentialID != "" {
 		cred, err := s.store.GetCredential(req.CredentialID)

@@ -271,7 +271,7 @@ func fanOutSubdomains(ctx context.Context, subdomains []string, onCheck func(Che
 			onCheck(httpCheck)
 
 			if takeover, flagged := detectTakeover(sub, dnsCheck, httpCheck); flagged {
-				onCheck(takeover)
+				onCheck(refineTakeover(ctx, takeover))
 			}
 		}()
 	}

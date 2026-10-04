@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 )
@@ -36,12 +37,42 @@ const openapiFixture = `{
   }
 }`
 
+// methodLog records every HTTP method the fixture server receives, so a test
+// can check which verbs actually went out on the wire.
+type methodLog struct {
+	mu   sync.Mutex
+	seen map[string]bool
+}
+
+// record notes that a request with method arrived.
+func (l *methodLog) record(method string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.seen[method] = true
+}
+
+// saw reports whether a request with method arrived at any point.
+func (l *methodLog) saw(method string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.seen[method]
+}
+
 // newFixtureServer stands in for a real target: it serves openapiFixture at
 // /openapi.json, answers /users/1 for GET/DELETE/PATCH/OPTIONS, and 404s
 // everything else -- including every brute-force guess and GraphQL probe
 // path this run will also fire, so the test stays fast and deterministic.
 func newFixtureServer(t *testing.T) *httptest.Server {
 	t.Helper()
+	srv, _ := newRecordingFixtureServer(t)
+	return srv
+}
+
+// newRecordingFixtureServer is newFixtureServer plus a methodLog of every
+// request method the server received.
+func newRecordingFixtureServer(t *testing.T) (*httptest.Server, *methodLog) {
+	t.Helper()
+	log := &methodLog{seen: map[string]bool{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/openapi.json", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -64,9 +95,35 @@ func newFixtureServer(t *testing.T) *httptest.Server {
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 	})
-	srv := httptest.NewServer(mux)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		log.record(r.Method)
+		mux.ServeHTTP(w, r)
+	}))
 	t.Cleanup(srv.Close)
-	return srv
+	return srv, log
+}
+
+// TestRunScanSendsNoWriteMethodsByDefault checks that a default run never
+// sends PUT, PATCH or DELETE, even to a route the spec declares as DELETE and
+// PATCH, and that the write-method opt-in is what enables them. It checks the
+// verbs the server received, not just what the result reports.
+func TestRunScanSendsNoWriteMethodsByDefault(t *testing.T) {
+	srv, log := newRecordingFixtureServer(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if _, err := RunScan(ctx, srv.URL, Options{CrawlDepth: 1, MaxPages: 1}); err != nil {
+		t.Fatalf("RunScan: %v", err)
+	}
+	for _, method := range []string{"PUT", "PATCH", "DELETE"} {
+		if log.saw(method) {
+			t.Errorf("default run sent %s to the target", method)
+		}
+	}
+	if !log.saw("GET") {
+		t.Error("default run sent no GET at all, so the fixture was not exercised")
+	}
 }
 
 func TestRunScanFindsSpecRouteAndFlagsIDParam(t *testing.T) {
@@ -75,7 +132,9 @@ func TestRunScanFindsSpecRouteAndFlagsIDParam(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	result, err := RunScan(ctx, srv.URL, Options{CrawlDepth: 1, MaxPages: 1})
+	// The operator has opted into write methods here, so the method swap is
+	// expected to reach PUT/PATCH/DELETE. The default is checked separately.
+	result, err := RunScan(ctx, srv.URL, Options{CrawlDepth: 1, MaxPages: 1, AllowWriteMethods: true})
 	if err != nil {
 		t.Fatalf("RunScan: %v", err)
 	}

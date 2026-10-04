@@ -103,6 +103,7 @@ cd web && npm run dev                        # terminal 2, http://localhost:5173
 - `internal/engine` — DAG flow executor (filter/merge/table/export nodes + adapters), driving each job's flow
 - `internal/recon` — fast stdlib-only DNS/TLS/HTTP/WHOIS checks, passive (crt.sh + DNSDumpster) subdomain discovery with two-path liveness verification, and web technology fingerprinting -- run on demand by an "Identify" job, never automatically
 - `internal/cve` — live NVD CVE lookups for fingerprinted technology versions
+- `internal/gitdump` — exposed `.git` recovery: probes each target, downloads refs/index/loose and packed objects (each one hash-verified), restores the HEAD working tree in Go (the remote config is never run through a local git), and zips each exposed target as a downloadable bucket
 - `internal/techfp` — the curated web technology fingerprint signature set
 - `internal/store` — SQLite persistence (cases, targets, jobs, findings)
 - `internal/api` — REST + WebSocket server

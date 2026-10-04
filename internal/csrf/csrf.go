@@ -107,6 +107,25 @@ type Request struct {
 	APIURL    string `json:"apiUrl,omitempty"`
 	APIMethod string `json:"apiMethod,omitempty"`
 	APIBody   string `json:"apiBody,omitempty"`
+
+	// TokenProbe optionally names one form endpoint whose anti-CSRF token
+	// enforcement is tested by replaying it with the token missing, empty, or
+	// wrong. Like APIURL it is operator-named only, never crawled. Nil skips the
+	// check.
+	TokenProbe *TokenProbe `json:"tokenProbe,omitempty"`
+}
+
+// TokenProbe describes one form submission whose token enforcement is tested.
+// Body is the complete form-encoded body a legitimate submission sends, token
+// field included. Field names the token field inside it. The check replays
+// Body as is to establish a baseline, then with that field removed, emptied,
+// and set to a wrong value. It makes state-changing requests, so the operator
+// must name the endpoint.
+type TokenProbe struct {
+	URL    string `json:"url"`
+	Method string `json:"method,omitempty"` // defaults to POST
+	Body   string `json:"body"`
+	Field  string `json:"field"`
 }
 
 type Result struct {
@@ -147,6 +166,14 @@ func Run(ctx context.Context, req Request) (*Result, error) {
 		rep.Done(apiID, len(mod.Findings), nil)
 		modules = append(modules, mod)
 	}
+	if req.TokenProbe != nil && strings.TrimSpace(req.TokenProbe.URL) != "" {
+		tokID := "token-validation|" + req.TokenProbe.URL
+		rep.Plan(scanprogress.Check{ID: tokID, Label: req.TokenProbe.URL, Group: "CSRF token validation"})
+		rep.Start(tokID)
+		mod := tokenValidationModule(ctx, req.TokenProbe, req.Headers)
+		rep.Done(tokID, len(mod.Findings), nil)
+		modules = append(modules, mod)
+	}
 	sort.Slice(modules, func(i, j int) bool { return modules[i].Name < modules[j].Name })
 
 	return &Result{PagesScanned: cr.PagesScanned, FormsFound: len(cr.Forms), Modules: modules}, nil
@@ -155,5 +182,6 @@ func Run(ctx context.Context, req Request) (*Result, error) {
 // Confidence levels for a Finding, shared with the other scanners.
 const (
 	ConfidenceConfirmed = "confirmed"
+	ConfidenceLikely    = "likely"
 	ConfidenceHeuristic = "heuristic"
 )

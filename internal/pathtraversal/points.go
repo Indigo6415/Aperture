@@ -3,6 +3,7 @@ package pathtraversal
 import (
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"maps"
 	"net/http"
@@ -111,15 +112,105 @@ func queryPoint(base requestSpec, pageURL *url.URL, key string) point {
 		label: fmt.Sprintf("query parameter %q on %s", key, bare.String()),
 		build: func(value string) requestSpec {
 			u := *pageURL
-			q := u.Query()
-			q.Set(key, value)
-			u.RawQuery = q.Encode()
+			// The payload is written raw, so the app decodes it exactly once,
+			// the way a browser's URL would reach it. Re-encoding the value
+			// here would add one more layer and break every encoding bypass.
+			u.RawQuery = setRawQueryParam(pageURL.RawQuery, key, rawValueFor(value))
 			spec := base
 			spec.URL = u.String()
 			spec.Headers = cloneHeaders(base.Headers)
 			return spec
 		},
 	}
+}
+
+// setRawQueryParam returns the raw query string q with every pair named key
+// removed and key=raw appended. The other pairs are kept byte for byte, so
+// their encoding is the operator's own. key is decoded before comparing, so
+// an escaped name still matches.
+func setRawQueryParam(q, key, raw string) string {
+	parts := []string{}
+	// Keep every pair except the one named key. Empty pairs from "&&" are dropped.
+	for _, pair := range strings.Split(q, "&") {
+		if pair == "" {
+			continue
+		}
+		name, _, _ := strings.Cut(pair, "=")
+		// A name that fails to decode cannot be key, so the pair is kept.
+		if decoded, err := url.QueryUnescape(name); err == nil && decoded == key {
+			continue
+		}
+		parts = append(parts, pair)
+	}
+	parts = append(parts, url.QueryEscape(key)+"="+raw)
+	return strings.Join(parts, "&")
+}
+
+// rawValueFor escapes a payload for use as a query or form value, leaving its
+// percent sequences as written. Only the bytes that would change how the query
+// is split or decoded are escaped: "&", "#", "+", space, non-ASCII, and a "%"
+// that does not start a valid escape. A "%u2215" sequence is kept as written
+// too, since it is the IIS form and is not a valid percent escape.
+func rawValueFor(v string) string {
+	var b strings.Builder
+	// Walk the payload byte by byte, so each escape decision sees one byte.
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		// A percent sequence the payload wrote on purpose goes out unchanged.
+		if c == '%' && isPercentSequence(v[i:]) {
+			b.WriteByte(c)
+			continue
+		}
+		if querySafe(c) {
+			b.WriteByte(c)
+			continue
+		}
+		fmt.Fprintf(&b, "%%%02X", c)
+	}
+	return b.String()
+}
+
+// querySafe reports whether c can stand unescaped inside a query value. The
+// set is the unreserved characters plus the sub-delimiters that a payload
+// uses (path separators, "=", "?", ":", "@", "$", ",", ";", "(", ")", "*",
+// "!", "'"), and it leaves out "&", "#", and "+", which change the query.
+func querySafe(c byte) bool {
+	switch {
+	case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		return true
+	}
+	return strings.IndexByte("-._~/:=?@!$'()*,;[]", c) >= 0
+}
+
+// isPercentSequence reports whether s starts with a percent escape: "%" plus
+// two hex digits, or "%u" plus four hex digits (the IIS form). Anything else
+// starting with "%" is not an escape and must be encoded as %25.
+func isPercentSequence(s string) bool {
+	if len(s) >= 3 && isHex(s[1]) && isHex(s[2]) {
+		return true
+	}
+	if len(s) >= 6 && s[1] == 'u' && isHex(s[2]) && isHex(s[3]) && isHex(s[4]) && isHex(s[5]) {
+		return true
+	}
+	return false
+}
+
+// isHex reports whether c is an ASCII hexadecimal digit.
+func isHex(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+}
+
+// formEncodeWith encodes fields as a query or form body, with key set to the
+// raw payload. The other fields are encoded normally, and key is written last.
+func formEncodeWith(fields url.Values, key, raw string) string {
+	others := url.Values{}
+	// Copy every field except key, which is written raw below.
+	for k, v := range fields {
+		if k != key {
+			others[k] = v
+		}
+	}
+	return setRawQueryParam(others.Encode(), key, raw)
 }
 
 // formPoint is one field of a discovered form. A GET form puts its fields in
@@ -132,25 +223,29 @@ func formPoint(action *url.URL, method, enctype string, fields url.Values, key s
 		id:    "form|" + method + "|" + bare.String() + "|" + key,
 		label: fmt.Sprintf("form field %q (%s %s)", key, method, bare.String()),
 		build: func(value string) requestSpec {
+			// The payload is written raw in the query and urlencoded body, the
+			// same as queryPoint, so the app decodes it once. Multipart has no
+			// decoding step, so its value goes in as is.
+			raw := rawValueFor(value)
 			f := url.Values{}
 			for k, v := range fields {
 				f[k] = append([]string(nil), v...)
 			}
-			f.Set(key, value)
 			spec := requestSpec{Method: method, Headers: cloneHeaders(headers)}
 			if method == http.MethodGet {
 				u := *action
-				u.RawQuery = f.Encode()
+				u.RawQuery = formEncodeWith(f, key, raw)
 				spec.URL = u.String()
 				return spec
 			}
 			spec.URL = action.String()
 			if strings.Contains(strings.ToLower(enctype), "multipart") {
+				f.Set(key, value)
 				body, contentType := encodeMultipart(f)
 				spec.Body = body
 				spec.Headers["Content-Type"] = contentType
 			} else {
-				spec.Body = f.Encode()
+				spec.Body = formEncodeWith(f, key, raw)
 				spec.Headers["Content-Type"] = "application/x-www-form-urlencoded"
 			}
 			return spec
@@ -372,8 +467,8 @@ func pathSuffixPoint(seed *url.URL, base requestSpec) point {
 }
 
 // bodyPoints turns the operator's body into points. A JSON body gives one
-// point per string leaf. A form-encoded body gives one point per field. Any
-// other body gives none.
+// point per string leaf. An XML body gives one point per text node. A
+// form-encoded body gives one point per field. Any other body gives none.
 func bodyPoints(base requestSpec, body, contentType string) []point {
 	if body == "" {
 		return nil
@@ -394,6 +489,12 @@ func bodyPoints(base requestSpec, body, contentType string) []point {
 		}
 		return out
 	}
+	// XML is checked before form encoding, since an XML body is not a query string.
+	isXML := strings.Contains(strings.ToLower(contentType), "xml") ||
+		(contentType == "" && strings.HasPrefix(trimmed, "<"))
+	if isXML {
+		return xmlPoints(base, body)
+	}
 	fields, err := url.ParseQuery(body)
 	if err != nil {
 		return nil
@@ -412,6 +513,73 @@ func bodyPoints(base requestSpec, body, contentType string) []point {
 		out = append(out, formPoint(target, base.Method, "application/x-www-form-urlencoded", fields, k, base.Headers))
 	}
 	return out
+}
+
+// maxXMLNodes caps how many text nodes of an XML body become points, the same
+// way maxJSONFields caps JSON leaves.
+const maxXMLNodes = 40
+
+// xmlTextPattern matches the text between a closing ">" and the next "<",
+// which is the text content of one element.
+var xmlTextPattern = regexp.MustCompile(`>([^<>]*)<`)
+
+// xmlPoints gives one point per non-blank text node of an XML body. The
+// payload is XML-escaped before it goes in, so the document stays well formed
+// and the parser hands the app the payload's own characters.
+func xmlPoints(base requestSpec, body string) []point {
+	var out []point
+	// Each match is one text node, with group 1 the text itself.
+	for _, loc := range xmlTextPattern.FindAllStringSubmatchIndex(body, -1) {
+		// Stop at the cap so a large document does not become hundreds of probes.
+		if len(out) >= maxXMLNodes {
+			break
+		}
+		start, end := loc[2], loc[3]
+		// Skip the whitespace between tags. Only real text is a point.
+		if strings.TrimSpace(body[start:end]) == "" {
+			continue
+		}
+		out = append(out, xmlPoint(base, body, start, end, xmlElementName(body[:start])))
+	}
+	return out
+}
+
+// xmlElementName returns the name of the innermost element that is open at the
+// end of before, which is the element whose text comes next. It returns "?"
+// when no tag can be found.
+func xmlElementName(before string) string {
+	i := strings.LastIndex(before, "<")
+	if i < 0 || i+1 >= len(before) {
+		return "?"
+	}
+	name := before[i+1:]
+	// Stop the name at the first space, ">", or "/" (a closing tag).
+	if j := strings.IndexAny(name, " \t\r\n>/"); j >= 0 {
+		name = name[:j]
+	}
+	if name == "" {
+		return "?"
+	}
+	return name
+}
+
+// xmlPoint replaces the text at body[start:end] with the escaped payload. The
+// element name is only for the label, and the id uses the text's offset, which
+// is stable for one body.
+func xmlPoint(base requestSpec, body string, start, end int, element string) point {
+	return point{
+		id:    fmt.Sprintf("xml|%s|%s|%d", base.Method, base.URL, start),
+		label: fmt.Sprintf("XML text of <%s> (%s %s)", element, base.Method, base.URL),
+		build: func(value string) requestSpec {
+			var esc strings.Builder
+			// EscapeText writes into a strings.Builder without failing.
+			_ = xml.EscapeText(&esc, []byte(value))
+			spec := base
+			spec.Body = body[:start] + esc.String() + body[end:]
+			spec.Headers = cloneHeaders(base.Headers)
+			return spec
+		},
+	}
 }
 
 // formSpec is one <form> from a page, with its action resolved and its fields

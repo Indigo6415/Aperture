@@ -12,9 +12,37 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strings"
+	"time"
 )
 
 const breachedAccountEndpoint = "https://haveibeenpwned.com/api/v3/breachedaccount/"
+
+// hibpTimeout bounds one HIBP lookup. The shared http.DefaultClient had no
+// timeout, so a stalled connection could hold a scan open indefinitely.
+const hibpTimeout = 20 * time.Second
+
+// hibpClient is used for every HIBP call. It deliberately is NOT the netgov
+// client the target-facing scanners use: that transport skips TLS verification
+// for lab targets, and this request carries the account's API key, so it must
+// verify the certificate. HIBP is a fixed third-party API, not a scan target,
+// so the per-target governor does not apply to it.
+var hibpClient = &http.Client{Timeout: hibpTimeout}
+
+// validateEmail rejects input that cannot be an address before any request is
+// sent. It checks only the shape (one "@", a non-empty local part, a dotted
+// domain, no whitespace), because HIBP itself is the authority on validity.
+func validateEmail(email string) error {
+	email = strings.TrimSpace(email)
+	at := strings.LastIndex(email, "@")
+	if at <= 0 || at == len(email)-1 || strings.ContainsAny(email, " \t\r\n") {
+		return fmt.Errorf("breach: %q is not an email address", email)
+	}
+	if !strings.Contains(email[at+1:], ".") {
+		return fmt.Errorf("breach: %q has no domain", email)
+	}
+	return nil
+}
 
 // Breach is one breach an email address appeared in -- the subset of HIBP's
 // own record shape Aperture surfaces.
@@ -58,6 +86,10 @@ func Lookup(ctx context.Context, email, apiKey string) ([]Breach, error) {
 	if apiKey == "" {
 		return nil, fmt.Errorf("breach: an API key is required (see Settings)")
 	}
+	// Reject a malformed address before spending one of the limited requests on it.
+	if err := validateEmail(email); err != nil {
+		return nil, err
+	}
 	if err := limiter.wait(ctx); err != nil {
 		return nil, err
 	}
@@ -74,7 +106,7 @@ func Lookup(ctx context.Context, email, apiKey string) ([]Breach, error) {
 	// HIBP rejects any request with no User-Agent outright.
 	req.Header.Set("User-Agent", "Aperture-Recon-Tool")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := hibpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("breach: %w", err)
 	}

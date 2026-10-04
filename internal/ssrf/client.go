@@ -136,3 +136,74 @@ func fetchParamThrottled(ctx context.Context, sem chan struct{}, client *http.Cl
 	defer func() { <-sem }()
 	return fetchParam(ctx, client, target, method, param, value, headers)
 }
+
+// fetchHeader issues a plain GET of target with headerName set to value. A
+// payload sent this way never touches the URL or the body, so it only reaches
+// whatever reads that header server-side: a virtual-host router choosing its
+// backend by Host, a proxy building its upstream from X-Forwarded-Host, and
+// similar. A Host payload replaces the request's Host field, since net/http
+// ignores a Host entry in Header.
+func fetchHeader(ctx context.Context, client *http.Client, target *url.URL, headerName, value string, headers map[string]string) *ssrfResult {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
+	if err != nil {
+		return &ssrfResult{Err: err}
+	}
+	req.Header.Set("User-Agent", "Aperture-SSRF")
+	netgov.ApplyHeaders(req, headers)
+	if strings.EqualFold(headerName, "Host") {
+		req.Host = value
+	} else {
+		req.Header.Set(headerName, value)
+	}
+
+	sentHeaders := map[string]string{}
+	for k := range req.Header {
+		sentHeaders[k] = req.Header.Get(k)
+	}
+	if req.Host != "" {
+		sentHeaders["Host"] = req.Host
+	}
+	captured := CapturedRequest{Method: http.MethodGet, URL: target.String(), Headers: sentHeaders}
+
+	start := time.Now()
+	resp, err := client.Do(req)
+	if err != nil {
+		return &ssrfResult{Err: err, Latency: time.Since(start), Request: captured}
+	}
+	defer resp.Body.Close()
+	elapsed := time.Since(start)
+
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
+	if err != nil {
+		return &ssrfResult{Err: err, Request: captured}
+	}
+	return &ssrfResult{StatusCode: resp.StatusCode, ContentLength: len(raw), Body: string(raw), Latency: elapsed, Request: captured}
+}
+
+// fetchPointThrottled sends value to one injection point of d's target: as a
+// parameter (fetchParam, honoring d's method) or as a header (fetchHeader,
+// given the value's host part). It takes a slot from d.sem first, so every
+// module's requests share the same in-flight bound.
+func fetchPointThrottled(ctx context.Context, d runDeps, pt probePoint, value string) *ssrfResult {
+	select {
+	case d.sem <- struct{}{}:
+	case <-ctx.Done():
+		return &ssrfResult{Err: ctx.Err()}
+	}
+	defer func() { <-d.sem }()
+	if pt.header {
+		return fetchHeader(ctx, d.client, d.target, pt.name, hostOf(value), d.req.Headers)
+	}
+	return fetchParam(ctx, d.client, d.target, d.method, pt.name, value, d.req.Headers)
+}
+
+// hostOf returns the host part of a URL payload, which is what a Host or
+// forwarded-host header carries. A value that does not parse as a URL is
+// returned unchanged.
+func hostOf(value string) string {
+	u, err := url.Parse(value)
+	if err != nil || u.Host == "" {
+		return value
+	}
+	return u.Host
+}

@@ -2,13 +2,14 @@ package csrf
 
 import (
 	"context"
-	"github.com/Indigo6415/Aperture/internal/robots"
 	"io"
 	"net/http"
 	"net/url"
-	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/Indigo6415/Aperture/internal/netgov"
+	"github.com/Indigo6415/Aperture/internal/robots"
 )
 
 // Crawl sizing mirrors internal/breach's own email-crawler (see its
@@ -19,35 +20,14 @@ const (
 	crawlMaxPagesCap     = 50
 )
 
-var (
-	crawlAnchorHrefPattern = regexp.MustCompile(`(?is)<a[^>]+href\s*=\s*["']([^"']+)["']`)
-	formPattern            = regexp.MustCompile(`(?is)<form([^>]*)>(.*?)</form>`)
-	formActionPattern      = regexp.MustCompile(`(?is)action\s*=\s*["']([^"']*)["']`)
-	formMethodPattern      = regexp.MustCompile(`(?is)method\s*=\s*["']([^"']*)["']`)
-	// methodOverridePattern catches the Rails-style (and equivalent-framework)
-	// convention of a hidden "_method" field carrying the real HTTP verb --
-	// plain HTML forms can only natively submit GET or POST, so a form that
-	// actually performs a PUT/DELETE/PATCH almost always looks like this
-	// under the hood.
-	methodOverridePattern = regexp.MustCompile(`(?is)<input[^>]+name\s*=\s*["']_method["'][^>]+value\s*=\s*["']([^"']+)["']`)
-	// csrfFieldPattern mirrors pwreset.csrfFieldRe -- same pattern, kept as
-	// its own copy for the same reason pwreset's own doc comment gives for
-	// not sharing types across scanners.
-	csrfFieldPattern = regexp.MustCompile(`(?i)<input[^>]+name=["']([^"']*(?:csrf|_token|authenticity_token)[^"']*)["']`)
-	// csrfMetaPattern covers the alternative some SPAs use: a page-level
-	// <meta name="csrf-token" content="..."> that JS reads and attaches as
-	// a request header instead of a hidden form field.
-	csrfMetaPattern = regexp.MustCompile(`(?i)<meta[^>]+name=["'](?:csrf-token|csrf-param)["'][^>]+content=["']([^"']*)["']`)
-)
-
 // stateChangingMethods is which effective methods this scanner treats as
 // "performs a state change, so CSRF protection actually matters here" --
 // a plain GET form (a search box, a filter) isn't a CSRF target, since
 // nothing it does should have a side effect to forge in the first place.
 var stateChangingMethods = map[string]bool{"POST": true, "PUT": true, "DELETE": true, "PATCH": true}
 
-// discoveredForm is one state-changing form found during the crawl. Never
-// submitted -- see the package doc comment -- so HasToken/HasMetaToken are
+// discoveredForm is one state-changing form submission found during the crawl.
+// Never submitted -- see the package doc comment -- so HasToken/HasMetaToken are
 // judged entirely from the page's own markup.
 type discoveredForm struct {
 	PageURL      string
@@ -57,9 +37,9 @@ type discoveredForm struct {
 	HasMetaToken bool
 }
 
-// discoveredCookie is one Set-Cookie seen anywhere during the crawl, kept
-// the first time it's seen (a cookie set identically on every page isn't
-// more informative the second time).
+// discoveredCookie is one Set-Cookie seen anywhere during the crawl. A cookie
+// is kept once per distinct name and SameSite value, so a cookie set the same
+// way on every page is not reported repeatedly.
 type discoveredCookie struct {
 	Name, RawValue, SeenOn string
 }
@@ -98,6 +78,8 @@ func crawl(ctx context.Context, client *http.Client, seed *url.URL, req Request)
 	policy := robots.Load(ctx, client, seed, req.Headers)
 	queue := []crawlQueuedPage{{seed.String(), 0}}
 
+	// Breadth-first walk: each pass takes the next queued page, stopping at
+	// the page budget or when the context is cancelled.
 	for len(queue) > 0 && len(visited) < maxPages {
 		if ctx.Err() != nil {
 			break
@@ -121,23 +103,26 @@ func crawl(ctx context.Context, client *http.Client, seed *url.URL, req Request)
 		}
 		forms = append(forms, extractForms(body, pageURL)...)
 
+		// Record each cookie once per name and SameSite value. Keeping the
+		// SameSite value in the key means a weaker variant of the same cookie
+		// is still reported even when a stronger one was seen first.
 		for _, raw := range header.Values("Set-Cookie") {
-			name := raw
-			if i := strings.Index(raw, "="); i > 0 {
-				name = raw[:i]
-			}
-			if seenCookies[name] {
+			info := parseSetCookie(raw)
+			key := info.Name + "|" + info.SameSite
+			if seenCookies[key] {
 				continue
 			}
-			seenCookies[name] = true
-			cookies = append(cookies, discoveredCookie{Name: name, RawValue: raw, SeenOn: item.url})
+			seenCookies[key] = true
+			cookies = append(cookies, discoveredCookie{Name: info.Name, RawValue: raw, SeenOn: item.url})
 		}
 
 		if item.depth >= req.RecursionDepth {
 			continue
 		}
-		for _, m := range crawlAnchorHrefPattern.FindAllStringSubmatch(body, -1) {
-			resolved, err := pageURL.Parse(m[1])
+		// Queue every same-origin link the policy allows, dropping fragments
+		// and anything already visited.
+		for _, link := range extractLinks(body, pageURL) {
+			resolved, err := url.Parse(link)
 			if err != nil || !strings.EqualFold(resolved.Host, seed.Host) || visited[resolved.String()] {
 				continue
 			}
@@ -159,15 +144,16 @@ func crawl(ctx context.Context, client *http.Client, seed *url.URL, req Request)
 	return &crawlResult{PagesScanned: pagesScanned, Forms: forms, Cookies: cookies}, nil
 }
 
+// fetchPage GETs target and returns its body (capped at maxBodyBytes) and
+// response headers. The caller's headers are applied through netgov so a Host
+// override is honored, which a plain Header.Set would silently drop.
 func fetchPage(ctx context.Context, client *http.Client, target string, headers map[string]string) (string, http.Header, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return "", nil, err
 	}
 	req.Header.Set("User-Agent", "Aperture-CSRFScan")
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
+	netgov.ApplyHeaders(req, headers)
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", nil, err
@@ -180,47 +166,141 @@ func fetchPage(ctx context.Context, client *http.Client, target string, headers 
 	return string(raw), resp.Header, nil
 }
 
-// extractForms pulls every <form> out of body and -- for each one whose
-// effective method is state-changing (see stateChangingMethods) -- records
-// whether it carries a CSRF-token-looking hidden field or page-level meta
-// tag. A form with no action attribute submits to its own page, per the
-// HTML spec, so Action falls back to pageURL in that case.
+// submission is one way a form can be sent: the verb the browser uses and
+// the URL it goes to. A form can have several, one per submit button that
+// overrides formmethod/formaction.
+type submission struct {
+	method string
+	action *url.URL
+}
+
+// extractForms returns every state-changing form submission in body, as a
+// browser would send it. Each form's controls are read from its start tag to
+// its </form> (or to the next <form> if the closing tag is missing). It
+// handles:
+//   - method="post" only; other values fall back to GET, as browsers do;
+//   - a hidden _method field (Rails/Laravel) when the form posts;
+//   - submit buttons with formmethod="post", which send a POST even from a
+//     GET form;
+//   - relative actions resolved against <base href>;
+//   - actions pointing at another origin, which are skipped: a third-party
+//     form cannot forge a request to this site, so it is not this site's CSRF.
+//
+// A form with no action attribute submits to its own page, per the HTML spec,
+// so Action falls back to pageURL in that case.
 func extractForms(body string, pageURL *url.URL) []discoveredForm {
-	hasMetaToken := csrfMetaPattern.MatchString(body)
+	doc := stripComments(body)
+	tags := scanTags(doc)
+	base := documentBase(tags, pageURL)
+
+	hasMetaToken := false
+	for _, t := range tags {
+		if t.Name == "meta" && isTokenMetaName(t.Attrs["name"]) {
+			hasMetaToken = true
+			break
+		}
+	}
+	closes := formClosePattern.FindAllStringIndex(doc, -1)
 
 	var out []discoveredForm
-	for _, m := range formPattern.FindAllStringSubmatch(body, -1) {
-		attrs, inner := m[1], m[2]
-
-		method := "GET"
-		if mm := formMethodPattern.FindStringSubmatch(attrs); mm != nil {
-			method = strings.ToUpper(strings.TrimSpace(mm[1]))
-		}
-		// A _method override hidden field (Rails/Laravel/etc. convention)
-		// is the actual verb the server acts on, regardless of what the
-		// <form method> attribute itself says (browsers only submit
-		// GET/POST natively).
-		if om := methodOverridePattern.FindStringSubmatch(inner); om != nil {
-			method = strings.ToUpper(strings.TrimSpace(om[1]))
-		}
-		if !stateChangingMethods[method] {
+	// Walk every start tag, handling each <form> together with its controls.
+	for i, ft := range tags {
+		if ft.Name != "form" {
 			continue
 		}
+		// End the form at its </form>, or at the next <form> when the closing
+		// tag is missing, whichever comes first.
+		end := len(doc)
+		for _, c := range closes {
+			if c[0] >= ft.End {
+				end = c[0]
+				break
+			}
+		}
+		// Shorten the form's range if a nested <form> starts inside it, since a
+		// browser closes the outer form there.
+		for k := i + 1; k < len(tags) && tags[k].Start < end; k++ {
+			if tags[k].Name == "form" {
+				end = tags[k].Start
+				break
+			}
+		}
+		// Collect the controls that sit inside the form's range.
+		var controls []htmlTag
+		for k := i + 1; k < len(tags) && tags[k].Start < end; k++ {
+			controls = append(controls, tags[k])
+		}
 
-		action := pageURL.String()
-		if am := formActionPattern.FindStringSubmatch(attrs); am != nil && strings.TrimSpace(am[1]) != "" {
-			if resolved, err := pageURL.Parse(strings.TrimSpace(am[1])); err == nil {
-				action = resolved.String()
+		// Read the form's hidden token field and _method override from its controls.
+		hasToken := false
+		override := ""
+		for _, c := range controls {
+			if c.Name != "input" {
+				continue
+			}
+			if strings.EqualFold(c.Attrs["type"], "hidden") && isTokenFieldName(c.Attrs["name"]) {
+				hasToken = true
+			}
+			if c.Attrs["name"] == "_method" {
+				override = strings.ToUpper(strings.TrimSpace(c.Attrs["value"]))
 			}
 		}
 
-		out = append(out, discoveredForm{
-			PageURL:      pageURL.String(),
-			Action:       action,
-			Method:       method,
-			HasToken:     csrfFieldPattern.MatchString(inner),
-			HasMetaToken: hasMetaToken,
-		})
+		// The form's own submission, to its action (or its own page when no
+		// action is given).
+		formMethod := "GET"
+		if strings.EqualFold(strings.TrimSpace(ft.Attrs["method"]), "post") {
+			formMethod = "POST"
+		}
+		formAction := pageURL
+		if a := strings.TrimSpace(ft.Attrs["action"]); a != "" {
+			if resolved, err := base.Parse(a); err == nil {
+				formAction = resolved
+			}
+		}
+		subs := []submission{{method: formMethod, action: formAction}}
+
+		// A submit button with formmethod="post" sends a POST even when the
+		// form itself is GET. Its formaction, if any, replaces the action.
+		for _, c := range controls {
+			if !isSubmitControl(c) {
+				continue
+			}
+			if !strings.EqualFold(strings.TrimSpace(c.Attrs["formmethod"]), "post") {
+				continue
+			}
+			act := formAction
+			if fa := strings.TrimSpace(c.Attrs["formaction"]); fa != "" {
+				if resolved, err := base.Parse(fa); err == nil {
+					act = resolved
+				}
+			}
+			subs = append(subs, submission{method: "POST", action: act})
+		}
+
+		// Emit each distinct, same-origin, state-changing submission once.
+		seen := map[string]bool{}
+		for _, s := range subs {
+			method := resolveMethod(s.method, override)
+			if !stateChangingMethods[method] {
+				continue
+			}
+			if !strings.EqualFold(s.action.Host, pageURL.Host) {
+				continue
+			}
+			key := method + " " + s.action.String()
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			out = append(out, discoveredForm{
+				PageURL:      pageURL.String(),
+				Action:       s.action.String(),
+				Method:       method,
+				HasToken:     hasToken,
+				HasMetaToken: hasMetaToken,
+			})
+		}
 	}
 	return out
 }

@@ -1,6 +1,6 @@
 import { Fragment, useMemo, useState } from 'react'
 import type { Finding, TriageStatus } from '../types'
-import { statusHexColor } from '../statusColor'
+import { statusHexColor, statusTextClass } from '../statusColor'
 import { extensionOf, hostnameOf } from '../url'
 import { isDangerousExtension } from '../extensions'
 import { api, screenshotPreviewEnabled } from '../api'
@@ -49,16 +49,6 @@ function triageMetaOf(status: TriageStatus): { label: string; cls: string } {
 // be derived from the URL the same way the Ext column/facet do.
 function sortValueOf(f: Finding, key: SortKey): string | number {
   return key === 'extension' ? (extensionOf(f.url) ?? '') : f[key]
-}
-
-// statusTextClass is the Tailwind-class counterpart to statusHexColor, for
-// table cells (which use a class) rather than inline-styled chips/badges.
-function statusTextClass(code: number): string {
-  if (code >= 200 && code < 300) return 'text-emerald-400'
-  if (code >= 300 && code < 400) return 'text-sky-400'
-  if (code >= 400 && code < 500) return 'text-amber-400'
-  if (code >= 500) return 'text-red-400'
-  return 'text-neutral-400'
 }
 
 // extensionOf returns undefined for paths with no extension, but that's a

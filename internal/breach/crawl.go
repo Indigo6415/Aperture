@@ -45,8 +45,18 @@ var (
 // address.
 var nonEmailLabelExts = map[string]bool{
 	"png": true, "jpg": true, "jpeg": true, "gif": true, "svg": true, "webp": true, "bmp": true, "ico": true,
-	"css": true, "js": true, "mjs": true, "map": true,
+	"avif": true, "css": true, "js": true, "mjs": true, "map": true, "json": true, "xml": true,
+	"html": true, "htm": true, "php": true, "pdf": true, "mp4": true, "webm": true, "mp3": true,
 	"woff": true, "woff2": true, "ttf": true, "eot": true, "otf": true,
+}
+
+// placeholderEmailDomains are the reserved and documentation domains that
+// appear in code, docs, and sample configs. An address at one of them is not
+// a person's contact, so it is dropped rather than reported as a finding.
+var placeholderEmailDomains = map[string]bool{
+	"example.com": true, "example.org": true, "example.net": true, "example.edu": true,
+	"test.com": true, "domain.com": true, "email.com": true, "yourdomain.com": true,
+	"yourcompany.com": true, "company.com": true, "localhost": true, "invalid": true,
 }
 
 // CrawlRequest is one email-crawl's parameters -- same shape/reasoning as
@@ -94,9 +104,8 @@ func crawlFetch(ctx context.Context, client *http.Client, target string, headers
 	// sites' WAFs treat a blank/default Go UA as a bot signal worth
 	// blocking regardless.
 	req.Header.Set("User-Agent", "Aperture-Recon-Tool")
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
+	// ApplyHeaders honors a Host override; a plain Header.Set silently drops it.
+	netgov.ApplyHeaders(req, headers)
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
@@ -137,10 +146,29 @@ func normalizeEmail(raw string) string {
 	if dot < 0 {
 		return ""
 	}
-	if nonEmailLabelExts[domainPart[dot+1:]] {
+	tld := domainPart[dot+1:]
+	// A real top-level domain has letters. A version such as "pkg@1.2.3" or an
+	// image density suffix such as "icon@2.0" ends in digits, so it is not an address.
+	if !hasLetter(tld) {
+		return ""
+	}
+	if nonEmailLabelExts[tld] {
+		return ""
+	}
+	if placeholderEmailDomains[domainPart] {
 		return ""
 	}
 	return e
+}
+
+// hasLetter reports whether s contains at least one ASCII letter.
+func hasLetter(s string) bool {
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+			return true
+		}
+	}
+	return false
 }
 
 func crawlSameOrigin(base, candidate *url.URL) bool {

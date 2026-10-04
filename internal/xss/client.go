@@ -21,6 +21,8 @@ type xssResult struct {
 	Body       string
 	// ContentType decides whether a reflection can execute: only HTML does.
 	ContentType string
+	// Disposition is the Content-Disposition header. An attachment is downloaded rather than rendered, so it cannot execute a reflection.
+	Disposition string
 	Err         error
 	// Request is exactly what was sent on the wire for this check --
 	// attached to any Finding it produced so "Send to Tester" (see
@@ -75,7 +77,7 @@ func fetchPlain(ctx context.Context, client *http.Client, target string, headers
 	if err != nil {
 		return &xssResult{Err: err}
 	}
-	return &xssResult{StatusCode: resp.StatusCode, Body: string(raw), ContentType: resp.Header.Get("Content-Type")}
+	return &xssResult{StatusCode: resp.StatusCode, Body: string(raw), ContentType: resp.Header.Get("Content-Type"), Disposition: resp.Header.Get("Content-Disposition")}
 }
 
 // fetchInjectionPoint sends value at pt.Param -- for a query/form point,
@@ -158,7 +160,7 @@ func fetchWithFields(ctx context.Context, client *http.Client, pt injectionPoint
 	if err != nil {
 		return &xssResult{Err: err, Request: captured}
 	}
-	return &xssResult{StatusCode: resp.StatusCode, Body: string(raw), ContentType: resp.Header.Get("Content-Type"), Request: captured}
+	return &xssResult{StatusCode: resp.StatusCode, Body: string(raw), ContentType: resp.Header.Get("Content-Type"), Disposition: resp.Header.Get("Content-Disposition"), Request: captured}
 }
 
 // fetchWithHeader issues a plain GET of target with headerName set to
@@ -191,5 +193,5 @@ func fetchWithHeader(ctx context.Context, client *http.Client, target, headerNam
 	if err != nil {
 		return &xssResult{Err: err, Request: captured}
 	}
-	return &xssResult{StatusCode: resp.StatusCode, Body: string(raw), ContentType: resp.Header.Get("Content-Type"), Request: captured}
+	return &xssResult{StatusCode: resp.StatusCode, Body: string(raw), ContentType: resp.Header.Get("Content-Type"), Disposition: resp.Header.Get("Content-Disposition"), Request: captured}
 }

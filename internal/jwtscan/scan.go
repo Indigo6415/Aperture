@@ -57,9 +57,9 @@ func probe(client *http.Client, targetURL, token, method, cookie string, extraHe
 	if err != nil {
 		return nil, err
 	}
-	for k, v := range extraHeaders {
-		req.Header.Set(k, v)
-	}
+	// Caller headers go through netgov so a Host override is honored; a plain
+	// Header.Set would drop it silently.
+	netgov.ApplyHeaders(req, extraHeaders)
 	if cookie != "" {
 		req.AddCookie(&http.Cookie{Name: cookie, Value: token})
 	} else {
@@ -82,7 +82,7 @@ func probe(client *http.Client, targetURL, token, method, cookie string, extraHe
 // A forged token that the server accepts gets the same account back, so an
 // identity value that appears for the real token and not for an invalid one is
 // the strongest acceptance signal available.
-var identityClaims = []string{"sub", "email", "username", "preferred_username", "user_id", "uid", "name"}
+var identityClaims = []string{"sub", "email", "username", "preferred_username", "user_id", "uid", "name", "login", "upn", "unique_name"}
 
 // identityMarkers returns the identity values from a token payload that are
 // long enough to be distinctive, lowercased for case-insensitive matching.
@@ -107,11 +107,47 @@ func presentIn(body []byte, markers []string) []string {
 	lower := strings.ToLower(string(body))
 	var out []string
 	for _, m := range markers {
-		if strings.Contains(lower, m) {
+		if containsWord(lower, m) {
 			out = append(out, m)
 		}
 	}
 	return out
+}
+
+// containsWord reports whether needle occurs in haystack with a non-alphanumeric
+// character (or the text edge) on both sides. A plain substring match let a short
+// name like "ann" hit inside "announcement" on an unrelated page, which is how an
+// innocent page could look like it had accepted a forged identity.
+func containsWord(haystack, needle string) bool {
+	if needle == "" {
+		return false
+	}
+	// Search forward one match at a time, checking each match's edges.
+	for start := 0; start < len(haystack); {
+		i := strings.Index(haystack[start:], needle)
+		if i < 0 {
+			return false
+		}
+		i += start
+		end := i + len(needle)
+		if isWordEdge(haystack, i-1) && isWordEdge(haystack, end) {
+			return true
+		}
+		start = i + 1
+	}
+	return false
+}
+
+// isWordEdge reports whether the byte at idx is outside a word: the text edge,
+// or a byte that is not an ASCII letter or digit. Multi-byte UTF-8 is treated as
+// a word character, which errs toward not matching.
+func isWordEdge(s string, idx int) bool {
+	if idx < 0 || idx >= len(s) {
+		return true
+	}
+	c := s[idx]
+	isAlnum := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c >= 0x80
+	return !isAlnum
 }
 
 // bodyHasMarker reports whether body contains any of markers.
@@ -218,25 +254,68 @@ func (c *scanCtx) attempt(label, token string) Attempt {
 // smuggle an unsigned token past a naive check.
 func (c *scanCtx) testAlgNone() TestResult {
 	res := TestResult{ID: "alg_none", Name: "alg:none Attack"}
-	for _, variant := range []string{"none", "None", "NONE", "nOnE"} {
+	for _, v := range algNoneVariants() {
 		h := cloneMap(c.header)
-		h["alg"] = variant
+		// An omitted alg drops the key entirely; buildJWT then treats the token
+		// as unsigned, the way a library with no alg check would.
+		if v.omit {
+			delete(h, "alg")
+		} else {
+			h["alg"] = v.alg
+		}
 		token, err := buildJWT(h, c.payload, nil)
 		if err != nil {
 			continue
 		}
-		a := c.attempt(fmt.Sprintf("alg: %q", variant), token)
+		a := c.attempt(v.label(), token)
 		res.Attempts = append(res.Attempts, a)
 		if a.Hit {
 			res.Status = StatusVulnerable
-			res.Summary = fmt.Sprintf("Server accepted an unsigned token with alg set to %q", variant)
+			res.Summary = fmt.Sprintf("Server accepted an unsigned token with %s", v.label())
 			res.Token = token
 			return res
 		}
 	}
 	res.Status = StatusSafe
-	res.Summary = "Server rejected every alg:none casing variant"
+	res.Summary = fmt.Sprintf("Server rejected all %d alg:none variants (every casing of \"none\", empty alg, omitted alg)", len(algNoneVariants()))
 	return res
+}
+
+// algNoneVariant is one way of declaring an unsigned token's algorithm. omit
+// drops the alg field entirely instead of setting it to alg.
+type algNoneVariant struct {
+	alg  string
+	omit bool
+}
+
+// label is how the variant is shown in results.
+func (v algNoneVariant) label() string {
+	if v.omit {
+		return "alg omitted"
+	}
+	return fmt.Sprintf("alg: %q", v.alg)
+}
+
+// algNoneVariants lists every casing of "none" (2^4 = 16 variants: a library
+// that lowercases before comparing accepts them all, and one that compares
+// exactly accepts only one), plus an empty alg and an omitted alg. The old
+// list of four casings missed most of the space that case-tricking actually
+// reaches.
+func algNoneVariants() []algNoneVariant {
+	base := "none"
+	out := make([]algNoneVariant, 0, 18)
+	// Each bit of the mask chooses upper or lower case for one letter of "none".
+	for mask := 0; mask < 1<<len(base); mask++ {
+		b := []byte(base)
+		for i := range b {
+			if mask&(1<<i) != 0 {
+				b[i] -= 'a' - 'A'
+			}
+		}
+		out = append(out, algNoneVariant{alg: string(b)})
+	}
+	out = append(out, algNoneVariant{alg: ""}, algNoneVariant{omit: true})
+	return out
 }
 
 // testEmptySig strips the signature segment entirely while keeping the
@@ -245,18 +324,27 @@ func (c *scanCtx) testEmptySig() TestResult {
 	res := TestResult{ID: "empty_sig", Name: "Empty Signature"}
 	hBytes, _ := json.Marshal(c.header)
 	pBytes, _ := json.Marshal(c.payload)
-	token := b64enc(hBytes) + "." + b64enc(pBytes) + "."
+	signingInput := b64enc(hBytes) + "." + b64enc(pBytes)
 
-	a := c.attempt("signature segment stripped", token)
-	res.Attempts = []Attempt{a}
-	if a.Hit {
-		res.Status = StatusVulnerable
-		res.Summary = "Server accepted the token with its signature segment stripped entirely"
-		res.Token = token
-	} else {
-		res.Status = StatusSafe
-		res.Summary = "Server rejected the token once its signature was stripped"
+	// Two shapes of "no signature": the trailing dot kept (header.payload.) and
+	// the segment removed entirely (header.payload). Parsers differ on which
+	// they accept, so both are tried.
+	variants := []struct{ label, token string }{
+		{"signature segment empty (trailing dot)", signingInput + "."},
+		{"signature segment omitted (two segments)", signingInput},
 	}
+	for _, v := range variants {
+		a := c.attempt(v.label, v.token)
+		res.Attempts = append(res.Attempts, a)
+		if a.Hit {
+			res.Status = StatusVulnerable
+			res.Summary = fmt.Sprintf("Server accepted the token with its signature removed (%s)", v.label)
+			res.Token = v.token
+			return res
+		}
+	}
+	res.Status = StatusSafe
+	res.Summary = "Server rejected the token once its signature was removed"
 	return res
 }
 
@@ -330,11 +418,19 @@ func offlineAdvisories(header, payload map[string]any) []string {
 	exp, hasExp := payload["exp"]
 	if !hasExp {
 		out = append(out, "Token has no exp claim, so it never expires on its own.")
-	} else if iat, ok := payload["iat"]; ok {
-		expN, okE := asUnix(exp)
-		iatN, okI := asUnix(iat)
-		if okE && okI && expN-iatN > 365*24*3600 {
-			out = append(out, "Token lifetime exceeds one year (exp minus iat).")
+	} else {
+		// exp is present. Report whether it has already passed, and whether the
+		// token's lifetime (exp minus iat) is longer than a year.
+		if expN, ok := asUnix(exp); ok && expN < time.Now().Unix() {
+			// Already past its expiry: if the server still accepts it, see testExpiredToken.
+			out = append(out, "Token is already expired (exp is in the past).")
+		}
+		if iat, ok := payload["iat"]; ok {
+			expN, okE := asUnix(exp)
+			iatN, okI := asUnix(iat)
+			if okE && okI && expN-iatN > 365*24*3600 {
+				out = append(out, "Token lifetime exceeds one year (exp minus iat).")
+			}
 		}
 	}
 	for _, k := range []string{"jku", "x5u"} {
@@ -511,6 +607,70 @@ func (c *scanCtx) testClaimTampering(foundSecret *string) TestResult {
 	return res
 }
 
+// expiryGrace is how far past its exp a token must be before it counts as
+// expired. Servers allow a few minutes of clock skew, so a token that lapsed a
+// moment ago proves nothing about expiry enforcement.
+const expiryGrace = 5 * time.Minute
+
+// expiredTokenBackdate is how far in the past the forged token's exp is set when
+// the expiry test re-signs claims. A day is far outside any leeway.
+const expiredTokenBackdate = 24 * time.Hour
+
+// testExpiredToken checks whether the target enforces the exp claim, in one of
+// two ways, and skips when neither is possible:
+//  1. The caller's own token is already past exp (by more than expiryGrace), and
+//     the valid response still shows the account. That response is the server
+//     accepting an expired token, so no forging is needed.
+//  2. The HMAC secret was recovered (foundSecret), so the same claims can be
+//     re-signed with exp a day in the past. An accepted response means expiry
+//     is not enforced even though the signature is valid.
+func (c *scanCtx) testExpiredToken(foundSecret *string) TestResult {
+	res := TestResult{ID: "expired_token", Name: "Expired Token Acceptance"}
+	now := time.Now().Unix()
+
+	// Case 1: the source token itself has lapsed and was still accepted. The
+	// baseline's identity markers are what show the account was served.
+	if exp, ok := asUnix(c.payload["exp"]); ok && exp < now-int64(expiryGrace.Seconds()) && len(c.markers) > 0 {
+		res.Attempts = []Attempt{{
+			Label: "source token (exp in the past)", Token: c.rawToken,
+			HTTPStatus: c.ok.StatusCode, Hit: true,
+		}}
+		res.Status = StatusVulnerable
+		res.Summary = "Server accepted the caller's own token after its exp claim had passed"
+		res.Token = c.rawToken
+		return res
+	}
+
+	// Case 2: re-sign the same claims with exp in the past. This needs the
+	// secret, so it only runs when the weak-secret test recovered one.
+	if foundSecret != nil && strings.HasPrefix(strings.ToUpper(fmt.Sprint(c.header["alg"])), "HS") {
+		p := cloneMap(c.payload)
+		p["exp"] = now - int64(expiredTokenBackdate.Seconds())
+		if token, err := buildJWT(c.header, p, []byte(*foundSecret)); err == nil {
+			a := c.attemptWithClaims("re-signed with exp one day in the past", token, p)
+			res.Attempts = []Attempt{a}
+			if a.Hit {
+				res.Status = StatusVulnerable
+				res.Summary = "Server accepted a validly signed token whose exp claim was one day in the past"
+				res.Token = token
+				return res
+			}
+			res.Status = StatusSafe
+			res.Summary = "Server rejected a validly signed token whose exp claim was one day in the past"
+			return res
+		}
+	}
+
+	// Neither case can run: no expiry to test, or no way to forge the claim.
+	res.Status = StatusSkipped
+	if _, hasExp := c.payload["exp"]; !hasExp {
+		res.Summary = "Token has no exp claim, so there is no expiry to enforce -- skipping"
+	} else {
+		res.Summary = "Expiry enforcement needs either an already-expired token or a recovered HMAC secret -- skipping"
+	}
+	return res
+}
+
 // testRS256HS256 tries the classic algorithm-confusion attack: sign an
 // HS256 token using the server's own RSA public key bytes as the HMAC
 // secret. A server that verifies "whatever alg the token claims" using the
@@ -534,20 +694,25 @@ func (c *scanCtx) testRS256HS256(manualPEM string, discovered []pemCandidate) Te
 		return res
 	}
 
+	// Each candidate key is tried under every HMAC width. A verifier that
+	// accepts "any HS*" with the public key as the secret fails on HS384 or
+	// HS512 even when a HS256-only probe was rejected.
 	for _, cand := range candidates {
-		h := cloneMap(c.header)
-		h["alg"] = "HS256"
-		token, err := buildJWT(h, c.payload, []byte(cand.PEM))
-		if err != nil {
-			continue
-		}
-		a := c.attempt(fmt.Sprintf("HS256 signed with public key from %s", cand.Source), token)
-		res.Attempts = append(res.Attempts, a)
-		if a.Hit {
-			res.Status = StatusVulnerable
-			res.Summary = fmt.Sprintf("Server accepted its own RSA public key (%s) used as an HMAC secret", cand.Source)
-			res.Token = token
-			return res
+		for _, alg := range []string{"HS256", "HS384", "HS512"} {
+			h := cloneMap(c.header)
+			h["alg"] = alg
+			token, err := buildJWT(h, c.payload, []byte(cand.PEM))
+			if err != nil {
+				continue
+			}
+			a := c.attempt(fmt.Sprintf("%s signed with public key from %s", alg, cand.Source), token)
+			res.Attempts = append(res.Attempts, a)
+			if a.Hit {
+				res.Status = StatusVulnerable
+				res.Summary = fmt.Sprintf("Server accepted its own RSA public key (%s) used as an HMAC secret under %s", cand.Source, alg)
+				res.Token = token
+				return res
+			}
 		}
 	}
 

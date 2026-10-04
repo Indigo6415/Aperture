@@ -30,6 +30,9 @@ type corsResult struct {
 	AllowCredentials   string
 	AllowMethods       string
 	AllowHeaders       string
+	// Vary is every Vary header value joined with commas, so a check can tell
+	// whether the response declares that it depends on the Origin header.
+	Vary string
 	// Request is exactly what was sent on the wire for this check -- method,
 	// full URL, and the resolved header set (Origin/preflight headers/
 	// extraHeaders all merged, the same way a browser or curl would show
@@ -118,13 +121,28 @@ func doRequest(ctx context.Context, client *http.Client, target *url.URL, method
 		AllowCredentials:   resp.Header.Get("Access-Control-Allow-Credentials"),
 		AllowMethods:       resp.Header.Get("Access-Control-Allow-Methods"),
 		AllowHeaders:       resp.Header.Get("Access-Control-Allow-Headers"),
+		Vary:               strings.Join(resp.Header.Values("Vary"), ","),
 		Request:            CapturedRequest{Method: httpMethod, URL: target.String(), Headers: sentHeaders},
 	}, nil
 }
 
+// headerPresent reports whether h carries name at all, even with an empty value.
 func headerPresent(h http.Header, name string) bool {
 	_, ok := h[http.CanonicalHeaderKey(name)]
 	return ok
+}
+
+// headerTokens splits a comma-separated header value (Allow-Methods, Allow-Headers,
+// Vary, ...) into its lower-cased, trimmed tokens so membership is an exact match
+// rather than a substring one.
+func headerTokens(v string) map[string]bool {
+	out := map[string]bool{}
+	for _, part := range strings.Split(v, ",") {
+		if tok := strings.ToLower(strings.TrimSpace(part)); tok != "" {
+			out[tok] = true
+		}
+	}
+	return out
 }
 
 func (r Request) method() string {

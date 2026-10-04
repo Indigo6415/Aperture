@@ -18,16 +18,21 @@ const verifyTimeout = 20 * time.Second
 // verifyMarkerAttr is the attribute a verification payload writes onto <html>.
 const verifyMarkerAttr = "data-apx"
 
-// alertCall matches the alert(...) call every payload module uses to show
-// that code ran. verifyPayload swaps it for a DOM write.
-var alertCall = regexp.MustCompile(`alert\([^)]*\)`)
+// alertCall matches the alert(...) call, or the tagged-template alert`...`
+// form, that payload modules use to show that code ran. verifyPayload swaps
+// it for a DOM write.
+var alertCall = regexp.MustCompile("alert(?:\\([^)]*\\)|`[^`]*`)")
 
 // verifyPayload rewrites a module payload so that, when executed, it sets an
 // attribute carrying canary on the document element instead of calling alert.
 // The breakout is unchanged, so this tests the same reflection, but the effect
 // can be read back from the rendered DOM.
+//
+// The setter uses backtick strings rather than single quotes. A payload that
+// breaks out of a single-quoted JS string would otherwise be cut short by the
+// setter's own quotes, so a real injection would fail the browser check.
 func verifyPayload(payload, canary string) string {
-	setter := fmt.Sprintf("document.documentElement.setAttribute('%s','%s')", verifyMarkerAttr, canary)
+	setter := "document.documentElement.setAttribute(`" + verifyMarkerAttr + "`,`" + canary + "`)"
 	return alertCall.ReplaceAllLiteralString(payload, setter)
 }
 

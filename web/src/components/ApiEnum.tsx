@@ -13,6 +13,7 @@ import type {
   Credential,
   Target,
 } from '../types'
+import { statusTextClass } from '../statusColor'
 import { CollapsibleFormPanel } from './CollapsibleFormPanel'
 import { TargetPicker } from './TargetPicker'
 import { CredentialPicker } from './CredentialPicker'
@@ -101,6 +102,7 @@ export function ApiEnum({
   const [crawlDepth, setCrawlDepth] = useState('')
   const [maxPages, setMaxPages] = useState('')
   const [extraWordlist, setExtraWordlist] = useState('')
+  const [allowWrites, setAllowWrites] = useState(false)
   const [advancedOpen, setAdvancedOpen] = useState(false)
   const [view, setView] = useState<'scan' | 'history'>('scan')
 
@@ -170,6 +172,7 @@ export function ApiEnum({
         crawlDepth: crawlDepth ? Number(crawlDepth) : undefined,
         maxPages: maxPages ? Number(maxPages) : undefined,
         extraWordlist: extraWordlistEntries.length > 0 ? extraWordlistEntries : undefined,
+        allowWriteMethods: allowWrites || undefined,
         caseId,
       })
       setScans((prev) => (prev[targetValue] ? { ...prev, [targetValue]: { ...prev[targetValue], scanId } } : prev))
@@ -319,6 +322,10 @@ export function ApiEnum({
                 rows={2}
                 className={`mt-0.5 ${inputBase}`}
               />
+            </label>
+            <label className="flex items-start gap-2 text-[11px] text-amber-300/90">
+              <input type="checkbox" checked={allowWrites} onChange={(e) => setAllowWrites(e.target.checked)} className="mt-0.5" />
+              <span>Also send PUT, PATCH and DELETE to each route. These can change or delete data on the target.</span>
             </label>
           </div>
         )}
@@ -654,6 +661,13 @@ function RouteRow({ route }: { route: ApiRoute }) {
                 Authed → <span className="font-mono text-neutral-300">{route.auth.authenticatedStatus}</span>
               </span>
             )}
+            {route.auth.verdict && (
+              // The verdict says what an unauthenticated answer means, e.g. a
+              // site-wide gate that is not this route's own control.
+              <span title={route.auth.challenge ? `WWW-Authenticate: ${route.auth.challenge}` : undefined}>
+                Verdict → <span className="font-mono text-neutral-300">{route.auth.verdict}</span>
+              </span>
+            )}
             {route.contentTypesAccepted && route.contentTypesAccepted.length > 0 && (
               <span>
                 Accepts → <span className="font-mono text-neutral-300">{route.contentTypesAccepted.join(', ')}</span>
@@ -693,7 +707,7 @@ function MethodTable({ methods }: { methods: ApiMethodProbe[] }) {
             <td className="py-0.5 pr-2">
               <MethodBadge method={m.method} allowed={m.allowed} />
             </td>
-            <td className="py-0.5 pr-2 font-mono">{m.statusCode || '—'}</td>
+            <td className={`py-0.5 pr-2 font-mono ${m.statusCode ? statusTextClass(m.statusCode) : ''}`}>{m.statusCode || '—'}</td>
             <td className="py-0.5 pr-2 font-mono">{m.contentType || '—'}</td>
             <td className="py-0.5 pr-2">{m.bodyShape || '—'}</td>
             <td className="py-0.5">{m.responseBytes}</td>

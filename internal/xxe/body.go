@@ -20,13 +20,46 @@ const defaultBody = `<?xml version="1.0" encoding="UTF-8"?>
 var doctypePattern = regexp.MustCompile(`(?s)<!DOCTYPE\b[^\[>]*(\[.*?\])?\s*>`)
 
 // leaf is one injection point: a text value that sits directly inside an
-// element. start and end are byte offsets into template.text, so a payload
-// can replace exactly that value and leave the rest of the document alone.
+// element, or an attribute value on an element. start and end are byte offsets
+// into template.text, so a payload can replace exactly that value and leave the
+// rest of the document alone. attr is empty for a text value and holds the
+// attribute name for an attribute value.
 type leaf struct {
 	index   int
 	start   int
 	end     int
 	element string
+	attr    string
+}
+
+// attrValuePattern matches one attribute of a start tag, with its quoted value
+// captured in group 2 (double quotes) or group 3 (single quotes). parseTemplate
+// uses it to find each attribute value's byte range inside the raw tag text.
+var attrValuePattern = regexp.MustCompile(`([A-Za-z_][\w.:-]*)\s*=\s*(?:"([^"]*)"|'([^']*)')`)
+
+// attrLeaves returns one leaf per non-empty attribute value in the start tag
+// raw, which begins at byte offset tagStart of the template text. Namespace
+// declarations (xmlns, xmlns:x) are skipped, since replacing a namespace URI
+// would change how the document parses rather than what the server reads.
+func attrLeaves(raw string, tagStart int, element string) []leaf {
+	var out []leaf
+	for _, m := range attrValuePattern.FindAllStringSubmatchIndex(raw, -1) {
+		name := raw[m[2]:m[3]]
+		if name == "xmlns" || strings.HasPrefix(name, "xmlns:") {
+			continue
+		}
+		// Group 2 is the double-quoted value and group 3 the single-quoted one.
+		// Whichever matched has a start index of at least zero.
+		vs, ve := m[4], m[5]
+		if m[4] < 0 {
+			vs, ve = m[6], m[7]
+		}
+		if vs < 0 || ve <= vs {
+			continue
+		}
+		out = append(out, leaf{start: tagStart + vs, end: tagStart + ve, element: element, attr: name})
+	}
+	return out
 }
 
 // template is the operator's XML (or defaultBody) with any DOCTYPE removed,
@@ -78,6 +111,13 @@ func parseTemplate(raw string) (template, error) {
 		switch v := tok.(type) {
 		case xml.StartElement:
 			pending = nil
+			// Attribute values on this start tag are injection points too. An
+			// entity reference is legal in an attribute value, so a payload
+			// placed there can still be expanded by the parser.
+			for _, l := range attrLeaves(stripped[tokStart:tokEnd], int(tokStart), v.Name.Local) {
+				l.index = len(t.leaves)
+				t.leaves = append(t.leaves, l)
+			}
 			stack = append(stack, v.Name.Local)
 		case xml.CharData:
 			pending = nil
@@ -124,7 +164,11 @@ func (t template) render(pt *leaf, replacement, doctype string) string {
 	return body
 }
 
-// describe names a leaf for finding labels, e.g. `<username>`.
+// describe names a leaf for finding labels: `<username>` for a text value, and
+// `@id of <item>` for an attribute value.
 func (l leaf) describe() string {
+	if l.attr != "" {
+		return fmt.Sprintf("@%s of <%s>", l.attr, l.element)
+	}
 	return fmt.Sprintf("<%s>", l.element)
 }

@@ -107,6 +107,13 @@ func (r Request) unknownIdentifier() string {
 	if r.UnknownIdentifier != "" {
 		return r.UnknownIdentifier
 	}
+	return r.freshUnknownIdentifier()
+}
+
+// freshUnknownIdentifier generates a new random identifier that no account can
+// have. Each call is different, so the enumeration check can take a second
+// unknown identifier as a noise control even when the operator named one.
+func (r Request) freshUnknownIdentifier() string {
 	var suffix [5]byte
 	// crypto/rand.Read only errors on a broken system entropy source, which
 	// would already be fatal well before this ever ran -- falling back to a
@@ -181,9 +188,9 @@ func submit(ctx context.Context, client *http.Client, target *url.URL, method, c
 			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		}
 	}
-	for k, v := range extraHeaders {
-		req.Header.Set(k, v)
-	}
+	// Caller headers go through netgov so a Host override is honored; a plain
+	// Header.Set would drop it silently.
+	netgov.ApplyHeaders(req, extraHeaders)
 	sentHeaders := map[string]string{}
 	for k := range req.Header {
 		sentHeaders[k] = req.Header.Get(k)
@@ -214,13 +221,17 @@ func submit(ctx context.Context, client *http.Client, target *url.URL, method, c
 }
 
 // fetchForm issues a plain GET against formURL -- used only by the CSRF/
-// form-security modules, never against the submission endpoint itself.
-func fetchForm(ctx context.Context, client *http.Client, formURL string) (*httpResult, error) {
+// form-security modules, never against the submission endpoint itself. The
+// caller's headers are sent too: a form page often renders its token only for
+// an authenticated or cookie-bearing visitor, so judging it without them would
+// report a token that is really there as missing.
+func fetchForm(ctx context.Context, client *http.Client, formURL string, headers map[string]string) (*httpResult, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, formURL, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("User-Agent", "Aperture-PwReset")
+	netgov.ApplyHeaders(req, headers)
 
 	resp, err := client.Do(req)
 	if err != nil {

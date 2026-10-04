@@ -39,7 +39,12 @@ var (
 // (see crawl below), not every crawled page, to keep the per-engine
 // payload fan-out bounded the same way ssrfParams is a fixed list rather
 // than growing with every page visited.
-var injectionHeaders = []string{"User-Agent", "Referer", "X-Forwarded-For", "X-Forwarded-Host", "X-Real-IP", "Accept-Language", "Origin"}
+var injectionHeaders = []string{
+	"User-Agent", "Referer", "X-Forwarded-For", "X-Forwarded-Host", "X-Real-IP", "Accept-Language", "Origin",
+	// Client-address and forwarding headers that proxies and access-log viewers
+	// also echo into a page.
+	"X-Client-IP", "True-Client-IP", "Forwarded", "X-Forwarded-Proto",
+}
 
 type injectionKind string
 

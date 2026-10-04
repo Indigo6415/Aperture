@@ -149,6 +149,7 @@ func runOOBCallbackModule(ctx context.Context, deps runDeps, oob OOBConfig) []Fi
 			Payload:    captured.URL,
 			Method:     captured.Method,
 			Confidence: ConfidenceConfirmed,
+			Callback:   true,
 			Request:    &captured,
 		})
 		deps.rep.Done(id, 1, nil)

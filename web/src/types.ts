@@ -688,6 +688,7 @@ export type ScanTool =
   | 'breach-crawl'
   | 'domainscan'
   | 'bypass403'
+  | 'gitdump'
   | 'pwreset'
   | 'graphqlenum'
   | 'corsscan'
@@ -807,6 +808,9 @@ export interface Bypass403Request {
   url: string
   headers?: Record<string, string>
   credentialId?: string
+  // allowWriteMethods opts into the PUT, PATCH and DELETE method attempts, which
+  // can change or delete data on the target. Off by default.
+  allowWriteMethods?: boolean
   caseId?: string
 }
 
@@ -836,6 +840,43 @@ export interface Bypass403Response {
   baseline: Bypass403Baseline
   attempts: Bypass403Attempt[]
   bypassCount: number
+}
+
+// --- Git dump (mirrors internal/gitdump and internal/api/handlers_gitdump.go) ---
+
+export interface GitDumpRequest {
+  // requestsPerSecond is the scan speed (Slow/Normal/Fast/Custom); omitted means the server default.
+  requestsPerSecond?: number
+  // targets are URLs or bare hosts. Each is checked for an exposed .git and dumped if one is found.
+  targets: string[]
+  credentialId?: string
+  caseId?: string
+}
+
+// GitDumpTarget is one target's outcome. bucketId is set only when the target
+// was exposed and its zip exists, and is what the download link is built from.
+export interface GitDumpTarget {
+  input: string
+  baseUrl: string
+  // gitPath is the .git spelling that matched. Absent or ".git/" is the standard one.
+  gitPath?: string
+  host: string
+  exposed: boolean
+  headRef?: string
+  refs: number
+  packs: number
+  objects: number
+  missingObjects: number
+  files: number
+  restoredFrom?: 'HEAD' | 'index' | ''
+  warnings?: string[]
+  bucketId?: string
+  zipBytes?: number
+  error?: string
+}
+
+export interface GitDumpResponse {
+  targets: GitDumpTarget[]
 }
 
 // --- Forgot-password scanner (mirrors internal/pwreset) ---
@@ -887,6 +928,9 @@ export interface PwResetFinding {
   method?: string
   statusCode?: number
   request?: CapturedRequest
+  // confidence is "confirmed" when the behavior was reproduced, "likely" or
+  // "heuristic" otherwise (empty on findings saved before it was recorded).
+  confidence?: Confidence
 }
 
 export interface PwResetModuleResult {
@@ -917,6 +961,9 @@ export interface GraphqlEnumBaseline {
   statusCode: number
   confirmed: boolean
   typeName?: string
+  // resolvedUrl is set only when the checks ran against a different path than url
+  // (the requested URL did not answer as GraphQL and an alternate did).
+  resolvedUrl?: string
 }
 
 export interface GraphqlFieldSummary {
@@ -958,6 +1005,9 @@ export interface GraphqlEnumFinding {
   method?: string
   statusCode?: number
   request?: CapturedRequest
+  // confidence is "confirmed" when the behavior was reproduced, "likely" or
+  // "heuristic" otherwise (empty on findings saved before it was recorded).
+  confidence?: Confidence
 }
 
 export interface GraphqlEnumModuleResult {
@@ -965,6 +1015,8 @@ export interface GraphqlEnumModuleResult {
   name: string
   severity: ProbeSeverity
   findings: GraphqlEnumFinding[]
+  // skipped, when set, says why this module was deliberately not run at all.
+  skipped?: string
 }
 
 export interface GraphqlEnumResponse {
@@ -1000,10 +1052,25 @@ export interface ApiMethodProbe {
   responseBytes: number
 }
 
+// ApiAuthVerdict mirrors internal/apienum.AuthProbe.Verdict's documented values.
+export type ApiAuthVerdict =
+  | 'public'
+  | 'requires-auth'
+  | 'forbidden'
+  | 'login-redirect'
+  | 'site-wide-gate'
+  | 'not-found'
+  | 'unreachable'
+  | 'other'
+
 export interface ApiAuthProbe {
   unauthenticatedStatus: number
   authenticatedStatus?: number
   requiresAuth: boolean
+  // verdict names what the unauthenticated answer means (see internal/apienum.AuthProbe).
+  verdict?: ApiAuthVerdict
+  // challenge is the WWW-Authenticate header, when the server sent one.
+  challenge?: string
 }
 
 // ApiRouteSource is where a route was first discovered -- drives both the
@@ -1083,6 +1150,9 @@ export interface ApiEnumRequest {
   crawlDepth?: number
   maxPages?: number
   extraWordlist?: string[]
+  // allowWriteMethods opts into sending PUT, PATCH and DELETE to each route.
+  // Off by default because those requests can change or delete data on the target.
+  allowWriteMethods?: boolean
   // caseId -- see JwtScanRequest.caseId's doc comment.
   caseId?: string
 }
@@ -1132,6 +1202,9 @@ export interface CorsScanFinding {
   method?: string
   statusCode?: number
   request?: CapturedRequest
+  // confidence is "confirmed" when the behavior was reproduced, "likely" or
+  // "heuristic" otherwise (empty on findings saved before it was recorded).
+  confidence?: Confidence
 }
 
 export interface CorsScanModuleResult {
@@ -1201,6 +1274,9 @@ export interface OpenRedirectFinding {
   // chain is every request from the probe to the callback. Absent on scans
   // saved before it was recorded.
   chain?: ChainHop[]
+  // confidence is "confirmed" when the behavior was reproduced, "likely" or
+  // "heuristic" otherwise (empty on findings saved before it was recorded).
+  confidence?: Confidence
 }
 
 export interface OpenRedirectModuleResult {
@@ -1257,6 +1333,9 @@ export interface SsrfFinding {
   method?: string
   statusCode?: number
   request?: CapturedRequest
+  // confidence is "confirmed" when the behavior was reproduced, "likely" or
+  // "heuristic" otherwise (empty on findings saved before it was recorded).
+  confidence?: Confidence
 }
 
 export interface SsrfModuleResult {
@@ -1367,6 +1446,9 @@ export interface XssFinding {
   method?: string
   statusCode?: number
   request?: CapturedRequest
+  // confidence is "confirmed" when the behavior was reproduced, "likely" or
+  // "heuristic" otherwise (empty on findings saved before it was recorded).
+  confidence?: Confidence
 }
 
 export interface XssModuleResult {
@@ -1384,6 +1466,19 @@ export interface XssResponse {
 }
 
 // --- CSRF sweep (mirrors internal/csrf) ---
+
+// CsrfTokenProbeRequest mirrors internal/api's csrfTokenProbeRequest. The
+// server only runs the check when confirm is true, and it refuses the scan
+// when the probe is incomplete rather than dropping it.
+export interface CsrfTokenProbeRequest {
+  url: string
+  method?: 'POST' | 'PUT' | 'PATCH' | 'DELETE'
+  // body is the complete form-encoded submission, token field included.
+  body: string
+  // field names the token field inside body.
+  field: string
+  confirm: boolean
+}
 
 export interface CsrfScanRequest {
   // requestsPerSecond is the scan speed (Slow/Normal/Fast/Custom); omitted means the server default.
@@ -1403,6 +1498,10 @@ export interface CsrfScanRequest {
   apiUrl?: string
   apiMethod?: string
   apiBody?: string
+  // tokenProbe opts into the token-enforcement check. It replays one named form
+  // submission with its token removed, emptied and tampered, so it sends
+  // state-changing requests. The server refuses it unless confirm is true.
+  tokenProbe?: CsrfTokenProbeRequest
 }
 
 // CsrfFinding carries no method/statusCode -- unlike every other scanner's
@@ -1417,6 +1516,9 @@ export interface CsrfFinding {
   detail?: string
   evidence?: string
   request?: CapturedRequest
+  // confidence is "confirmed" when the behavior was reproduced, "likely" or
+  // "heuristic" otherwise (empty on findings saved before it was recorded).
+  confidence?: Confidence
 }
 
 export interface CsrfModuleResult {
@@ -1464,6 +1566,9 @@ export interface SstiScanFinding {
   method?: string
   statusCode?: number
   request?: CapturedRequest
+  // confidence is "confirmed" when the behavior was reproduced, "likely" or
+  // "heuristic" otherwise (empty on findings saved before it was recorded).
+  confidence?: Confidence
 }
 
 export interface SstiScanModuleResult {

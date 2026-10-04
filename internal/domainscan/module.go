@@ -12,7 +12,42 @@
 // probescan checks paths, domainscan runs tools.
 package domainscan
 
-import "context"
+import (
+	"context"
+	"sync"
+)
+
+// crawlMemoKey is the context key under which one scan stores its shared crawl.
+type crawlMemoKey struct{}
+
+// crawlMemo runs the domain crawl at most once per scan. Every module that
+// needs the site's scripts asks for the same result, so a scan does not walk
+// the target twice (retire.js and the library module both need it).
+type crawlMemo struct {
+	once sync.Once
+	res  crawlResult
+}
+
+// withCrawlMemo returns ctx carrying a fresh crawl memo. RunScanStreaming calls
+// it once per scan, before any module starts.
+func withCrawlMemo(ctx context.Context) context.Context {
+	return context.WithValue(ctx, crawlMemoKey{}, &crawlMemo{})
+}
+
+// sharedCrawl returns the scan's crawl of t, running it on the first call only.
+// Without a memo in ctx (a module invoked directly) it crawls on each call.
+func sharedCrawl(ctx context.Context, t *Target, opts Options) crawlResult {
+	memo, ok := ctx.Value(crawlMemoKey{}).(*crawlMemo)
+	if !ok {
+		return crawlDomain(ctx, t, opts.CrawlDepth, opts.MaxPages, opts.Headers)
+	}
+	// once.Do blocks the other modules until the first crawl finishes, so each
+	// of them then reads the same result.
+	memo.once.Do(func() {
+		memo.res = crawlDomain(ctx, t, opts.CrawlDepth, opts.MaxPages, opts.Headers)
+	})
+	return memo.res
+}
 
 // Finding is one thing a module discovered. Unlike probescan.Finding, this
 // carries its own Severity -- a module here wraps a whole external tool

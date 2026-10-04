@@ -8,8 +8,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-
-	"github.com/Indigo6415/Aperture/internal/fingerprint"
 )
 
 // spaShell is what a single-page app serves for every unknown route. It
@@ -43,11 +41,8 @@ func runModule(t *testing.T, url string, id string) []Finding {
 	t.Helper()
 	ctx := context.Background()
 	client := newProbeClient(16, nil)
-	profile, err := fingerprint.BuildProfile(ctx, client.follow, url, nil)
-	if err != nil {
-		t.Fatalf("BuildProfile: %v", err)
-	}
-	client.profile = profile
+	// Prime the baselines exactly as RunScanStreaming does for a real scan.
+	primeCatchAll(ctx, client, &Target{URL: url, Hostname: "fixture"}, nil)
 	for _, m := range registeredModules {
 		if m.id == id {
 			return m.run(ctx, &Target{URL: url, Hostname: "fixture"}, client)

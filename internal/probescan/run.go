@@ -109,6 +109,22 @@ func withRequestHeaders(findings []Finding, scanHeaders map[string]string) []Fin
 	return findings
 }
 
+// primeCatchAll fills in the soft-404 baselines a client judges hits against:
+// the random-path profile (from fingerprint.BuildProfile) and the homepage
+// fingerprint used when that profile is unstable. Each step is best effort, so
+// a failed probe only reduces filtering and never aborts the scan.
+func primeCatchAll(ctx context.Context, c *probeClient, t *Target, headers map[string]string) {
+	if profile, err := fingerprint.BuildProfile(ctx, c.follow, t.URL, headers); err == nil {
+		c.profile = profile
+	}
+	// The homepage is fetched through the client so it shares the probe's
+	// semaphore, headers, and redirect policy. Only a 200 is a usable baseline.
+	if r, err := c.get(ctx, t.URL, true); err == nil && r.StatusCode == 200 {
+		obs := r.observation()
+		c.home = &obs
+	}
+}
+
 // RunScan resolves rawTarget, runs a quick reachability check, then runs
 // every registered module concurrently against it, returning one aggregated
 // response. Modeled on jwtscan.RunScan's shape: an error here means the
@@ -138,12 +154,10 @@ func RunScanStreaming(ctx context.Context, rawTarget string, opts Options, onMod
 		conc = defaultConcurrency
 	}
 	client := newProbeClient(conc, opts.Headers)
-	// Build the catch-all profile before any module runs, so every module
-	// judges its hits against the same baseline. A failure here only means
-	// nothing gets filtered as a soft-404; the scan itself still proceeds.
-	if profile, err := fingerprint.BuildProfile(ctx, client.follow, t.URL, opts.Headers); err == nil {
-		client.profile = profile
-	}
+	// Build the catch-all baseline before any module runs, so every module
+	// judges its hits against the same reference. A failure here only means
+	// less gets filtered as a soft-404; the scan itself still proceeds.
+	primeCatchAll(ctx, client, t, opts.Headers)
 
 	results := make([]ModuleResult, len(registeredModules))
 	var wg sync.WaitGroup

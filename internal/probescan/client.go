@@ -45,6 +45,11 @@ type probeClient struct {
 	// when the probe that builds it failed, and then nothing is filtered as a
 	// soft-404.
 	profile *fingerprint.Profile
+	// home is the fingerprint of the target's own homepage, or nil when it
+	// could not be taken. It is the fallback catch-all baseline for hosts whose
+	// random-path profile is unstable: a 200 that looks just like the homepage
+	// is the site's front end answering for a path that does not exist.
+	home *fingerprint.Observation
 	// headers is applied to every request this client issues (get and
 	// post alike) -- e.g. a saved credential's Authorization/Cookie header,
 	// set once here rather than threaded through every check module.

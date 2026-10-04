@@ -19,6 +19,7 @@ package corsscan
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"net/url"
 	"sort"
 	"sync"
@@ -94,12 +95,23 @@ type moduleDef struct {
 type runDeps struct {
 	target *url.URL
 	req    Request
+	// client is the HTTP client every module sends through -- the shared netgov
+	// client in production (see newClient), injectable only by tests.
+	client *http.Client
+	// attacker is the response to the plain (non-preflight) request sent with
+	// Origin: attackerOrigin. It is fetched once in runWithClient and shared by
+	// every module that reads it, so the same request is not sent several times.
+	// Nil when that request failed.
+	attacker *corsResult
 }
 
+// registeredModules lists every module in the order they are reported. The
+// order does not affect results, since each module's findings are independent.
 func registeredModules() []moduleDef {
 	return []moduleDef{
 		reflectedOriginModule,
 		credentialedReflectionModule,
+		varyOriginModule,
 		nullOriginModule,
 		wildcardWithCredentialsModule,
 		insecureProtocolModule,
@@ -111,6 +123,13 @@ func registeredModules() []moduleDef {
 // Run resolves req.URL, takes an Origin-less baseline request, then runs
 // every check module concurrently against the same endpoint.
 func Run(ctx context.Context, req Request) (*Result, error) {
+	return runWithClient(ctx, req, newClient())
+}
+
+// runWithClient is Run with the HTTP client supplied by the caller. Run passes
+// the shared netgov client; tests pass a client that points at an httptest
+// server.
+func runWithClient(ctx context.Context, req Request, client *http.Client) (*Result, error) {
 	rep := scanprogress.Or(req.Progress)
 
 	target, err := parseTarget(req.URL)
@@ -118,7 +137,6 @@ func Run(ctx context.Context, req Request) (*Result, error) {
 		return nil, err
 	}
 
-	client := newClient()
 	baselineRes, err := doRequest(ctx, client, target, req.method(), "", false, "", "", req.Headers)
 	if err != nil {
 		return nil, fmt.Errorf("corsscan: baseline request failed: %w", err)
@@ -128,7 +146,14 @@ func Run(ctx context.Context, req Request) (*Result, error) {
 		AllowOriginPresent: baselineRes.AllowOriginPresent, AllowOrigin: baselineRes.AllowOrigin,
 	}
 
-	deps := runDeps{target: target, req: req}
+	// The attacker-origin response is shared by several modules; a failure here
+	// just leaves those modules with nothing to report, as before.
+	attackerRes, err := doRequest(ctx, client, target, req.method(), attackerOrigin, false, "", "", req.Headers)
+	if err != nil {
+		attackerRes = nil
+	}
+
+	deps := runDeps{target: target, req: req, client: client, attacker: attackerRes}
 	mods := registeredModules()
 	// One progress check per module -- each module is a whole battery of its
 	// own probes, so the module is the unit a user can follow.

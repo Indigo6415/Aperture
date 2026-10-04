@@ -39,6 +39,24 @@ var directoryNames = []struct{ path, label string }{
 	{"/private", "Private directory"},
 	{"/secret", "Secret directory"},
 	{"/hidden", "Hidden directory"},
+	// Dependency and build trees, whose listing exposes the full stack.
+	{"/vendor", "Vendor dependencies directory"},
+	{"/node_modules", "Node modules directory"},
+	{"/bower_components", "Bower components directory"},
+	// Installer, setup, and CGI directories that are meant to be removed after use.
+	{"/install", "Installer directory"},
+	{"/setup", "Setup directory"},
+	{"/cgi-bin", "CGI scripts directory"},
+	{"/includes", "Includes directory"},
+	{"/lib", "Library directory"},
+	// Staging, export, and report directories that often hold business data.
+	{"/staging", "Staging directory"},
+	{"/export", "Export directory"},
+	{"/exports", "Exports directory"},
+	{"/reports", "Reports directory"},
+	{"/storage", "Storage directory"},
+	{"/debug", "Debug directory"},
+	{"/new", "New files directory"},
 }
 
 // isDirectoryListing reports whether a body is a server-generated autoindex

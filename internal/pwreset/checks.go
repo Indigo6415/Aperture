@@ -25,11 +25,13 @@ const enumerationLengthTolerance = 4
 const enumerationTimingTolerance = 300 * time.Millisecond
 
 // Confidence levels for a Finding. Every check here reasons about responses it
-// actually observed, so the strongest level is confirmed; the two checks that
-// infer from a sample are likely.
+// actually observed. The strongest level is confirmed, the checks that infer
+// from a sample are likely, and a check that only matches a pattern in one
+// response is heuristic.
 const (
 	ConfidenceConfirmed = "confirmed"
 	ConfidenceLikely    = "likely"
+	ConfidenceHeuristic = "heuristic"
 )
 
 // --- Host-header / password-reset-poisoning module ---
@@ -62,12 +64,20 @@ type hostHeaderSpec struct {
 	forwardedSyntax bool
 }
 
+// hostHeaderSpecs are the host-trust techniques tried. Besides the standard
+// Host and forwarded-host headers, the list covers the non-standard names
+// frameworks and proxies use for the same purpose (X-Host, X-Forwarded-Hostname,
+// X-HTTP-Host-Override), since an app that trusts one of them often trusts the
+// rest in the same way.
 var hostHeaderSpecs = []hostHeaderSpec{
 	{id: "host-header", description: "Host header", overrideHost: true},
 	{id: "x-forwarded-host", description: "X-Forwarded-Host header", headerName: "X-Forwarded-Host"},
 	{id: "x-forwarded-server", description: "X-Forwarded-Server header", headerName: "X-Forwarded-Server"},
 	{id: "x-original-host", description: "X-Original-Host header", headerName: "X-Original-Host"},
 	{id: "forwarded", description: "Forwarded header", headerName: "Forwarded", forwardedSyntax: true},
+	{id: "x-host", description: "X-Host header", headerName: "X-Host"},
+	{id: "x-forwarded-hostname", description: "X-Forwarded-Hostname header", headerName: "X-Forwarded-Hostname"},
+	{id: "x-http-host-override", description: "X-HTTP-Host-Override header", headerName: "X-HTTP-Host-Override"},
 }
 
 var hostHeaderModule = moduleDef{
@@ -75,6 +85,9 @@ var hostHeaderModule = moduleDef{
 	run: runHostHeaderModule,
 }
 
+// runHostHeaderModule sends the reset request once per host-trust technique,
+// each with the poison domain in that technique's header, and reports every
+// technique whose domain comes back in the response.
 func runHostHeaderModule(ctx context.Context, client *http.Client, target *url.URL, req Request, unknownID string, _ *httpResult) []Finding {
 	fields := buildFields(req.identifierField(), unknownID, req.ExtraFields)
 	method, contentType := req.method(), req.contentType()
@@ -94,6 +107,8 @@ func runHostHeaderModule(ctx context.Context, client *http.Client, target *url.U
 				headers[k] = v
 			}
 			hostHeader := ""
+			// Place the poison domain where this technique puts it: the Host
+			// override, the RFC 7239 Forwarded syntax, or a plain proxy header.
 			if spec.overrideHost {
 				hostHeader = poisonDomain
 			} else if spec.forwardedSyntax {
@@ -114,6 +129,7 @@ func runHostHeaderModule(ctx context.Context, client *http.Client, target *url.U
 				Method:     method,
 				StatusCode: res.StatusCode,
 				Request:    &res.Request,
+				Confidence: ConfidenceLikely,
 			}}
 		}(i, spec)
 	}
@@ -148,6 +164,8 @@ func reflectsPoisonDomain(res *httpResult) bool {
 	if strings.Contains(res.Body, poisonDomain) {
 		return true
 	}
+	// Each response header value is checked, since a Location or Set-Cookie
+	// can carry the domain while the body does not.
 	for _, values := range res.Header {
 		for _, v := range values {
 			if strings.Contains(v, poisonDomain) {
@@ -180,8 +198,13 @@ var leakageQueryRe = regexp.MustCompile(`(?i)[?&](token|code|otp|reset[_-]?token
 // field rather than embedded in a link.
 var leakageJSONKeyRe = regexp.MustCompile(`(?i)"(token|resettoken|reset_token|reseturl|reset_url|resetlink|reset_link|debug|otp)"\s*:\s*"([^"]{3,})"`)
 
+// runLeakageModule scans the reset response for token-shaped values. When a
+// known identifier is given, the scan reads the known account's response, and any
+// value that also appears in the unknown account's response is dropped. Such a
+// value is page furniture or a static value, not a token minted for that request.
 func runLeakageModule(ctx context.Context, client *http.Client, target *url.URL, req Request, unknownID string, baseline *httpResult) []Finding {
 	res := baseline
+	known := false
 	// A known-good identifier is more likely to trigger the app's real
 	// "success" flow (as opposed to a generic "if this account exists…"
 	// response an unknown identifier gets), so it's worth one extra request
@@ -190,15 +213,30 @@ func runLeakageModule(ctx context.Context, client *http.Client, target *url.URL,
 		fields := buildFields(req.identifierField(), req.KnownIdentifier, req.ExtraFields)
 		if r, err := submit(ctx, client, target, req.method(), req.contentType(), fields, req.Headers, ""); err == nil {
 			res = r
+			known = true
 		}
 	}
 	if res == nil {
 		return nil
 	}
 
+	// ref is the unknown-account response to subtract from. Without a known
+	// account there is nothing to subtract, so the finding is only heuristic.
+	ref := ""
+	confidence := ConfidenceHeuristic
+	if known && baseline != nil {
+		ref = baseline.Body
+		confidence = ConfidenceLikely
+	}
+
 	var out []Finding
 	seen := map[string]bool{}
 	addMatch := func(field, value string) {
+		// A value present in the unknown-account response is not specific to
+		// the known account's request, so it is not reported as a leaked token.
+		if ref != "" && strings.Contains(ref, value) {
+			return
+		}
 		key := field + value
 		if seen[key] {
 			return
@@ -211,6 +249,7 @@ func runLeakageModule(ctx context.Context, client *http.Client, target *url.URL,
 			Method:     req.method(),
 			StatusCode: res.StatusCode,
 			Request:    &res.Request,
+			Confidence: confidence,
 		})
 	}
 
@@ -279,63 +318,107 @@ var rateLimitWaves = []int{4, 8, 16}
 // to show a pattern without being a denial-of-service attempt on the target.
 const rateLimitBurst = 4 + 8 + 16
 
+// throttlePhrases are wordings a limiter or bot-filter uses in a body. "captcha"
+// and "too many failed" are the common ones on reset forms, where a limiter
+// answers with a challenge rather than a 429.
 var throttlePhrases = []string{
 	"too many requests", "rate limit", "try again later", "temporarily blocked", "please wait before", "slow down",
+	"too many attempts", "too many failed", "captcha",
+}
+
+// waveResult is what one concurrent wave of requests showed.
+type waveResult struct {
+	// throttled counts responses that signal a limit: 429, a Retry-After
+	// header, a zeroed rate-limit header, or throttle wording.
+	throttled int
+	// answered counts responses that were a normal answer, meaning no transport
+	// error and a status below 500.
+	answered int
 }
 
 // runRateLimitModule fires escalating concurrent waves at the reset endpoint.
 // A throttled response in any wave means a limit exists, so nothing is
-// reported. Otherwise the finding states the exact sample size: a burst this
-// small cannot show the absence of a limit over a longer window, so the claim
-// is only as strong as the sample.
+// reported. Otherwise the finding states how many requests got a normal answer,
+// so the claim is only as strong as the sample. If most of the burst failed,
+// nothing is reported: a "no throttling" claim about a server that was erroring
+// would be false.
 func runRateLimitModule(ctx context.Context, client *http.Client, target *url.URL, req Request, unknownID string, _ *httpResult) []Finding {
 	fields := buildFields(req.identifierField(), unknownID, req.ExtraFields)
 	method, contentType := req.method(), req.contentType()
 
-	sent := 0
+	sent, answered := 0, 0
 	for _, wave := range rateLimitWaves {
-		throttled := sendWave(ctx, client, target, method, contentType, fields, req.Headers, wave)
+		w := sendWave(ctx, client, target, method, contentType, fields, req.Headers, wave)
 		sent += wave
-		if throttled > 0 {
+		answered += w.answered
+		if w.throttled > 0 {
 			return nil
 		}
 	}
+	// Require at least 90% of the burst to have been answered normally.
+	if answered*10 < sent*9 {
+		return nil
+	}
 	return []Finding{{
-		Label:      fmt.Sprintf("No throttling seen across %d rapid requests", sent),
-		Detail:     fmt.Sprintf("Every request in %d concurrent requests, sent in waves of %v, returned a normal (non-throttled) response. That is evidence of no limit at this rate, not proof: a limiter keyed on a longer window, or one that starts after a threshold above %d requests, would not show here.", sent, rateLimitWaves, sent),
+		Label:      fmt.Sprintf("No throttling seen across %d rapid requests", answered),
+		Detail:     fmt.Sprintf("%d of %d concurrent requests, sent in waves of %v, returned a normal (non-throttled) response, with no throttle header or wording. That is evidence of no limit at this rate, not proof: a limiter keyed on a longer window, or one that starts after a threshold above %d requests, would not show here.", answered, sent, rateLimitWaves, sent),
 		Method:     method,
 		Confidence: ConfidenceLikely,
 	}}
 }
 
-// sendWave fires n identical requests concurrently and returns how many were
-// throttled. Concurrency is deliberate: a limiter keyed on requests per second
-// would go undetected by a slow sequential burst.
-func sendWave(ctx context.Context, client *http.Client, target *url.URL, method, contentType string, fields map[string]string, headers map[string]string, n int) int {
-	throttled := make([]bool, n)
+// sendWave fires n identical requests concurrently and reports how many were
+// throttled and how many got a normal answer. Concurrency is deliberate: a
+// limiter keyed on requests per second would go undetected by a slow
+// sequential burst.
+func sendWave(ctx context.Context, client *http.Client, target *url.URL, method, contentType string, fields map[string]string, headers map[string]string, n int) waveResult {
+	// One slot per request, so each goroutine writes only its own element.
+	type slot struct{ answered, throttled bool }
+	slots := make([]slot, n)
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
 			res, err := submit(ctx, client, target, method, contentType, fields, headers, "")
-			if err != nil {
+			// A transport error or a server error is not an answer about throttling.
+			if err != nil || res.StatusCode >= 500 {
 				return
 			}
-			throttled[i] = res.StatusCode == http.StatusTooManyRequests || looksThrottled(res.Body)
+			slots[i] = slot{answered: true, throttled: looksThrottledResponse(res)}
 		}(i)
 	}
 	wg.Wait()
 
-	count := 0
-	for _, t := range throttled {
-		if t {
-			count++
+	var out waveResult
+	for _, s := range slots {
+		if s.answered {
+			out.answered++
+		}
+		if s.throttled {
+			out.throttled++
 		}
 	}
-	return count
+	return out
 }
 
+// looksThrottledResponse reports whether one response signals a limit, by
+// status, by the headers a limiter sets, or by throttle wording in the body.
+func looksThrottledResponse(res *httpResult) bool {
+	if res.StatusCode == http.StatusTooManyRequests {
+		return true
+	}
+	// A limiter often answers 200 with these headers instead of a 429.
+	if res.Header.Get("Retry-After") != "" {
+		return true
+	}
+	if res.Header.Get("X-RateLimit-Remaining") == "0" || res.Header.Get("RateLimit-Remaining") == "0" {
+		return true
+	}
+	return looksThrottled(res.Body)
+}
+
+// looksThrottled reports whether body contains a throttle phrase, case-insensitively.
 func looksThrottled(body string) bool {
 	lower := strings.ToLower(body)
 	// Checked against a fixed phrase list the same way bypass403.looksBlocked
@@ -356,6 +439,14 @@ func looksThrottled(body string) bool {
 // ordinary network jitter, looking for any difference (status code,
 // response size, or response time) that would let an attacker tell which
 // email addresses/usernames are actually registered.
+//
+// Two controls keep this from reporting noise:
+//   - Echoes of the identifier are removed from each body before its length is
+//     taken. A page that says "we sent a link to <address>" is longer for a longer
+//     address, and that difference is the identifier itself, not account state.
+//   - A second, fresh unknown identifier is sampled alongside. A difference that
+//     also separates two identifiers that both don't exist is page or network
+//     noise, so it is dropped.
 var enumerationModule = moduleDef{
 	id: "enumeration", name: "User enumeration", severity: "medium",
 	run: runEnumerationModule,
@@ -368,54 +459,54 @@ const enumerationSamples = 10
 
 // enumSample is one timed request against one identifier.
 type enumSample struct {
-	status  int
+	status int
+	// length is the body length with identifier echoes removed (see
+	// bodyLengthWithoutEchoes).
 	length  int
 	latency time.Duration
 	suspect bool
 }
 
+// measureDiff is one way two sample groups differ: the measure it's about
+// ("status", "length", or "timing") and a sentence describing the difference.
+type measureDiff struct {
+	measure string
+	reason  string
+}
+
 // runEnumerationModule compares a known identifier's responses with an unknown
-// one's. Samples are interleaved (known, unknown, known, ...) so that drift in
-// the network or in the target falls on both groups equally, instead of making
-// one group look slower. A difference is reported only when the groups separate
-// completely on that measure, which is what a real side channel looks like,
-// and not the overlap that jitter produces. Timing is ignored when the governor
-// has flagged the host as drifting, since throttling itself moves latency.
+// one's, with a second unknown identifier as the noise control. Samples are
+// interleaved (known, unknown, control, ...) so that drift in the network or the
+// target falls on every group equally. A difference is reported only when the
+// groups separate completely on that measure, which is what a real side channel
+// looks like, and only when the same measure does not separate the two unknown
+// identifiers. Timing is ignored when the governor has flagged the host as
+// drifting, since throttling itself moves latency.
 func runEnumerationModule(ctx context.Context, client *http.Client, target *url.URL, req Request, unknownID string, _ *httpResult) []Finding {
 	if req.KnownIdentifier == "" || unknownID == "" {
 		return nil
 	}
-	known, unknown := sampleInterleaved(ctx, client, target, req, req.KnownIdentifier, unknownID)
-	if len(known) < enumerationSamples || len(unknown) < enumerationSamples {
+	control := req.freshUnknownIdentifier()
+	echoes := []string{req.KnownIdentifier, unknownID, control}
+	known, unknown, ctl := sampleInterleaved(ctx, client, target, req, req.KnownIdentifier, unknownID, control, echoes)
+	if len(known) < enumerationSamples || len(unknown) < enumerationSamples || len(ctl) < enumerationSamples {
 		return nil
 	}
 
-	anySuspect := false
-	for _, s := range append(append([]enumSample{}, known...), unknown...) {
-		anySuspect = anySuspect || s.suspect
-	}
+	timing := !anySuspect(known, unknown, ctl)
 
+	// Measures that also separate two unknown identifiers are noise, not
+	// account state, so they are dropped from the report.
+	noise := map[string]bool{}
+	for _, d := range differingMeasures(unknown, ctl, "the unknown account", "a second unknown account", timing) {
+		noise[d.measure] = true
+	}
 	var reasons []string
-	if k, u := uniformStatus(known), uniformStatus(unknown); k >= 0 && u >= 0 && k != u {
-		reasons = append(reasons, fmt.Sprintf("status code differs on every sample (%d for the known account vs. %d for the unknown one)", k, u))
-	}
-	lengths := func(s []enumSample) []float64 {
-		out := make([]float64, len(s))
-		for i := range s {
-			out[i] = float64(s[i].length)
+	for _, d := range differingMeasures(known, unknown, "the known account", "the unknown one", timing) {
+		if noise[d.measure] {
+			continue
 		}
-		return out
-	}
-	kl, ul := lengths(known), lengths(unknown)
-	if separated(kl, ul) && math.Abs(median(kl)-median(ul)) > enumerationLengthTolerance {
-		reasons = append(reasons, fmt.Sprintf("response size differs on every sample (median ~%.0f bytes for the known account vs. ~%.0f for the unknown one)", median(kl), median(ul)))
-	}
-	if !anySuspect {
-		kt, ut := latencies(known), latencies(unknown)
-		if separated(kt, ut) && math.Abs(median(kt)-median(ut)) > float64(enumerationTimingTolerance) {
-			reasons = append(reasons, fmt.Sprintf("response time differs on every sample (median %v for the known account vs. %v for the unknown one)",
-				time.Duration(median(kt)).Round(time.Millisecond), time.Duration(median(ut)).Round(time.Millisecond)))
-		}
+		reasons = append(reasons, d.reason)
 	}
 
 	if len(reasons) == 0 {
@@ -423,30 +514,74 @@ func runEnumerationModule(ctx context.Context, client *http.Client, target *url.
 	}
 	return []Finding{{
 		Label:      "Known and unknown identifiers get distinguishable responses",
-		Detail:     "The request-reset endpoint responds differently depending on whether the account exists: " + strings.Join(reasons, "; ") + ". An attacker can use this to enumerate registered accounts.",
+		Detail:     "The request-reset endpoint responds differently depending on whether the account exists: " + strings.Join(reasons, "; ") + ". Two unknown identifiers were also sampled and did not differ on those measures, so the difference is not page or network noise. An attacker can use this to enumerate registered accounts.",
 		Method:     req.method(),
 		StatusCode: known[0].status,
 		Confidence: ConfidenceLikely,
 	}}
 }
 
-// sampleInterleaved sends enumerationSamples requests for each identifier,
-// alternating between them. Requests are sequential because they are timed; a
-// concurrent burst would let the two identifiers contend for one connection.
-func sampleInterleaved(ctx context.Context, client *http.Client, target *url.URL, req Request, known, unknown string) (knownSamples, unknownSamples []enumSample) {
-	for i := 0; i < enumerationSamples; i++ {
-		if s, ok := sampleOnce(ctx, client, target, req, known); ok {
-			knownSamples = append(knownSamples, s)
-		}
-		if s, ok := sampleOnce(ctx, client, target, req, unknown); ok {
-			unknownSamples = append(unknownSamples, s)
+// differingMeasures lists every measure on which groups a and b separate
+// completely: status (when each group is uniform and the two differ), length
+// (beyond enumerationLengthTolerance), and, when timing is allowed, latency
+// (beyond enumerationTimingTolerance). nameA and nameB label the groups in the
+// reason text.
+func differingMeasures(a, b []enumSample, nameA, nameB string, timing bool) []measureDiff {
+	var out []measureDiff
+	if x, y := uniformStatus(a), uniformStatus(b); x >= 0 && y >= 0 && x != y {
+		out = append(out, measureDiff{"status", fmt.Sprintf("status code differs on every sample (%d for %s vs. %d for %s)", x, nameA, y, nameB)})
+	}
+	la, lb := lengthsOf(a), lengthsOf(b)
+	if separated(la, lb) && math.Abs(median(la)-median(lb)) > enumerationLengthTolerance {
+		out = append(out, measureDiff{"length", fmt.Sprintf("response size differs on every sample (median ~%.0f bytes for %s vs. ~%.0f for %s)", median(la), nameA, median(lb), nameB)})
+	}
+	if timing {
+		ta, tb := latencies(a), latencies(b)
+		if separated(ta, tb) && math.Abs(median(ta)-median(tb)) > float64(enumerationTimingTolerance) {
+			out = append(out, measureDiff{"timing", fmt.Sprintf("response time differs on every sample (median %v for %s vs. %v for %s)",
+				time.Duration(median(ta)).Round(time.Millisecond), nameA, time.Duration(median(tb)).Round(time.Millisecond), nameB)})
 		}
 	}
-	return knownSamples, unknownSamples
+	return out
 }
 
-// sampleOnce sends one request for identifier and records its timing.
-func sampleOnce(ctx context.Context, client *http.Client, target *url.URL, req Request, identifier string) (enumSample, bool) {
+// anySuspect reports whether any sample in any group came back flagged by the
+// governor as drifting, which makes its latency unreliable.
+func anySuspect(groups ...[]enumSample) bool {
+	for _, g := range groups {
+		for _, s := range g {
+			if s.suspect {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// sampleInterleaved sends enumerationSamples requests for each of the three
+// identifiers, cycling through them in turn. Requests are sequential because
+// they are timed; a concurrent burst would let the identifiers contend for one
+// connection.
+func sampleInterleaved(ctx context.Context, client *http.Client, target *url.URL, req Request, known, unknown, control string, echoes []string) (knownSamples, unknownSamples, controlSamples []enumSample) {
+	// Each pass sends one request per identifier, in a fixed order, so drift
+	// during the run lands on all three groups alike.
+	for i := 0; i < enumerationSamples; i++ {
+		if s, ok := sampleOnce(ctx, client, target, req, known, echoes); ok {
+			knownSamples = append(knownSamples, s)
+		}
+		if s, ok := sampleOnce(ctx, client, target, req, unknown, echoes); ok {
+			unknownSamples = append(unknownSamples, s)
+		}
+		if s, ok := sampleOnce(ctx, client, target, req, control, echoes); ok {
+			controlSamples = append(controlSamples, s)
+		}
+	}
+	return knownSamples, unknownSamples, controlSamples
+}
+
+// sampleOnce sends one request for identifier and records its timing and its
+// echo-free body length.
+func sampleOnce(ctx context.Context, client *http.Client, target *url.URL, req Request, identifier string, echoes []string) (enumSample, bool) {
 	fields := buildFields(req.identifierField(), identifier, req.ExtraFields)
 	res, err := submit(ctx, client, target, req.method(), req.contentType(), fields, req.Headers, "")
 	if err != nil {
@@ -454,10 +589,34 @@ func sampleOnce(ctx context.Context, client *http.Client, target *url.URL, req R
 	}
 	return enumSample{
 		status:  res.StatusCode,
-		length:  len(res.Body),
+		length:  bodyLengthWithoutEchoes(res.Body, echoes),
 		latency: res.Latency,
 		suspect: res.Header.Get(netgov.SuspectHeader) != "",
 	}, true
+}
+
+// bodyLengthWithoutEchoes returns the length of body after removing every
+// occurrence of the given identifiers, both as sent and URL-escaped. The escaped
+// form matters because a form-encoded echo is escaped (@ becomes %40).
+func bodyLengthWithoutEchoes(body string, identifiers []string) int {
+	// Strip each identifier in both its literal and escaped spelling.
+	for _, id := range identifiers {
+		if id == "" {
+			continue
+		}
+		body = strings.ReplaceAll(body, id, "")
+		body = strings.ReplaceAll(body, url.QueryEscape(id), "")
+	}
+	return len(body)
+}
+
+// lengthsOf returns the echo-free body lengths of samples as floats.
+func lengthsOf(s []enumSample) []float64 {
+	out := make([]float64, len(s))
+	for i := range s {
+		out[i] = float64(s[i].length)
+	}
+	return out
 }
 
 // uniformStatus returns the status shared by every sample, or -1 when the
@@ -528,25 +687,53 @@ var csrfModule = moduleDef{
 	run: runCSRFModule,
 }
 
-// csrfFieldRe matches a hidden input whose name reads as a CSRF/authenticity
-// token -- covers the field-name conventions of Rails, Django, and most
-// hand-rolled implementations.
-var csrfFieldRe = regexp.MustCompile(`(?i)<input[^>]+name=["']([^"']*(?:csrf|_token|authenticity_token)[^"']*)["']`)
+// Patterns for hasCSRFToken. Tags are found first, then their attributes are
+// checked on their own, so attribute order does not matter.
+var (
+	inputTagRe       = regexp.MustCompile(`(?is)<input\b[^>]*>`)
+	metaTagRe        = regexp.MustCompile(`(?is)<meta\b[^>]*>`)
+	hiddenTypeRe     = regexp.MustCompile(`(?i)\btype\s*=\s*["']?hidden\b`)
+	tokenInputNameRe = regexp.MustCompile(`(?i)\bname\s*=\s*["']?(?:[^"'\s>]*(?:csrf|xsrf|authenticity[_-]?token|requestverificationtoken|antiforgery)[^"'\s>]*|_token)(?:["'\s>/]|$)`)
+	tokenMetaNameRe  = regexp.MustCompile(`(?i)\bname\s*=\s*["']?[^"'\s>]*(?:csrf|xsrf)[^"'\s>]*`)
+)
+
+// hasCSRFToken reports whether a page carries an anti-CSRF token a form could
+// submit: a hidden input with a token-like name, or a token <meta> that a script
+// reads and sends as a header. A visible input named "csrf_note", or a hidden
+// access_token, is not a token. csrf-param and csrf-header metas name the field
+// or header, not the token, so they are ignored.
+func hasCSRFToken(body string) bool {
+	// A hidden input is a token only if its name reads as one.
+	for _, tag := range inputTagRe.FindAllString(body, -1) {
+		if hiddenTypeRe.MatchString(tag) && tokenInputNameRe.MatchString(tag) {
+			return true
+		}
+	}
+	// A token meta counts only when its name is a token and not a param or header.
+	for _, tag := range metaTagRe.FindAllString(body, -1) {
+		lower := strings.ToLower(tag)
+		if tokenMetaNameRe.MatchString(tag) && !strings.Contains(lower, "param") && !strings.Contains(lower, "header") {
+			return true
+		}
+	}
+	return false
+}
 
 func runCSRFModule(ctx context.Context, client *http.Client, _ *url.URL, req Request, _ string, _ *httpResult) []Finding {
-	res, err := fetchForm(ctx, client, req.FormURL)
+	res, err := fetchForm(ctx, client, req.FormURL, req.Headers)
 	if err != nil {
 		return nil
 	}
-	if csrfFieldRe.MatchString(res.Body) {
+	if hasCSRFToken(res.Body) {
 		return nil
 	}
 	return []Finding{{
 		Label:      "No CSRF-token-looking field found on the reset form",
-		Detail:     "Checked " + req.FormURL + " for a hidden input named like a CSRF/authenticity token and found none -- confirm the form isn't relying on a header-based token this static check can't see before treating this as confirmed.",
+		Detail:     "Checked " + req.FormURL + " for a hidden input named like a CSRF/authenticity token, and for a token meta tag, and found neither -- confirm the form isn't relying on a header-based token this static check can't see before treating this as confirmed.",
 		Method:     "GET",
 		StatusCode: res.StatusCode,
 		Request:    &res.Request,
+		Confidence: ConfidenceHeuristic,
 	}}
 }
 
@@ -562,10 +749,37 @@ var formSecurityModule = moduleDef{
 	run: runFormSecurityModule,
 }
 
-var sameSiteRe = regexp.MustCompile(`(?i)samesite=([a-z]+)`)
+// parseCookieFlags reads the name and the Secure, HttpOnly, and SameSite
+// attributes of one Set-Cookie header. Each attribute is matched by name in the
+// ";"-separated list, so a cookie value that contains the word "secure" is not
+// read as the flag.
+func parseCookieFlags(raw string) (name string, secure, httpOnly bool, sameSite string) {
+	parts := strings.Split(raw, ";")
+	name = parts[0]
+	if i := strings.Index(name, "="); i >= 0 {
+		name = name[:i]
+	}
+	name = strings.TrimSpace(name)
+	// Each segment after the first is an attribute; read its name and value.
+	for _, p := range parts[1:] {
+		key, val := p, ""
+		if i := strings.Index(p, "="); i >= 0 {
+			key, val = p[:i], p[i+1:]
+		}
+		switch strings.ToLower(strings.TrimSpace(key)) {
+		case "secure":
+			secure = true
+		case "httponly":
+			httpOnly = true
+		case "samesite":
+			sameSite = strings.ToLower(strings.TrimSpace(val))
+		}
+	}
+	return name, secure, httpOnly, sameSite
+}
 
 func runFormSecurityModule(ctx context.Context, client *http.Client, _ *url.URL, req Request, _ string, _ *httpResult) []Finding {
-	res, err := fetchForm(ctx, client, req.FormURL)
+	res, err := fetchForm(ctx, client, req.FormURL, req.Headers)
 	if err != nil {
 		return nil
 	}
@@ -579,6 +793,7 @@ func runFormSecurityModule(ctx context.Context, client *http.Client, _ *url.URL,
 			Method:     "GET",
 			StatusCode: res.StatusCode,
 			Request:    &res.Request,
+			Confidence: ConfidenceLikely,
 		})
 	}
 
@@ -586,19 +801,17 @@ func runFormSecurityModule(ctx context.Context, client *http.Client, _ *url.URL,
 	// one missing Secure/HttpOnly/SameSite is worth flagging on its own,
 	// regardless of how many other cookies on the same page are fine.
 	for _, cookie := range res.Header.Values("Set-Cookie") {
-		lower := strings.ToLower(cookie)
-		name := cookie
-		if i := strings.Index(cookie, "="); i > 0 {
-			name = cookie[:i]
-		}
+		name, secure, httpOnly, sameSite := parseCookieFlags(cookie)
 		var missing []string
-		if !strings.Contains(lower, "secure") {
+		if !secure {
 			missing = append(missing, "Secure")
 		}
-		if !strings.Contains(lower, "httponly") {
+		if !httpOnly {
 			missing = append(missing, "HttpOnly")
 		}
-		if m := sameSiteRe.FindStringSubmatch(lower); m == nil || m[1] == "none" {
+		// SameSite=None sends the cookie cross-site, the same as no attribute at
+		// all, so only lax and strict count.
+		if sameSite != "lax" && sameSite != "strict" {
 			missing = append(missing, "SameSite=Lax/Strict")
 		}
 		if len(missing) == 0 {
@@ -609,6 +822,7 @@ func runFormSecurityModule(ctx context.Context, client *http.Client, _ *url.URL,
 			Method:     "GET",
 			StatusCode: res.StatusCode,
 			Request:    &res.Request,
+			Confidence: ConfidenceLikely,
 		})
 	}
 	return out

@@ -28,8 +28,28 @@ var (
 	// looks like an API path even when no recognized call wraps it --
 	// requires an /api/, /v1-v9/, or /graphql-style segment so this doesn't
 	// match every relative asset path in the bundle.
-	genericAPIPathPattern = regexp.MustCompile(`["'](/(?:api|v[1-9])[a-zA-Z0-9_\-./{}]*)["']`)
+	genericAPIPathPattern = regexp.MustCompile(`["'](/(?:api|v[1-9]|graphql|rest/|rpc/)[a-zA-Z0-9_\-./{}]*)["']`)
 	templateVarPattern    = regexp.MustCompile(`\$\{\s*([A-Za-z_$][A-Za-z0-9_.$]*)\s*\}`)
+	// memberCallPattern catches verb calls on a conventionally-named HTTP
+	// client (this.http.get<T>('/x'), api.post('/x'), ...) that none of the
+	// explicit call shapes above recognizes. The verb is the method. The
+	// group after the path is a bounded window rather than a brace-matched
+	// options object, because RE2 can't balance braces: a nested
+	// `params: {...}` would otherwise be cut at its own closing brace. Keys
+	// read from the window are best-effort and can spill into a neighbouring
+	// call that sits within it.
+	memberCallPattern = regexp.MustCompile("(?s)(?:http|api|client|axios|ky|request|service|apiClient|\\$http)\\.(get|post|put|patch|delete)(?:<[^>]*>)?\\(\\s*[`'\"]([^`'\"]+)[`'\"](.{0,300})")
+	// newRequestPattern catches the Fetch API's Request constructor, whose method
+	// lives in the options object (GET when none is given).
+	newRequestPattern = regexp.MustCompile("(?s)new\\s+Request\\(\\s*[`'\"]([^`'\"]+)[`'\"]\\s*(,\\s*\\{(.{0,600}?)\\})?")
+	// beaconPattern catches navigator.sendBeacon(url, ...), which is always a POST.
+	beaconPattern = regexp.MustCompile("sendBeacon\\(\\s*[`'\"]([^`'\"]+)[`'\"]")
+	// paramsFieldPattern catches axios-style `params: { ... }` config, the
+	// query-string half of a request.
+	paramsFieldPattern = regexp.MustCompile(`(?s)params\s*:\s*\{(.{0,300}?)\}`)
+	// baseVarPattern matches a path that starts with a base-URL variable
+	// (`${API_URL}/users`, `${this.baseUrl}/users`), capturing the path after it.
+	baseVarPattern = regexp.MustCompile(`(?i)^\{[a-z0-9_.]*(?:base|api|host|origin|server|endpoint|url|domain|root|gateway|backend)[a-z0-9_.]*\}(/.*)$`)
 )
 
 // mineJS scans every downloaded script for fetch/axios/$.ajax/XHR calls and
@@ -40,7 +60,10 @@ var (
 // comment for the confirmed/uncertain split).
 func mineJS(scripts []scriptFile, t *Target) []Route {
 	found := map[string]*Route{}
-	add := func(method, rawPath string, bodyKeys, headerKeys []string) {
+	// add records one mined call. bodyKeys, headerKeys and queryKeys are the
+	// request's body fields, headers and axios-style params, when the call
+	// shows them. Routes are deduped on method+normalized path.
+	add := func(method, rawPath string, bodyKeys, headerKeys, queryKeys []string) {
 		resolved := resolveJSPath(t, rawPath)
 		if resolved == nil {
 			return
@@ -56,6 +79,9 @@ func mineJS(scripts []scriptFile, t *Target) []Route {
 		for _, q := range queryParamNames(resolved.RawQuery) {
 			r.Params = mergeParams(r.Params, []Param{flagParam(Param{Name: q, Location: LocationQuery})})
 		}
+		for _, k := range queryKeys {
+			r.Params = mergeParams(r.Params, []Param{flagParam(Param{Name: k, Location: LocationQuery})})
+		}
 		for _, k := range bodyKeys {
 			r.Params = mergeParams(r.Params, []Param{flagParam(Param{Name: k, Location: LocationBody})})
 		}
@@ -64,17 +90,19 @@ func mineJS(scripts []scriptFile, t *Target) []Route {
 		}
 	}
 
+	// Each pattern below is one call shape; they all feed add so a route mined
+	// two ways becomes one route with the union of its params.
 	for _, s := range scripts {
 		text := string(s.Body)
 
 		for _, m := range fetchCallPattern.FindAllStringSubmatch(text, -1) {
 			opts := m[3]
 			method := firstMatch(methodFieldPattern, opts, "GET")
-			add(strings.ToUpper(method), m[1], objectKeys(bodyFieldPattern, opts), objectKeys(headersFieldPattern, opts))
+			add(strings.ToUpper(method), m[1], objectKeys(bodyFieldPattern, opts), objectKeys(headersFieldPattern, opts), objectKeys(paramsFieldPattern, opts))
 		}
 		for _, m := range axiosMethodPattern.FindAllStringSubmatch(text, -1) {
 			opts := m[4]
-			add(strings.ToUpper(m[1]), m[2], objectKeys(bodyFieldPattern, opts), objectKeys(headersFieldPattern, opts))
+			add(strings.ToUpper(m[1]), m[2], objectKeys(bodyFieldPattern, opts), objectKeys(headersFieldPattern, opts), objectKeys(paramsFieldPattern, opts))
 		}
 		for _, m := range axiosObjectPattern.FindAllStringSubmatch(text, -1) {
 			opts := m[1]
@@ -82,7 +110,7 @@ func mineJS(scripts []scriptFile, t *Target) []Route {
 			if path == "" {
 				continue
 			}
-			add(strings.ToUpper(firstMatch(methodFieldPattern, opts, "GET")), path, objectKeys(bodyFieldPattern, opts), objectKeys(headersFieldPattern, opts))
+			add(strings.ToUpper(firstMatch(methodFieldPattern, opts, "GET")), path, objectKeys(bodyFieldPattern, opts), objectKeys(headersFieldPattern, opts), objectKeys(paramsFieldPattern, opts))
 		}
 		for _, m := range ajaxPattern.FindAllStringSubmatch(text, -1) {
 			opts := m[1]
@@ -90,16 +118,27 @@ func mineJS(scripts []scriptFile, t *Target) []Route {
 			if path == "" {
 				continue
 			}
-			add(strings.ToUpper(firstMatch(methodFieldPattern, opts, "GET")), path, objectKeys(bodyFieldPattern, opts), objectKeys(headersFieldPattern, opts))
+			add(strings.ToUpper(firstMatch(methodFieldPattern, opts, "GET")), path, objectKeys(bodyFieldPattern, opts), objectKeys(headersFieldPattern, opts), objectKeys(paramsFieldPattern, opts))
+		}
+		for _, m := range memberCallPattern.FindAllStringSubmatch(text, -1) {
+			window := m[3]
+			add(strings.ToUpper(m[1]), m[2], objectKeys(bodyFieldPattern, window), objectKeys(headersFieldPattern, window), objectKeys(paramsFieldPattern, window))
+		}
+		for _, m := range newRequestPattern.FindAllStringSubmatch(text, -1) {
+			opts := m[3]
+			add(strings.ToUpper(firstMatch(methodFieldPattern, opts, "GET")), m[1], objectKeys(bodyFieldPattern, opts), objectKeys(headersFieldPattern, opts), nil)
+		}
+		for _, m := range beaconPattern.FindAllStringSubmatch(text, -1) {
+			add("POST", m[1], nil, nil, nil)
 		}
 		for _, m := range xhrOpenPattern.FindAllStringSubmatch(text, -1) {
-			add(strings.ToUpper(m[1]), m[2], nil, nil)
+			add(strings.ToUpper(m[1]), m[2], nil, nil, nil)
 		}
 		for _, m := range genericAPIPathPattern.FindAllStringSubmatch(text, -1) {
 			// add() dedupes on its own normalized method+path key (resolved
 			// and template-normalized), which a raw match here hasn't been
 			// through yet -- no need to pre-check before calling it.
-			add("GET", m[1], nil, nil)
+			add("GET", m[1], nil, nil, nil)
 		}
 	}
 
@@ -117,6 +156,12 @@ func mineJS(scripts []scriptFile, t *Target) []Route {
 // prefix, e.g. bare `${base}`).
 func resolveJSPath(t *Target, raw string) *url.URL {
 	raw = templateVarPattern.ReplaceAllString(raw, "{$1}")
+	// A leading base-URL variable is the host, not part of the path: strip it so
+	// `${API_URL}/users` resolves to /users. Any other leading variable still
+	// stops resolution, since its value is unknown.
+	if m := baseVarPattern.FindStringSubmatch(raw); m != nil {
+		raw = m[1]
+	}
 	if raw == "" || strings.HasPrefix(raw, "{") {
 		return nil
 	}

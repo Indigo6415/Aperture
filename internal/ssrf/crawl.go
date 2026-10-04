@@ -42,6 +42,9 @@ type crawlQueuedPage struct {
 // rather than just folding their names into the flat candidate-parameter set
 // tested against the page they were found on.
 type formTarget struct {
+	// name, when set, labels the target by what it is (a known product
+	// endpoint) instead of by its method and path.
+	name   string
 	method string
 	url    *url.URL
 	params []string

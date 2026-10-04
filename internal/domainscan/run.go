@@ -65,6 +65,8 @@ func RunScanStreaming(ctx context.Context, rawTarget string, opts Options, onMod
 		return nil, fmt.Errorf("domainscan: target is required")
 	}
 	t := ResolveTarget(rawTarget)
+	// One crawl per scan: every module that needs the site's scripts shares it.
+	ctx = withCrawlMemo(ctx)
 
 	rep := scanprogress.Or(opts.Progress)
 	checks := make([]scanprogress.Check, len(registeredModules))

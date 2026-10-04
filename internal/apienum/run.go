@@ -40,6 +40,7 @@ func RunScanStreaming(ctx context.Context, rawTarget string, opts Options, onPha
 		conc = defaultConcurrency
 	}
 	client := newClient(conc, newLimiter(opts.RateLimit), opts.Headers)
+	client.allowWrites = opts.AllowWriteMethods
 
 	phase := func(name string, done, total int) {
 		if onPhase != nil {
@@ -87,7 +88,7 @@ func RunScanStreaming(ctx context.Context, rawTarget string, opts Options, onPha
 
 	return &Result{
 		Target: t, Schema: schema, GraphQL: graphql, Routes: characterized,
-		InjectionPoints: injectionPoints, Stats: computeStats(characterized, injectionPoints),
+		InjectionPoints: injectionPoints, Stats: computeStats(characterized, injectionPoints, client.sent.Load()),
 	}, nil
 }
 
@@ -210,16 +211,17 @@ func sourceRank(s string) int {
 }
 
 // computeStats tallies Result.Stats from the finished route/injection-point
-// lists.
-func computeStats(routes []Route, points []InjectionPoint) Stats {
-	s := Stats{RoutesFound: len(routes), InjectionPoints: len(points)}
+// lists. requests is the number of requests the run's client actually sent,
+// which is the figure RequestsSent reports -- a count of method probes would
+// leave out discovery, brute forcing, and the auth and parameter sweeps.
+func computeStats(routes []Route, points []InjectionPoint, requests int64) Stats {
+	s := Stats{RoutesFound: len(routes), InjectionPoints: len(points), RequestsSent: int(requests)}
 	for _, r := range routes {
 		if r.Confirmed {
 			s.ConfirmedRoutes++
 		} else {
 			s.UncertainRoutes++
 		}
-		s.RequestsSent += len(r.Methods)
 	}
 	return s
 }

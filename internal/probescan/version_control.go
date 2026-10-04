@@ -63,6 +63,18 @@ var versionControlModule = moduleDef{
 			{"/.svn/entries", "SVN entries file", validSVNEntries},
 			{"/.svn/wc.db", "SVN working copy database", validSQLiteDB},
 			{"/.hg/hgrc", "Mercurial config", validHgRC},
+			{"/.hg/requires", "Mercurial requirements file", validRegexp(hgRequiresLine)},
+			// Git object-store files. Each is a line format that no HTML page
+			// produces, so a catch-all page cannot pass.
+			{"/.git/info/refs", "Git advertised refs", validRegexp(gitInfoRefLine)},
+			{"/.git/FETCH_HEAD", "Git fetch log", validRegexp(gitFetchHeadLine)},
+			{"/.git/ORIG_HEAD", "Git original HEAD", validRegexp(gitSHALine)},
+			{"/.git/refs/heads/main", "Git branch ref", validRegexp(gitSHALine)},
+			{"/.git/refs/heads/master", "Git branch ref", validRegexp(gitSHALine)},
+			// CVS metadata: a CVSROOT line and an Entries record, each with a
+			// format that prose and HTML do not produce.
+			{"/CVS/Root", "CVS root file", validRegexp(cvsRootLine)},
+			{"/CVS/Entries", "CVS entries file", validRegexp(cvsEntriesLine)},
 		}
 		// Plain-text checks: the file is text, but nothing else about it can
 		// be verified, so these findings are reported as "likely".
@@ -78,8 +90,6 @@ var versionControlModule = moduleDef{
 			{"/.hg/store/fncache", "Mercurial file cache", validPlainText},
 			{"/.hgignore", "Mercurial ignore file", validPlainText},
 			{"/.bzrignore", "Bazaar ignore file", validPlainText},
-			{"/CVS/Root", "CVS root file", notHTML(containsCase(":"))},
-			{"/CVS/Entries", "CVS entries file", notHTML(containsCase("/"))},
 		}
 
 		findings := runFileChecks(ctx, c, t.URL, strong, ConfidenceConfirmed)

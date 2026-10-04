@@ -35,6 +35,51 @@ type csrfScanRequest struct {
 	APIURL    string `json:"apiUrl,omitempty"`
 	APIMethod string `json:"apiMethod,omitempty"`
 	APIBody   string `json:"apiBody,omitempty"`
+
+	// TokenProbe optionally requests the token-enforcement check, which sends
+	// state-changing requests to one named form endpoint. It only runs when
+	// the request also sets Confirm -- see csrfTokenProbeRequest.
+	TokenProbe *csrfTokenProbeRequest `json:"tokenProbe,omitempty"`
+}
+
+// csrfTokenProbeRequest is the wire shape of csrf.TokenProbe. Confirm is the
+// operator's explicit acknowledgement that the check replays the form with the
+// token removed, emptied and tampered, so it has real effects on the target.
+// Without it the handler refuses the request rather than silently skipping.
+type csrfTokenProbeRequest struct {
+	URL     string `json:"url"`
+	Method  string `json:"method,omitempty"`
+	Body    string `json:"body"`
+	Field   string `json:"field"`
+	Confirm bool   `json:"confirm"`
+}
+
+// csrfTokenProbeMethods are the methods the token check will send. A form
+// submission is a POST in nearly every case; the others cover REST-style forms.
+var csrfTokenProbeMethods = map[string]bool{"POST": true, "PUT": true, "PATCH": true, "DELETE": true}
+
+// tokenProbeFor validates a token-probe request and converts it to the csrf
+// package's type. A nil request means the operator did not ask for the check.
+// Any other incomplete or unconfirmed request is an error, so the scan never
+// starts with a half-specified state-changing probe.
+func tokenProbeFor(in *csrfTokenProbeRequest) (*csrf.TokenProbe, error) {
+	if in == nil || strings.TrimSpace(in.URL) == "" {
+		return nil, nil
+	}
+	if !in.Confirm {
+		return nil, fmt.Errorf("tokenProbe sends state-changing requests to %s; set confirm to true to run it", in.URL)
+	}
+	if strings.TrimSpace(in.Field) == "" || strings.TrimSpace(in.Body) == "" {
+		return nil, fmt.Errorf("tokenProbe needs both the form body and the name of its token field")
+	}
+	method := strings.ToUpper(strings.TrimSpace(in.Method))
+	if method == "" {
+		method = "POST"
+	}
+	if !csrfTokenProbeMethods[method] {
+		return nil, fmt.Errorf("tokenProbe method %q is not one of POST, PUT, PATCH, DELETE", in.Method)
+	}
+	return &csrf.TokenProbe{URL: strings.TrimSpace(in.URL), Method: method, Body: in.Body, Field: strings.TrimSpace(in.Field)}, nil
 }
 
 // csrfScanTimeout is more generous than the other new scanners' handler
@@ -62,6 +107,28 @@ func (s *Server) handleCSRF(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("url is required"))
 		return
 	}
+	tokenProbe, err := tokenProbeFor(req.TokenProbe)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	// The optional endpoints are named by the operator, not crawled, so they
+	// must be checked against the case scope here. netgov enforces scope on
+	// every real request as well, but refusing early gives a clear 400.
+	scope, err := s.scopeFor(req.CaseID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	named := []string{req.APIURL}
+	if tokenProbe != nil {
+		named = append(named, tokenProbe.URL)
+	}
+	if err := checkTargetsInScope(scope, named...); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 
 	if req.CredentialID != "" {
 		cred, err := s.store.GetCredential(req.CredentialID)
@@ -87,7 +154,8 @@ func (s *Server) handleCSRF(w http.ResponseWriter, r *http.Request) {
 			resp, err := csrf.Run(ctx, csrf.Request{
 				URL: req.URL, RecursionDepth: req.RecursionDepth, MaxPages: req.MaxPages, Headers: req.Headers,
 				APIURL: req.APIURL, APIMethod: req.APIMethod, APIBody: req.APIBody,
-				Progress: rep,
+				TokenProbe: tokenProbe,
+				Progress:   rep,
 			})
 			if err != nil {
 				return scanOutcome{}, err

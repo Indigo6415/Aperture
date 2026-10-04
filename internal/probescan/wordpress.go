@@ -2,41 +2,51 @@ package probescan
 
 import (
 	"context"
+	"regexp"
 	"strings"
 )
 
-// wordpressChecks ports wordpress.py's CHECKS table.
+// wordpressChecks ports wordpress.py's CHECKS table. Config backups and the
+// debug log are not listed here: sensitive_files judges those files by their
+// content, so keeping them here as well would report one file twice.
 var wordpressChecks = []pathCheck{
-	{"/wp-json/wp/v2/users", "WordPress REST API user enumeration", containsAll("[", "slug")},
-	{"/?author=1", "WordPress author enumeration", nil}, // special-cased below (checks the final URL, not the body)
-	{"/wp-content/debug.log", "WordPress debug log", containsAny("php", "error", "warning")},
-	{"/wp-content/uploads/", "WordPress uploads directory listing", containsAny("index of")},
-	{"/wp-config.php~", "WordPress config backup", containsCase("DB_")},
-	{"/wp-config.php.bak", "WordPress config backup", containsCase("DB_")},
-	{"/wp-config.php.old", "WordPress config backup", containsCase("DB_")},
-	{"/wp-config.php.save", "WordPress config backup", containsCase("DB_")},
-	{"/wp-config.bak", "WordPress config backup", containsCase("DB_")},
-	{"/xmlrpc.php", "WordPress XML-RPC enabled", containsAll("xml", "rpc")},
-	{"/readme.html", "WordPress readme exposes version", containsAny("wordpress")},
-	{"/license.txt", "WordPress license file", containsAny("wordpress")},
-	{"/wp-admin/install.php", "WordPress install page accessible", containsAny("installation", "wordpress")},
-	{"/wp-admin/upgrade.php", "WordPress upgrade page accessible", containsAny("wordpress")},
-	{"/wp-content/plugins/", "WordPress plugins directory listing", containsAny("index of")},
-	{"/wp-content/themes/", "WordPress themes directory listing", containsAny("index of")},
+	{"/wp-json/wp/v2/users", "WordPress REST API user enumeration", validJSONArrayHasKey("slug")},
+	{"/?rest_route=/wp/v2/users", "WordPress REST API user enumeration", validJSONArrayHasKey("slug")},
+	{"/wp-content/uploads/", "WordPress uploads directory listing", isDirectoryListing},
+	{"/wp-content/plugins/", "WordPress plugins directory listing", isDirectoryListing},
+	{"/wp-content/themes/", "WordPress themes directory listing", isDirectoryListing},
+	{"/wp-includes/", "WordPress includes directory listing", isDirectoryListing},
+	{"/wp-content/backup-db/", "WordPress database backup directory listing", isDirectoryListing},
+	{"/wp-content/backups/", "WordPress backups directory listing", isDirectoryListing},
+	{"/xmlrpc.php", "WordPress XML-RPC enabled", containsAny("xml-rpc server accepts post requests only")},
+	{"/readme.html", "WordPress readme exposes version", containsAll("wordpress", "readme")},
+	{"/license.txt", "WordPress license file", containsAll("wordpress", "gnu general public license")},
+	{"/wp-admin/install.php", "WordPress install page accessible", containsAll("wordpress", "installation")},
+	{"/wp-admin/upgrade.php", "WordPress upgrade page accessible", containsAll("wordpress", "upgrade")},
 }
 
+// wpMarker matches the markup that only a WordPress front end emits: its
+// content and include directories, its REST API link, or its generator tag.
+var wpMarker = regexp.MustCompile(`(?i)wp-content/|wp-includes/|wp-json|<meta name="generator" content="wordpress`)
+
+// authorSlug captures the author slug from a redirected author archive URL.
+var authorSlug = regexp.MustCompile(`/author/([^/?#]+)`)
+
+// isWordPress reports whether the homepage carries a WordPress marker. The bare
+// word "wordpress" is not used: blogs and articles mention it constantly.
 func isWordPress(ctx context.Context, t *Target, c *probeClient) bool {
 	r, err := c.get(ctx, t.URL, true)
 	if err != nil {
 		return false
 	}
-	body := r.textLower()
-	return strings.Contains(body, "wp-content") || strings.Contains(body, "wp-json") ||
-		strings.Contains(body, "wordpress") || strings.Contains(strings.ToLower(r.Header.Get("X-Powered-By")), "wordpress")
+	return wpMarker.MatchString(r.Text) ||
+		strings.Contains(strings.ToLower(r.Header.Get("X-Powered-By")), "wordpress")
 }
 
 // wordpressModule ports modules/wordpress.py: skips entirely unless the
-// target's homepage looks like WordPress.
+// target's homepage looks like WordPress. Every path check runs through the
+// catch-all gate, so a host that answers each path with the same page reports
+// nothing.
 var wordpressModule = moduleDef{
 	id:       "wordpress",
 	name:     "WordPress",
@@ -46,28 +56,18 @@ var wordpressModule = moduleDef{
 			return nil
 		}
 
-		var findings []Finding
-		for _, chk := range wordpressChecks {
-			url := t.URL + chk.path
-			r, err := c.get(ctx, url, false)
-			if err != nil || r.StatusCode != 200 {
-				continue
-			}
-			if chk.path == "/?author=1" {
-				// Author enumeration is detected by WordPress redirecting
-				// the request to /?author=1 landing on an author-slug URL,
-				// not by anything in the body -- mirrors the Python
-				// check's `"author" in r.url.lower()`.
-				if strings.Contains(strings.ToLower(r.FinalURL), "author") {
-					findings = append(findings, Finding{
-						Label: chk.label + " at " + url, URL: url, Method: "GET", StatusCode: r.StatusCode,
-						Detail: "Requesting `/?author=1` redirected to " + r.FinalURL + ", which names an author's login slug",
-					})
-				}
-				continue
-			}
-			if chk.valid(r) {
-				findings = append(findings, Finding{Label: chk.label + " at " + url, URL: url, Method: "GET", StatusCode: r.StatusCode})
+		findings := runPathChecks(ctx, c, t.URL, wordpressChecks, false, "at")
+
+		// Author enumeration: /?author=1 redirects to /author/<slug>/ on a
+		// WordPress that leaks its usernames. The redirect is only visible when
+		// the request follows it, so this check must follow.
+		authorURL := t.URL + "/?author=1"
+		if r, err := c.get(ctx, authorURL, true); err == nil && r.StatusCode == 200 && !c.isCatchAll(r) {
+			if m := authorSlug.FindStringSubmatch(r.FinalURL); m != nil {
+				findings = append(findings, Finding{
+					Label: "WordPress author enumeration at " + authorURL, URL: authorURL, Method: "GET", StatusCode: r.StatusCode,
+					Detail: "Requesting `/?author=1` redirected to " + r.FinalURL + ", which names an author's login slug (\"" + m[1] + "\")",
+				})
 			}
 		}
 

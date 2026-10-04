@@ -14,6 +14,7 @@ import { useAutoCollapseOnce, useCollapsible } from '../collapsible'
 import { inputBase } from '../formStyles'
 import { SEVERITY_META, SEVERITY_ORDER } from '../severityColor'
 import { CopyButton } from './CopyButton'
+import { StatusBadge } from './FindingBadges'
 import { SendToTesterButton } from './SendToTesterButton'
 import { copyToClipboard, useContextMenu } from '../contextMenu'
 import { sendToBypass403 } from '../bypass403Handoff'
@@ -474,6 +475,7 @@ function FindingRow({ finding }: { finding: ProbeFinding }) {
         className={`flex items-start gap-2 ${hasExpandable ? 'cursor-pointer' : ''}`}
       >
         {hasExpandable && <span className="mt-0.5 shrink-0 text-neutral-600">{expanded ? '▾' : '▸'}</span>}
+        <StatusBadge code={finding.statusCode} />
         <div className="min-w-0 flex-1">
           <p className="break-all text-neutral-300">{finding.label}</p>
           {finding.detail && <p className="mt-0.5 text-neutral-600">{finding.detail}</p>}

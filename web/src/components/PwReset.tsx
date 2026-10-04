@@ -9,6 +9,7 @@ import { ScanHistoryPanel } from './ScanHistoryPanel'
 import { ScanWindowTabs } from './ScanWindowTabs'
 import { latestByTarget, loadCaseScans } from '../scanHistory'
 import { CopyButton } from './CopyButton'
+import { StatusBadge } from './FindingBadges'
 import { useAutoCollapseOnce, useCollapsible } from '../collapsible'
 import { inputBase } from '../formStyles'
 import { toAbsoluteUrl } from '../url'
@@ -517,6 +518,7 @@ function FindingRow({ finding }: { finding: PwResetFinding }) {
         className={`flex items-start gap-2 ${hasExpandable ? 'cursor-pointer' : ''}`}
       >
         {hasExpandable && <span className="mt-0.5 shrink-0 text-neutral-600">{expanded ? '▾' : '▸'}</span>}
+        <StatusBadge code={finding.statusCode} />
         <div className="min-w-0 flex-1">
           <p className="break-all text-neutral-300">{finding.label}</p>
           {finding.detail && <p className="mt-0.5 text-neutral-600">{finding.detail}</p>}

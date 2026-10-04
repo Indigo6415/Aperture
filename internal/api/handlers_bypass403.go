@@ -27,6 +27,10 @@ type bypass403Request struct {
 	// CaseID optionally scopes this run to a case -- see
 	// secretScanRequest.CaseID's doc comment.
 	CaseID string `json:"caseId,omitempty"`
+	// AllowWriteMethods opts into the PUT, PATCH and DELETE method attempts.
+	// Off by default because those can change or delete data on the target --
+	// see bypass403.Options.AllowWriteMethods.
+	AllowWriteMethods bool `json:"allowWriteMethods,omitempty"`
 }
 
 // bypass403Timeout bounds a full run: one baseline request plus ~30
@@ -78,7 +82,7 @@ func (s *Server) handleBypass403(w http.ResponseWriter, r *http.Request) {
 		tool:    "bypass403",
 		timeout: bypass403Timeout,
 		run: func(ctx context.Context, rep scanprogress.Reporter) (scanOutcome, error) {
-			resp, err := bypass403.Run(ctx, req.URL, bypass403.Options{Headers: req.Headers, Progress: rep})
+			resp, err := bypass403.Run(ctx, req.URL, bypass403.Options{Headers: req.Headers, AllowWriteMethods: req.AllowWriteMethods, Progress: rep})
 			if err != nil {
 				return scanOutcome{}, err
 			}

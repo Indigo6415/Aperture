@@ -117,8 +117,14 @@ func TestBinaryContentTypesAreSkipped(t *testing.T) {
 // TestOverlappingPatternsDedupeToOneMatch checks that a private key matched
 // by several overlapping patterns is reported once per location.
 func TestOverlappingPatternsDedupeToOneMatch(t *testing.T) {
-	body := "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA\n-----END RSA PRIVATE KEY-----"
+	// The body must be long enough for the key pattern, which now requires a
+	// real body between BEGIN and END; otherwise this test would pass without
+	// checking anything.
+	body := "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEAu7Xp9KqR2mT4vLw8Zs1Hc6Nd0YfGj3Bt5Uo\n-----END RSA PRIVATE KEY-----"
 	matches := ScanBody(body, "https://h/key.pem")
+	if len(matches) == 0 {
+		t.Fatal("private key block was not detected at all")
+	}
 	seen := map[string]int{}
 	for _, m := range matches {
 		seen[m.Fingerprint+"|"+m.Location]++

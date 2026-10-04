@@ -14,6 +14,7 @@ import { DomainScan } from './DomainScan'
 import { SecretScan } from './SecretScan'
 import { BreachCheck } from './BreachCheck'
 import { Bypass403 } from './Bypass403'
+import { GitDump } from './GitDump'
 import { PwReset } from './PwReset'
 import { GraphqlEnum } from './GraphqlEnum'
 import { ApiEnum } from './ApiEnum'
@@ -69,6 +70,7 @@ import {
   IconShieldKey,
   IconSitemap,
   IconTarget,
+  IconGitBranch,
   IconUnlock,
   IconWarning,
   IconWrench,
@@ -116,6 +118,7 @@ type Tab =
   | 'secrets'
   | 'breach'
   | 'bypass403'
+  | 'gitdump'
   | 'pwreset'
   | 'graphqlenum'
   | 'apienum'
@@ -150,6 +153,7 @@ const TAB_META: Record<Tab, { label: string; icon: IconType }> = {
   secrets: { label: 'Secrets', icon: IconLock },
   breach: { label: 'Breach Check', icon: IconKey },
   bypass403: { label: '403 Bypass', icon: IconUnlock },
+  gitdump: { label: 'Git Dump', icon: IconGitBranch },
   pwreset: { label: 'Password Reset', icon: IconMailQuestion },
   graphqlenum: { label: 'GraphQL Enumeration', icon: IconBraces },
   apienum: { label: 'API Enumerator', icon: IconRouteTree },
@@ -194,6 +198,7 @@ const NAV_GROUPS: NavGroup[] = [
       'secrets',
       'breach',
       'bypass403',
+      'gitdump',
       'pwreset',
       'graphqlenum',
       'apienum',
@@ -494,6 +499,7 @@ export function CaseView({ caseId }: { caseId: string }) {
     secrets: STATUS_DOT.done,
     breach: STATUS_DOT.done,
     bypass403: STATUS_DOT.done,
+    gitdump: STATUS_DOT.done,
     pwreset: STATUS_DOT.done,
     graphqlenum: STATUS_DOT.done,
     apienum: STATUS_DOT.done,
@@ -526,6 +532,7 @@ export function CaseView({ caseId }: { caseId: string }) {
     secrets: null,
     breach: null,
     bypass403: null,
+    gitdump: null,
     pwreset: null,
     graphqlenum: null,
     apienum: null,
@@ -817,6 +824,10 @@ export function CaseView({ caseId }: { caseId: string }) {
             <Bypass403 caseId={caseId} targets={targets} credentials={credentials} prefill={bypass403Prefill} />
           </div>
 
+          <div className={`h-full overflow-y-auto ${tab === 'gitdump' ? '' : 'hidden'}`}>
+            <GitDump caseId={caseId} targets={targets} credentials={credentials} />
+          </div>
+
           <div className={`h-full overflow-y-auto ${tab === 'pwreset' ? '' : 'hidden'}`}>
             <PwReset caseId={caseId} targets={targets} credentials={credentials} />
           </div>
@@ -1045,19 +1056,15 @@ function TargetsTab({
     }
   }
 
-  // pingList checks every target in one list and records each verdict. The
-  // results are merged into the existing map, so other lists' results stay.
+  // pingList checks every target in one list and records each verdict as it
+  // arrives, so rows light up one by one rather than all at once at the end.
+  // Each verdict is merged into the existing map, so other lists' results stay.
   const pingList = async (listId: string) => {
     setPinging(true)
     try {
-      const results = await api.pingTargetList(listId)
-      setPingResults((prev) => {
-        const next = { ...prev }
-        // Each result is keyed by its target id so it lands on the right row.
-        for (const r of results) {
-          next[r.targetId] = r
-        }
-        return next
+      await api.pingTargetList(listId, (r) => {
+        // Keyed by target id so the verdict lands on the right row.
+        setPingResults((prev) => ({ ...prev, [r.targetId]: r }))
       })
     } catch (err) {
       showToast(err instanceof Error ? err.message : String(err), 'error')

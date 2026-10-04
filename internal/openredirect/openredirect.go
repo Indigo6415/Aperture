@@ -31,6 +31,8 @@ import (
 	"time"
 
 	"github.com/Indigo6415/Aperture/internal/collaborator"
+	"github.com/Indigo6415/Aperture/internal/netgov"
+	"github.com/Indigo6415/Aperture/internal/paramminer"
 	"github.com/Indigo6415/Aperture/internal/scanprogress"
 )
 
@@ -51,7 +53,24 @@ type Finding struct {
 	// the probe itself, each redirect followed along the way, and the
 	// confirming request to the callback address. See ChainHop.
 	Chain []ChainHop `json:"chain,omitempty"`
+	// Confidence is "confirmed" when the target's own redirect URL carried the
+	// probe's identifier and the callback recorded it. It is "likely" when the
+	// scanner had to build the callback URL itself (the redirect dropped the
+	// identifier), or when the redirect came from a client-side literal in a
+	// 2xx page. In those cases the hit shows the redirect target is reachable,
+	// not that the target sent the visitor there.
+	Confidence string `json:"confidence,omitempty"`
+	// Callback is true when the redirect's callback hit reached Aperture's
+	// collaborator listener, which proves the finding out-of-band. The frontend
+	// shows a CALLBACK tag for it.
+	Callback bool `json:"callback,omitempty"`
 }
+
+// Confidence values for a Finding (see Finding.Confidence).
+const (
+	ConfidenceConfirmed = "confirmed"
+	ConfidenceLikely    = "likely"
+)
 
 // ChainHop is one request on the path from a probe to the callback. Kind is
 // "probe" (the payload request), "redirect" (a followed Location hop short of
@@ -96,8 +115,12 @@ type Request struct {
 	URL string `json:"url"`
 	// Params are extra parameter names to test beyond commonRedirectParams
 	// and whatever URL's own query string already carries.
-	Params  []string          `json:"params,omitempty"`
-	Headers map[string]string `json:"headers,omitempty"`
+	Params []string `json:"params,omitempty"`
+	// MineParams, when true, runs parameter mining (internal/paramminer) against
+	// the GET query of URL and folds every hidden parameter it finds into Params,
+	// so the rest of the run tests them too. Off by default.
+	MineParams bool              `json:"mineParams,omitempty"`
+	Headers    map[string]string `json:"headers,omitempty"`
 	// CallbackBase is a live callback server's bare "host[:port]/path" (no
 	// scheme, no trailing slash -- e.g. "aperture.example.com/collab/deadbeef0123"
 	// or "webhook.site/9f2e1234-…"), built by the HTTP handler either from an
@@ -226,6 +249,12 @@ func Run(ctx context.Context, req Request) (*Result, error) {
 	target, err := parseTarget(req.URL)
 	if err != nil {
 		return nil, err
+	}
+
+	// Parameter mining folds hidden names into req.Params before anything
+	// reads them, so every candidate-building path below picks them up.
+	if req.MineParams {
+		req.Params = append(append([]string{}, req.Params...), paramminer.Names(ctx, target, req.Headers, netgov.NewClient(8*time.Second, false), req.Params)...)
 	}
 
 	// The baseline is informational only: probes and callback confirmation do

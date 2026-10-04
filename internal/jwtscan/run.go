@@ -149,6 +149,7 @@ func RunScan(runCtx context.Context, req ScanRequest, oob OOBConfig) (*ScanRespo
 		scanprogress.Check{ID: "jwk_injection", Label: "jwk header injection"},
 		scanprogress.Check{ID: "kid_injection", Label: "kid header injection"},
 		scanprogress.Check{ID: "claim_tampering", Label: "Claim tampering"},
+		scanprogress.Check{ID: "expired_token", Label: "Expired token acceptance"},
 		scanprogress.Check{ID: "rs256_hs256", Label: "RS256 to HS256 confusion"},
 		scanprogress.Check{ID: "kid_ssrf", Label: "kid Header SSRF"},
 		scanprogress.Check{ID: "jku_injection", Label: "jku Header Injection"},
@@ -188,6 +189,7 @@ func RunScan(runCtx context.Context, req ScanRequest, oob OOBConfig) (*ScanRespo
 			track(rep, "jwk_injection", ctx.testJWKInjection),
 			track(rep, "kid_injection", ctx.testKidInjection),
 			track(rep, "claim_tampering", func() TestResult { return ctx.testClaimTampering(cracked) }),
+			track(rep, "expired_token", func() TestResult { return ctx.testExpiredToken(cracked) }),
 			track(rep, "rs256_hs256", func() TestResult { return ctx.testRS256HS256(req.PubKeyPEM, discoveredKey) }),
 		}, trackOOB(rep, ctx, oob)...),
 	}

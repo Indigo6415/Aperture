@@ -67,6 +67,43 @@ func parseTarget(rawURL string) (*url.URL, error) {
 	return u, nil
 }
 
+// newRequest builds the request for rawURL with its request target written
+// exactly as given. http.NewRequest parses and re-escapes the path, which
+// fails outright on IIS-style "%u2215" escapes and turns a raw backslash into
+// %5C. Both change the bytes a bypass depends on. So the target is handed to
+// net/http as an opaque string, which it sends verbatim.
+//
+// A target that starts with "//" is the one exception: net/http reads a
+// leading "//" in an opaque target as a host, so those go through the normal
+// parser. They never carry the escapes that parser rejects.
+func newRequest(ctx context.Context, method, rawURL string, body io.Reader) (*http.Request, error) {
+	scheme, rest, ok := strings.Cut(rawURL, "://")
+	// Without "://" there is no host to connect to, so the URL is refused.
+	if !ok {
+		return nil, fmt.Errorf("pathtraversal: URL %q has no scheme", rawURL)
+	}
+	// Split the host from the request target at the first "/" or "?".
+	host, target := rest, ""
+	if i := strings.IndexAny(rest, "/?"); i >= 0 {
+		host, target = rest[:i], rest[i:]
+	}
+	// A target that is only a query string is sent as "/?...".
+	if strings.HasPrefix(target, "?") {
+		target = "/" + target
+	}
+	if target == "" || strings.HasPrefix(target, "//") {
+		return http.NewRequestWithContext(ctx, method, rawURL, body)
+	}
+	// The placeholder URL validates the host and sets the Host header. Its
+	// path is then replaced by the raw target.
+	req, err := http.NewRequestWithContext(ctx, method, scheme+"://"+host+"/", body)
+	if err != nil {
+		return nil, err
+	}
+	req.URL.Opaque = target
+	return req, nil
+}
+
 // send issues spec and returns the response. A non-nil sem throttles the
 // request to the scan-wide concurrency limit. The baseline and crawl pass
 // nil, so they are not held back by the probe fan-out.
@@ -91,7 +128,7 @@ func send(ctx context.Context, client *http.Client, sem chan struct{}, spec requ
 	if spec.Body != "" {
 		body = strings.NewReader(spec.Body)
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, spec.Method, spec.URL, body)
+	httpReq, err := newRequest(ctx, spec.Method, spec.URL, body)
 	if err != nil {
 		return &sendResult{Err: err}
 	}

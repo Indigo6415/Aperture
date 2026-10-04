@@ -2,6 +2,7 @@ package probescan
 
 import (
 	"context"
+	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
@@ -37,6 +38,17 @@ func fetchCertificate(ctx context.Context, t *Target) (*x509.Certificate, error)
 		return nil, fmt.Errorf("no certificate presented")
 	}
 	return certs[0], nil
+}
+
+// weakRSABits reports the modulus size of an RSA leaf key when it is below
+// 2048 bits, which current guidance no longer accepts. The size comes from the
+// certificate itself, so no extra request is made. Non-RSA keys report false.
+func weakRSABits(cert *x509.Certificate) (int, bool) {
+	pub, ok := cert.PublicKey.(*rsa.PublicKey)
+	if !ok || pub.N.BitLen() >= 2048 {
+		return 0, false
+	}
+	return pub.N.BitLen(), true
 }
 
 func certHostnameMatches(cert *x509.Certificate, hostname string) bool {
@@ -104,6 +116,12 @@ var certificateModule = moduleDef{
 		if cert.SignatureAlgorithm == x509.MD5WithRSA || cert.SignatureAlgorithm == x509.SHA1WithRSA || cert.SignatureAlgorithm == x509.DSAWithSHA1 || cert.SignatureAlgorithm == x509.ECDSAWithSHA1 {
 			findings = append(findings, Finding{
 				Label: "Certificate uses weak " + cert.SignatureAlgorithm.String() + " signature algorithm",
+			})
+		}
+
+		if bits, weak := weakRSABits(cert); weak {
+			findings = append(findings, Finding{
+				Label: fmt.Sprintf("Certificate uses a weak %d-bit RSA key", bits),
 			})
 		}
 

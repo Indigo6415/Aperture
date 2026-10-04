@@ -1,10 +1,11 @@
 import { useMemo, useState } from 'react'
-import type { CapturedRequest, ChainHop, ProbeSeverity } from '../types'
+import type { CapturedRequest, ChainHop, Confidence, ProbeSeverity } from '../types'
 import { CopyButton } from './CopyButton'
 import { RedirectChain } from './RedirectChain'
 import { SEVERITY_META, SEVERITY_ORDER } from '../severityColor'
 import { sendToTester } from '../testerHandoff'
 import { useContextMenu } from '../contextMenu'
+import { CallbackTag, StatusBadge } from './FindingBadges'
 
 // GenericFinding/GenericModuleResult cover the check-module shape every one
 // of the four scanners added alongside this file (corsscan/openredirect/
@@ -27,6 +28,20 @@ export interface GenericFinding {
   // chain is the timed request path from a probe to its callback. Only
   // open-redirect findings carry one; other scanners leave it unset.
   chain?: ChainHop[]
+  // confidence grades how strongly the check supports the claim; the row shows
+  // it so a "heuristic" lead is not read like a reproduced finding.
+  confidence?: Confidence
+  // callback is true when the target called back to Aperture's collaborator
+  // listener, which proves the finding; the row shows a CALLBACK tag for it.
+  callback?: boolean
+}
+
+// CONFIDENCE_BADGE gives each confidence grade its label and colour in a
+// finding row. Keys match the Go side's confidence strings.
+const CONFIDENCE_BADGE: Record<Confidence, { label: string; className: string }> = {
+  confirmed: { label: 'Confirmed', className: 'border-emerald-700 bg-emerald-950 text-emerald-300' },
+  likely: { label: 'Likely', className: 'border-amber-700 bg-amber-950 text-amber-300' },
+  heuristic: { label: 'Lead', className: 'border-neutral-700 bg-neutral-900 text-neutral-400' },
 }
 
 export interface GenericModuleResult {
@@ -34,6 +49,8 @@ export interface GenericModuleResult {
   name: string
   severity: ProbeSeverity
   findings: GenericFinding[]
+  // skipped, when set, says why the module was deliberately not run at all.
+  skipped?: string
 }
 
 export function totalFindingsOf(modules: GenericModuleResult[]): number {
@@ -107,6 +124,7 @@ function ModuleCard({ module }: { module: GenericModuleResult }) {
       <button onClick={() => setExpanded((v) => !v)} className="flex w-full items-center gap-3 p-4 text-left">
         <div className="min-w-0 flex-1">
           <p className="text-sm font-medium text-neutral-100">{module.name}</p>
+          {module.skipped && <p className="mt-0.5 text-xs text-neutral-500">Not run: {module.skipped}</p>}
         </div>
         <span className={`shrink-0 rounded border px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wide ${meta.badge}`}>{meta.label}</span>
         <span className="shrink-0 text-xs text-neutral-500">
@@ -143,8 +161,19 @@ function FindingRow({ finding }: { finding: GenericFinding }) {
         className={`flex items-start gap-2 ${hasExpandable ? 'cursor-pointer' : ''}`}
       >
         {hasExpandable && <span className="mt-0.5 shrink-0 text-neutral-600">{expanded ? '▾' : '▸'}</span>}
+        <StatusBadge code={finding.statusCode} />
         <div className="min-w-0 flex-1">
-          <p className="break-all text-neutral-300">{finding.label}</p>
+          <p className="break-all text-neutral-300">
+            {finding.label}
+            {finding.callback && <CallbackTag />}
+            {finding.confidence && CONFIDENCE_BADGE[finding.confidence] && (
+              <span
+                className={`ml-2 inline-block rounded border px-1.5 py-px align-middle text-[10px] font-semibold uppercase tracking-wide ${CONFIDENCE_BADGE[finding.confidence].className}`}
+              >
+                {CONFIDENCE_BADGE[finding.confidence].label}
+              </span>
+            )}
+          </p>
           {finding.detail && <p className="mt-0.5 text-neutral-600">{finding.detail}</p>}
         </div>
       </div>

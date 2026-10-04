@@ -33,6 +33,19 @@ func writeBodyParam(b *strings.Builder, name string) {
 // signal.
 var candidateMethods = []string{"GET", "POST", "PUT", "PATCH", "DELETE"}
 
+// isWriteMethod reports whether method changes server state in the way a
+// routine probe should not do by default. PUT, PATCH and DELETE can overwrite
+// or remove data, so they are sent only when the operator opted in. POST is
+// left out on purpose: it is how a route shows it accepts a write at all, and
+// it is what a discovered form submission already uses.
+func isWriteMethod(method string) bool {
+	switch method {
+	case "PUT", "PATCH", "DELETE":
+		return true
+	}
+	return false
+}
+
 // rateLimitHeaderNames is every response header worth surfacing as this
 // route's own rate-limit signal, if the server sends one on an ordinary
 // request -- deliberately observational (see the package doc): this pass
@@ -44,6 +57,11 @@ var rateLimitHeaderNames = []string{
 }
 
 var pathParamPlaceholder = regexp.MustCompile(`\{([A-Za-z0-9_.$]+)\}`)
+
+// signInMarkers are substrings of a redirect's Location that name an
+// authentication page. A redirect to one of them means the route sits behind a
+// login rather than answering.
+var signInMarkers = []string{"login", "log-in", "signin", "sign-in", "sign_in", "/auth", "sso", "oauth"}
 
 // characterizeAll runs characterizeRoute across every discovered route
 // concurrently (bounded by c's own concurrency cap and rate limiter, same
@@ -90,9 +108,13 @@ func routeCheckID(i int) string {
 // characterizeRoute is one route's full workup: method support (OPTIONS
 // plus a GET/POST/PUT/PATCH/DELETE swap), auth requirement (unauthenticated
 // vs. authenticated, when a credential was supplied), content-type
-// negotiation on a write method, a response-shape fingerprint, and the
+// negotiation on a write method, a response-shape fingerprint, undocumented
+// query-parameter discovery on a confirmed GET route, and the
 // confirmed/uncertain verdict a JS-mined or brute-forced route is still
 // waiting on (see mineJS/bruteforcePaths' doc comments).
+//
+// Every request here goes through the no-redirect client, so each response is
+// judged as the one the route itself sent.
 func characterizeRoute(ctx context.Context, c *apiClient, t *Target, r Route) Route {
 	// GraphQL operations are already confirmed by the introspection call
 	// that found them (see discoverGraphQL) and share one endpoint across
@@ -106,14 +128,21 @@ func characterizeRoute(ctx context.Context, c *apiClient, t *Target, r Route) Ro
 	resolvedPath, params := substitutePathParams(r.Path, r.Params)
 	r.Params = params
 	target := t.URL + resolvedPath
+	dir := parentDir(resolvedPath)
 
 	primaryMethod := "GET"
 	if len(r.Methods) > 0 {
 		primaryMethod = r.Methods[0].Method
 	}
+	// A route discovered under a write method (say, DELETE from a spec) is
+	// characterized through GET unless the operator opted in, so the default
+	// run never sends that write, not even as the primary probe.
+	if isWriteMethod(primaryMethod) && !c.allowWrites {
+		primaryMethod = "GET"
+	}
 
 	allowed := map[string]bool{}
-	if optRes, err := c.do(ctx, http.MethodOptions, target, nil, false, nil); err == nil {
+	if optRes, err := c.doNoFollow(ctx, http.MethodOptions, target, nil, false, nil); err == nil {
 		for m := range strings.SplitSeq(optRes.Header.Get("Allow"), ",") {
 			if m = strings.ToUpper(strings.TrimSpace(m)); m != "" {
 				allowed[m] = true
@@ -123,6 +152,10 @@ func characterizeRoute(ctx context.Context, c *apiClient, t *Target, r Route) Ro
 
 	methodsToTry := map[string]bool{primaryMethod: true}
 	for _, m := range candidateMethods {
+		// Skip write methods unless the operator allowed them for this run.
+		if isWriteMethod(m) && !c.allowWrites {
+			continue
+		}
 		methodsToTry[m] = true
 	}
 
@@ -137,7 +170,7 @@ func characterizeRoute(ctx context.Context, c *apiClient, t *Target, r Route) Ro
 		if contentType != "" {
 			headers["Content-Type"] = contentType
 		}
-		res, err := c.do(ctx, m, target, headers, false, body)
+		res, err := c.doNoFollow(ctx, m, target, headers, false, body)
 		if err != nil {
 			continue
 		}
@@ -162,7 +195,17 @@ func characterizeRoute(ctx context.Context, c *apiClient, t *Target, r Route) Ro
 	}
 	r.Methods = methodProbes
 
-	r.Auth = probeAuth(ctx, c, target, primaryMethod, r.Params)
+	// A GET that looks exactly like this host's answer for a path that cannot
+	// exist is a soft 404, not the route. The check only applies to GET, since
+	// that's the method the catch-all profile is built from.
+	soft404 := false
+	if primaryResult != nil && primaryMethod == http.MethodGet {
+		if prof := c.catchAllFor(ctx, t, dir); prof.Matches(observe(primaryResult)) {
+			soft404 = true
+		}
+	}
+
+	r.Auth = probeAuth(ctx, c, t, target, primaryMethod, r.Params, dir)
 
 	if hasWriteMethod(methodProbes) {
 		r.ContentTypesAccepted = negotiateContentTypes(ctx, c, target, r.Params)
@@ -185,8 +228,24 @@ func characterizeRoute(ctx context.Context, c *apiClient, t *Target, r Route) Ro
 		}
 	}
 
-	r.Confirmed = routeIsConfirmed(r, primaryResult)
+	r.Confirmed = routeIsConfirmed(r, primaryResult, soft404)
+
+	// Undocumented query parameters are only worth sweeping for on a route that
+	// is real and answers GET, and only while the run's sweep budget lasts.
+	if r.Confirmed && !soft404 && methodAllowedFor(methodProbes, http.MethodGet) && c.takeParamBudget() {
+		r.Params = mergeParams(r.Params, c.discoverQueryParams(ctx, t, resolvedPath, r.Params))
+	}
 	return r
+}
+
+// methodAllowedFor reports whether probes says method is accepted.
+func methodAllowedFor(probes []MethodProbe, method string) bool {
+	for _, p := range probes {
+		if p.Method == method && p.Allowed {
+			return true
+		}
+	}
+	return false
 }
 
 // routeIsConfirmed finalizes the confirmed/uncertain split the package doc
@@ -194,13 +253,13 @@ func characterizeRoute(ctx context.Context, c *apiClient, t *Target, r Route) Ro
 // to exist, so it stays confirmed regardless of what characterization
 // finds. A JS-mined or brute-forced route only earns "confirmed" once a
 // live probe actually responded with something other than a 404 or a
-// server error -- both of which are exactly the "ambiguous response" case
-// the uncertain bucket exists for.
-func routeIsConfirmed(r Route, primaryResult *apiResult) bool {
+// server error -- and, new here, something that isn't the host's own
+// catch-all answer for a nonexistent path (soft404).
+func routeIsConfirmed(r Route, primaryResult *apiResult, soft404 bool) bool {
 	if r.Source == "spec" || r.Source == "crawl" || r.Source == "graphql" {
 		return true
 	}
-	if primaryResult == nil {
+	if primaryResult == nil || soft404 {
 		return false
 	}
 	status := primaryResult.StatusCode
@@ -282,6 +341,8 @@ func sampleRequestBody(method string, params []Param) ([]byte, string) {
 	return body, "application/json"
 }
 
+// sampleJSONValue picks a placeholder value for one body param, matching its
+// type guess so the sample isn't rejected for the wrong JSON type.
 func sampleJSONValue(p Param) any {
 	if p.Sample != "" {
 		return p.Sample
@@ -319,6 +380,8 @@ func bodyShape(contentType string, body []byte) string {
 	return "binary"
 }
 
+// hasWriteMethod reports whether any write method (POST/PUT/PATCH) is accepted,
+// which is what makes content-type negotiation worth running.
 func hasWriteMethod(methods []MethodProbe) bool {
 	for _, m := range methods {
 		if m.Allowed && (m.Method == http.MethodPost || m.Method == http.MethodPut || m.Method == http.MethodPatch) {
@@ -328,10 +391,64 @@ func hasWriteMethod(methods []MethodProbe) bool {
 	return false
 }
 
+// isLoginRedirect reports whether a response is a redirect whose Location names
+// a sign-in page.
+func isLoginRedirect(status int, location string) bool {
+	if status < 300 || status >= 400 || location == "" {
+		return false
+	}
+	loc := strings.ToLower(location)
+	for _, marker := range signInMarkers {
+		if strings.Contains(loc, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// authVerdictFor names what one unauthenticated response says about the route's
+// access control, and whether that means the route requires auth. siteWide
+// means the same verdict came back for a nonexistent path in the same
+// directory, so the control belongs to the directory or the whole host rather
+// than to this route: the verdict becomes "site-wide-gate" and RequiresAuth is
+// not claimed for the route.
+func authVerdictFor(res *apiResult, siteWide bool) (string, bool) {
+	status := res.StatusCode
+	verdict, requires := "other", false
+	switch {
+	case isLoginRedirect(status, res.Header.Get("Location")):
+		verdict, requires = "login-redirect", true
+	case status == http.StatusUnauthorized:
+		verdict, requires = "requires-auth", true
+	case status == http.StatusForbidden:
+		verdict, requires = "forbidden", true
+	case status >= 200 && status < 400:
+		verdict = "public"
+	case status == http.StatusNotFound:
+		verdict = "not-found"
+	}
+	if siteWide && requires {
+		return "site-wide-gate", false
+	}
+	return verdict, requires
+}
+
+// challengeOf returns the WWW-Authenticate challenge a response carried,
+// truncated to something a UI can show in one line, or "" when there is none.
+func challengeOf(res *apiResult) string {
+	const maxLen = 120
+	v := res.Header.Get("WWW-Authenticate")
+	if len(v) > maxLen {
+		return v[:maxLen]
+	}
+	return v
+}
+
 // probeAuth sends the unauthenticated half of the auth check always, and
 // the authenticated half only when this run was actually given a
-// credential to test with -- see client.go's hasBaseline.
-func probeAuth(ctx context.Context, c *apiClient, target, method string, params []Param) AuthProbe {
+// credential to test with -- see client.go's hasBaseline. dir is the route's
+// own directory, used to tell a route-specific gate from a directory-wide one.
+func probeAuth(ctx context.Context, c *apiClient, t *Target, target, method string, params []Param, dir string) AuthProbe {
 	body, contentType := sampleRequestBody(method, params)
 	headers := map[string]string{}
 	if contentType != "" {
@@ -339,12 +456,22 @@ func probeAuth(ctx context.Context, c *apiClient, target, method string, params 
 	}
 
 	probe := AuthProbe{}
-	if res, err := c.do(ctx, method, target, headers, true, body); err == nil {
+	if res, err := c.doNoFollow(ctx, method, target, headers, true, body); err == nil {
 		probe.UnauthenticatedStatus = res.StatusCode
-		probe.RequiresAuth = res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden
+		probe.Challenge = challengeOf(res)
+		base, _ := authVerdictFor(res, false)
+		// A 401/403/login verdict is only route-specific if a nonexistent path in
+		// the same directory doesn't get the identical verdict.
+		siteWide := false
+		if base == "requires-auth" || base == "forbidden" || base == "login-redirect" {
+			siteWide = c.gateVerdict(ctx, t, dir) == base
+		}
+		probe.Verdict, probe.RequiresAuth = authVerdictFor(res, siteWide)
+	} else {
+		probe.Verdict = "unreachable"
 	}
 	if c.hasBaseline() {
-		if res, err := c.do(ctx, method, target, headers, false, body); err == nil {
+		if res, err := c.doNoFollow(ctx, method, target, headers, false, body); err == nil {
 			probe.AuthenticatedStatus = &res.StatusCode
 		}
 	}
@@ -358,6 +485,8 @@ func probeAuth(ctx context.Context, c *apiClient, target, method string, params 
 // like XXE against a route that turns out to be JSON-only.
 var negotiationContentTypes = []string{"application/json", "application/x-www-form-urlencoded", "application/xml"}
 
+// negotiateContentTypes sends the same write body under each candidate
+// Content-Type and reports every type the route didn't refuse with a 415.
 func negotiateContentTypes(ctx context.Context, c *apiClient, target string, params []Param) []string {
 	jsonBody, _ := sampleRequestBody(http.MethodPost, params)
 	bodies := map[string][]byte{
@@ -371,7 +500,7 @@ func negotiateContentTypes(ctx context.Context, c *apiClient, target string, par
 		if ctx.Err() != nil {
 			break
 		}
-		res, err := c.do(ctx, http.MethodPost, target, map[string]string{"Content-Type": ct}, false, bodies[ct])
+		res, err := c.doNoFollow(ctx, http.MethodPost, target, map[string]string{"Content-Type": ct}, false, bodies[ct])
 		if err != nil {
 			continue
 		}
@@ -382,6 +511,7 @@ func negotiateContentTypes(ctx context.Context, c *apiClient, target string, par
 	return accepted
 }
 
+// formEncode builds a form-urlencoded body from the route's known body params.
 func formEncode(params []Param) []byte {
 	var b strings.Builder
 	first := true
@@ -403,6 +533,7 @@ func formEncode(params []Param) []byte {
 	return []byte(b.String())
 }
 
+// xmlEncode builds an XML body from the route's known body params.
 func xmlEncode(params []Param) []byte {
 	var b strings.Builder
 	b.WriteString("<root>")

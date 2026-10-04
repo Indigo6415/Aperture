@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api } from '../api'
-import type { CsrfScanResponse, Credential, Target } from '../types'
+import type { CsrfScanResponse, CsrfTokenProbeRequest, Credential, Target } from '../types'
 import { CollapsibleFormPanel } from './CollapsibleFormPanel'
 import { TargetPicker } from './TargetPicker'
 import { CredentialPicker } from './CredentialPicker'
@@ -40,6 +40,16 @@ export function Csrf({ caseId, targets, credentials }: { caseId: string; targets
   const [apiUrl, setApiUrl] = useState('')
   const [apiMethod, setApiMethod] = useState('POST')
   const [apiBody, setApiBody] = useState('')
+  const [tokenUrl, setTokenUrl] = useState('')
+  const [tokenMethod, setTokenMethod] = useState<CsrfTokenProbeRequest['method']>('POST')
+  const [tokenBody, setTokenBody] = useState('')
+  const [tokenField, setTokenField] = useState('')
+  const [tokenConfirm, setTokenConfirm] = useState(false)
+
+  // The token probe sends state-changing requests, so a partly filled one
+  // blocks the run instead of being quietly dropped; the server refuses it too.
+  const tokenProbeStarted = tokenUrl.trim() !== ''
+  const tokenProbeReady = !tokenProbeStarted || (tokenConfirm && tokenBody.trim() !== '' && tokenField.trim() !== '')
 
   const hasScans = Object.keys(scans).length > 0
   const [formOpen, setFormOpen] = useCollapsible('csrf.form', true)
@@ -71,7 +81,7 @@ export function Csrf({ caseId, targets, credentials }: { caseId: string; targets
   // server's terminal event arrives.
   const stopScan = (t: string) => stopTrackedScan(scans[t])
   const speed = useScanSpeed()
-  const canRun = runTargets.length > 0 && !running && speed.rps !== null
+  const canRun = runTargets.length > 0 && !running && speed.rps !== null && tokenProbeReady
 
   const runScan = () => {
     if (!canRun) return
@@ -102,6 +112,9 @@ export function Csrf({ caseId, targets, credentials }: { caseId: string; targets
         apiUrl: apiUrl.trim() || undefined,
         apiMethod: apiUrl.trim() ? apiMethod : undefined,
         apiBody: apiUrl.trim() ? apiBody : undefined,
+        tokenProbe: tokenProbeStarted
+          ? { url: toAbsoluteUrl(tokenUrl.trim()), method: tokenMethod, body: tokenBody, field: tokenField.trim(), confirm: tokenConfirm }
+          : undefined,
       }),
       (update) => setScans((prev) => (prev[targetValue] ? { ...prev, [targetValue]: update(prev[targetValue]) } : prev)),
       signal,
@@ -237,6 +250,75 @@ export function Csrf({ caseId, targets, credentials }: { caseId: string; targets
               className={`mt-0.5 ${inputBase} font-mono`}
             />
           </label>
+        </div>
+
+        <div className="space-y-2 rounded-lg border border-amber-900/60 bg-neutral-950/40 p-3">
+          <div>
+            <span className="text-xs font-medium text-neutral-300">Anti-CSRF token enforcement (optional, state-changing)</span>
+            <p className="mt-0.5 text-[11px] text-neutral-600">
+              Submits one form twice with its token field removed, emptied, and then set to a wrong value, after a baseline
+              submission with the real body. If the tampered submissions are accepted the same way as the baseline, the
+              endpoint isn't checking the token. These requests change state on the target, so only use an endpoint you own
+              or may modify. Leave the URL blank to skip.
+            </p>
+          </div>
+          <div className="flex flex-wrap items-end gap-2">
+            <label className="flex-1 basis-56">
+              <span className="text-[11px] text-neutral-500">Form endpoint URL</span>
+              <input
+                type="text"
+                value={tokenUrl}
+                onChange={(e) => setTokenUrl(e.target.value)}
+                placeholder="https://target.htb/account/password"
+                className={`mt-0.5 ${inputBase}`}
+              />
+            </label>
+            <label>
+              <span className="text-[11px] text-neutral-500">Method</span>
+              <select
+                value={tokenMethod}
+                onChange={(e) => setTokenMethod(e.target.value as CsrfTokenProbeRequest['method'])}
+                className="mt-0.5 block w-24 rounded border border-neutral-700 bg-neutral-900 px-1.5 py-1.5 text-xs text-neutral-200 outline-none focus:border-sky-500"
+              >
+                <option>POST</option>
+                <option>PUT</option>
+                <option>PATCH</option>
+                <option>DELETE</option>
+              </select>
+            </label>
+            <label className="basis-40">
+              <span className="text-[11px] text-neutral-500">Token field name</span>
+              <input
+                type="text"
+                value={tokenField}
+                onChange={(e) => setTokenField(e.target.value)}
+                placeholder="csrf_token"
+                className={`mt-0.5 ${inputBase}`}
+              />
+            </label>
+          </div>
+          <label className="block">
+            <span className="text-[11px] text-neutral-500">Form body (URL-encoded, token included)</span>
+            <textarea
+              value={tokenBody}
+              onChange={(e) => setTokenBody(e.target.value)}
+              placeholder={'csrf_token=abc123&new_password=Example1!'}
+              rows={2}
+              className={`mt-0.5 ${inputBase} font-mono`}
+            />
+          </label>
+          <label className="flex items-start gap-2 text-[11px] text-amber-300/90">
+            <input
+              type="checkbox"
+              checked={tokenConfirm}
+              onChange={(e) => setTokenConfirm(e.target.checked)}
+              className="mt-0.5"
+            />
+            <span>I understand these submissions change state on the endpoint above and I am allowed to test it.</span>
+          </label>
+          {tokenProbeStarted && !tokenProbeReady && (
+            <p className="text-[11px] text-amber-400">Fill in the form body and token field, and confirm, or clear the URL to skip this check.</p>
+          )}
         </div>
 
         <button

@@ -41,7 +41,7 @@ type Finding struct {
 	// CapturedRequest in client.go) -- lets the frontend's "Send to Tester"
 	// action replay precisely what triggered the finding.
 	Request *CapturedRequest `json:"request,omitempty"`
-	// Confidence is "confirmed" or "likely" (see checks.go).
+	// Confidence is "confirmed", "likely", or "heuristic" (see checks.go).
 	Confidence string `json:"confidence,omitempty"`
 }
 

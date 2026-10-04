@@ -16,29 +16,35 @@ import (
 var sqlErrorStrings = map[string][]string{
 	"MySQL":      {"you have an error in your sql syntax", "warning: mysql", "mysql_fetch", "mysql_num_rows"},
 	"PostgreSQL": {"pg_query", "pg_exec", "postgresql error", "unterminated quoted string"},
-	"MSSQL":      {"microsoft sql server", "odbc sql server", "sqlserver", "unclosed quotation mark"},
-	"Oracle":     {"ora-01756", "ora-00933", "ora-00907", "quoted string not properly terminated"},
-	"SQLite":     {"sqlite3::query", "sqlite_query", "sqliteexception"},
-	"Generic":    {"sql syntax", "sql error", "database error", "query failed", "syntax error"},
+	// Each string is a driver-level error prefix. Bare words such as "sqlserver"
+	// or "query failed" occur on ordinary pages and were dropped for that reason.
+	"MSSQL":   {"[microsoft][odbc sql server driver]", "incorrect syntax near", "unclosed quotation mark after the character string"},
+	"Oracle":  {"ora-01756", "ora-00933", "ora-00907", "quoted string not properly terminated"},
+	"SQLite":  {"sqlite3::query", "sqlite_query", "sqliteexception"},
+	"Generic": {"sql syntax error"},
 }
 
-// traversalPayloads ports injections.py's TRAVERSAL_PAYLOADS table.
+// traversalPayloads ports injections.py's TRAVERSAL_PAYLOADS table. Each
+// indicator is text that only the named file contains. The hosts-file payload
+// uses the Windows hosts header rather than "localhost", which any page that
+// echoes a URL can contain.
 var traversalPayloads = []struct{ payload, indicator string }{
 	{"../../../../etc/passwd", "root:x:"},
 	{"../../../../etc/shadow", "root:$"},
 	{"../../../../windows/win.ini", "[fonts]"},
-	{"../../../../windows/system32/drivers/etc/hosts", "localhost"},
+	{"../../../../windows/system32/drivers/etc/hosts", "Microsoft Corp."},
 	{"%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd", "root:x:"},
 	{"....//....//....//etc/passwd", "root:x:"},
 }
 
-// sstiPayloads ports injections.py's SSTI_PAYLOADS table.
+// sstiPayloads ports injections.py's SSTI_PAYLOADS table. The expression
+// multiplies two unusual numbers, so its product (9801547) would not appear in
+// an ordinary page by chance, which the old 123*123 = 15129 could.
 var sstiPayloads = []struct{ payload, expected string }{
-	{"{{123*123}}", "15129"},
-	{"${123*123}", "15129"},
-	{"#{123*123}", "15129"},
-	{"<%= 123*123 %>", "15129"},
-	{"{{123*'123'}}", "15129"},
+	{"{{1337*7331}}", "9801547"},
+	{"${1337*7331}", "9801547"},
+	{"#{1337*7331}", "9801547"},
+	{"<%= 1337*7331 %>", "9801547"},
 }
 
 var hrefPattern = regexp.MustCompile(`(?i)href\s*=\s*["']([^"']+)["']`)

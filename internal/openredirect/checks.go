@@ -49,19 +49,48 @@ var forwardedHostHeaders = []string{
 // without letting a redirect loop run the scan out of budget.
 const maxRedirectHops = 5
 
-// metaRefreshRe/jsRedirectRe flag a *client-side* redirect in a response
-// body -- an endpoint that renders "You are being redirected to <url>…"
-// rather than sending a 3xx. Matched independently of where the callback
-// host turns up in the body; detect() only treats a callback-host hit as a
-// redirect when one of these also matches, so a page that merely echoes the
-// raw parameter back (e.g. in a "did you mean" or error message) isn't
-// mistaken for an actual redirect. Even so, nothing here produces a Finding
-// on its own -- it only decides what's worth confirming against the live
-// callback server.
+// metaRefreshRe and jsRedirectRe find the redirect literals of a *client-side*
+// redirect in a response body: a <meta http-equiv=refresh> content attribute,
+// and a string literal assigned to location.href, location.replace() or
+// location.assign(). Capture group 1 is the content or literal text. A page
+// that only echoes the probe's value (in an input, an error message, or a
+// "did you mean" line) has no such literal, so it is not a redirect.
 var (
-	metaRefreshRe = regexp.MustCompile(`(?i)<meta[^>]+http-equiv=["']?refresh["']?[^>]*content=["'][^"']*url=`)
-	jsRedirectRe  = regexp.MustCompile(`(?i)(location\.href|location\.replace\s*\(|window\.location(\.href)?)\s*=`)
+	metaRefreshRe = regexp.MustCompile(`(?is)<meta[^>]+http-equiv\s*=\s*["']?refresh["']?[^>]*content\s*=\s*["']([^"']*)["']`)
+	jsRedirectRe  = regexp.MustCompile("(?is)(?:\\blocation(?:\\.href)?\\s*=|\\blocation\\.(?:replace|assign)\\s*\\()\\s*[\"'`]([^\"'`]*)[\"'`]")
 )
+
+// clientRedirectTo reports whether the body has a client-side redirect literal
+// that names both the callback host and this probe's identifier. Requiring
+// both means an unrelated script (location.href = "/home") that happens to sit
+// on a page echoing the probe is not treated as a redirect to the callback.
+func clientRedirectTo(body, cbHost, identifier string) bool {
+	for _, target := range clientRedirectTargets(body) {
+		if strings.Contains(target, cbHost) && strings.Contains(target, identifier) {
+			return true
+		}
+	}
+	return false
+}
+
+// clientRedirectTargets returns the destination text of each client-side
+// redirect in body. For a meta refresh that is the part after "url=", and for
+// a script redirect it is the string literal that was assigned.
+func clientRedirectTargets(body string) []string {
+	var out []string
+	// Each meta match carries its content attribute, which holds "delay;url=...".
+	for _, m := range metaRefreshRe.FindAllStringSubmatch(body, -1) {
+		content := m[1]
+		if i := strings.Index(strings.ToLower(content), "url="); i >= 0 {
+			out = append(out, strings.Trim(content[i+len("url="):], " '\""))
+		}
+	}
+	// Each script match carries the literal that was assigned to location.
+	for _, m := range jsRedirectRe.FindAllStringSubmatch(body, -1) {
+		out = append(out, m[1])
+	}
+	return out
+}
 
 // moduleDef is one vector family -- expand turns it into the concrete
 // requests to send for this particular run (one per candidate parameter,
@@ -340,6 +369,37 @@ var openRedirectModules = []moduleDef{
 	queryModule("allowlist-substring", "Allowlist substring redirect", "medium", func(p string, t *url.URL) string {
 		return "https://" + p + "/?" + t.Hostname()
 	}),
+	// The target's host placed after a fragment: a "contains our domain" check
+	// passes, and the browser never sends the fragment to the server.
+	queryModule("allowlist-fragment", "Allowlist fragment redirect", "medium", func(p string, t *url.URL) string {
+		return "https://" + p + "/#" + t.Hostname()
+	}),
+	// The target's host placed in the path instead of the authority, for a
+	// check that only looks for the domain anywhere in the value.
+	queryModule("allowlist-path", "Allowlist path redirect", "medium", func(p string, t *url.URL) string {
+		return "https://" + p + "/" + t.Hostname()
+	}),
+	// Three slashes: browsers collapse the run to an authority separator, but
+	// a "starts with //" check, or a parser that stops at the second slash,
+	// reads it as a path.
+	queryModule("triple-slash", "Triple-slash redirect", "medium", func(p string, _ *url.URL) string {
+		return "///" + p + "/"
+	}),
+	// "/\/" normalizes to "//" in a browser (backslash becomes slash), but
+	// reads as a path to a filter that only checks the second character.
+	queryModule("backslash-slash", "Backslash-slash redirect", "medium", func(p string, _ *url.URL) string {
+		return "/\\/" + p + "/"
+	}),
+	// The scheme written with backslashes, which browsers read as "https://".
+	// A filter that matches "https://" literally does not see it.
+	queryModule("https-backslash", "Scheme backslash redirect", "medium", func(p string, _ *url.URL) string {
+		return "https:\\\\" + p + "/"
+	}),
+	// The scheme followed by three slashes: the run collapses to "//" after
+	// the scheme, so the host is still read correctly by a browser.
+	queryModule("https-triple-slash", "Scheme triple-slash redirect", "medium", func(p string, _ *url.URL) string {
+		return "https:///" + p + "/"
+	}),
 
 	pathModule("path-absolute", "Path-segment absolute redirect", "medium", func(p string) string {
 		return "https://" + p + "/"
@@ -449,7 +509,12 @@ func runProbe(ctx context.Context, d runDeps, ps probeSpec) (candidate, bool) {
 	// hop is still recorded (with its error, if any) so the chain shows it.
 	// Sent without a concurrency slot: confirmations are few, and queueing them
 	// behind probes hanging on the target would delay the hit by the probe timeout.
-	_, confirmHop, _ := d.timedRequest(ctx, ChainHop{Kind: "callback", Method: http.MethodGet, URL: confirm}, confirm, nil)
+	_, confirmHop, err := d.timedRequest(ctx, ChainHop{Kind: "callback", Method: http.MethodGet, URL: confirm}, confirm, nil)
+	// One transport error on the callback request would drop a real hit, so it
+	// is retried once. A cancelled run is not retried, since it cannot succeed.
+	if err != nil && ctx.Err() == nil {
+		_, confirmHop, _ = d.timedRequest(ctx, ChainHop{Kind: "callback", Method: http.MethodGet, URL: confirm}, confirm, nil)
+	}
 
 	chain := append([]ChainHop{probeHop}, followed...)
 	chain = append(chain, confirmHop)
@@ -507,10 +572,9 @@ func (d runDeps) findCallbackHop(ctx context.Context, res *orResult, base *url.U
 	}
 
 	// No redirect in the chain reached the callback. A 2xx body may still
-	// describe a client-side redirect to it; only then is that page's
-	// behavior worth confirming.
-	if !isRedirect(res) && strings.Contains(strings.ToLower(res.Body), strings.ToLower(cbHost)) &&
-		(metaRefreshRe.MatchString(res.Body) || jsRedirectRe.MatchString(res.Body)) {
+	// describe a client-side redirect to it. Only a redirect literal that names
+	// the callback host and this probe's identifier is worth confirming.
+	if !isRedirect(res) && clientRedirectTo(res.Body, cbHost, ps.identifier) {
 		return followed, "https://" + d.poison(ps.identifier) + "/", "rendered a client-side redirect", true, true
 	}
 	return followed, "", "", false, false
@@ -693,6 +757,12 @@ func findingFor(c candidate, hits []collaborator.Interaction) Finding {
 	if c.rebuilt {
 		detail += " The redirect did not keep this probe's identifier path, so the hit was requested by the scanner, not followed from the redirect."
 	}
+	// Only a redirect the target sent with the identifier intact is fully
+	// confirmed. A rebuilt callback URL, or a client-side literal, is "likely".
+	confidence := ConfidenceConfirmed
+	if c.rebuilt {
+		confidence = ConfidenceLikely
+	}
 	return Finding{
 		Label:      fmt.Sprintf("%s redirects to an attacker-controlled host (confirmed via callback)", c.spec.label),
 		Detail:     detail,
@@ -701,6 +771,10 @@ func findingFor(c candidate, hits []collaborator.Interaction) Finding {
 		StatusCode: c.res.StatusCode,
 		Request:    testerRequest(c),
 		Chain:      c.chain,
+		Confidence: confidence,
+		// Built only from a callback hit, so the callback proves it, even when
+		// the scanner (not the target) made the confirming request.
+		Callback: true,
 	}
 }
 

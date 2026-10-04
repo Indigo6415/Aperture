@@ -257,6 +257,186 @@ func validPlainText(r *httpResult) bool {
 	return float64(printable)/float64(len(sample)) >= 0.95
 }
 
+// jsonObject parses the body as one JSON object and returns its top-level
+// members. It reports false for HTML, for text that is not JSON, and for a JSON
+// value that is not an object.
+func jsonObject(r *httpResult) (map[string]json.RawMessage, bool) {
+	if looksHTML(r) {
+		return nil, false
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(r.Body, &obj); err != nil || obj == nil {
+		return nil, false
+	}
+	return obj, true
+}
+
+// validJSONKeys requires a JSON object with at least one of keys at its top
+// level. Unlike validJSONAnyKey it accepts no unparseable text, so an HTML page
+// or a script that merely contains a brace cannot pass.
+func validJSONKeys(keys ...string) func(r *httpResult) bool {
+	return func(r *httpResult) bool {
+		obj, ok := jsonObject(r)
+		if !ok {
+			return false
+		}
+		// Any one matching member is enough to identify the document.
+		for _, k := range keys {
+			if _, found := obj[k]; found {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// validJSONBody requires a well-formed JSON document that is not an HTML page.
+// It is for endpoints whose only contract is that they answer with JSON.
+func validJSONBody(r *httpResult) bool {
+	return !looksHTML(r) && json.Valid(r.Body)
+}
+
+// validJSONArrayHasKey requires a JSON array of objects, at least one of which
+// has key. It is the shape of WordPress's REST user list.
+func validJSONArrayHasKey(key string) func(r *httpResult) bool {
+	return func(r *httpResult) bool {
+		if looksHTML(r) {
+			return false
+		}
+		var items []map[string]json.RawMessage
+		if err := json.Unmarshal(r.Body, &items); err != nil {
+			return false
+		}
+		// Scan the items for the key; one object carrying it identifies the list.
+		for _, item := range items {
+			if _, found := item[key]; found {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// validHealthBody accepts the two health-check shapes in common use: a JSON
+// object with a "status" member, or a bare status word such as "ok". A plain
+// substring check on "ok" would match nearly any page.
+func validHealthBody(r *httpResult) bool {
+	if looksHTML(r) {
+		return false
+	}
+	if obj, ok := jsonObject(r); ok {
+		_, found := obj["status"]
+		return found
+	}
+	switch strings.ToLower(strings.TrimSpace(r.Text)) {
+	case "ok", "healthy", "up", "pass":
+		return true
+	}
+	return false
+}
+
+// validRegexp requires a body that is not HTML and matches re.
+func validRegexp(re *regexp.Regexp) func(r *httpResult) bool {
+	return notHTML(func(r *httpResult) bool { return re.MatchString(r.Text) })
+}
+
+// matchesRegexp requires the body to match re. Unlike validRegexp it does not
+// reject HTML, for checks whose target is itself a web page, such as phpinfo.
+func matchesRegexp(re *regexp.Regexp) func(r *httpResult) bool {
+	return func(r *httpResult) bool { return re.MatchString(r.Text) }
+}
+
+// containsCaseAll requires every substring to appear, case-sensitively. It is
+// the AND form of containsCase.
+func containsCaseAll(subs ...string) func(r *httpResult) bool {
+	return func(r *httpResult) bool {
+		for _, s := range subs {
+			if !strings.Contains(r.Text, s) {
+				return false
+			}
+		}
+		return true
+	}
+}
+
+// phpSourceWith requires raw PHP source that contains every given substring. A
+// configuration file served as source leaks what the interpreter would hide.
+func phpSourceWith(subs ...string) func(r *httpResult) bool {
+	all := containsCaseAll(subs...)
+	return func(r *httpResult) bool {
+		return validPHPSource(r) && all(r)
+	}
+}
+
+// validDjangoSettings requires raw Python that defines a Django settings module:
+// a SECRET_KEY together with INSTALLED_APPS or DATABASES.
+func validDjangoSettings(r *httpResult) bool {
+	return !looksHTML(r) && containsCaseAll("SECRET_KEY")(r) &&
+		(containsCaseAll("INSTALLED_APPS")(r) || containsCaseAll("DATABASES")(r))
+}
+
+// validRailsMasterKey requires a body that is exactly one 32-character hex
+// string, the format of Rails' config/master.key.
+func validRailsMasterKey(r *httpResult) bool {
+	return !looksHTML(r) && railsMasterKeyLine.MatchString(strings.TrimSpace(r.Text))
+}
+
+// Line-anchored formats for files whose identity is one repeated line or shape.
+var (
+	// railsMasterKeyLine is the single hex line Rails keeps in config/master.key.
+	railsMasterKeyLine = regexp.MustCompile(`^[0-9a-fA-F]{32}$`)
+	// railsSecretsYAML matches a Rails secrets.yml: an environment key at the top
+	// level with a nested secret_key_base beneath it.
+	railsSecretsYAML = regexp.MustCompile(`(?ms)^(development|production|test):.*^\s+secret_key_base\s*:`)
+	// htaccessDirective matches a line that only Apache configuration uses.
+	htaccessDirective = regexp.MustCompile(`(?im)^\s*(RewriteEngine|RewriteRule|Options|AuthType|AuthUserFile|Require\s|Deny from|php_value|php_flag|SetEnv)`)
+	// netrcMachine matches a .netrc entry, which always names a machine.
+	netrcMachine = regexp.MustCompile(`(?im)^\s*machine\s+\S+`)
+	// gitCredentialsLine matches a .git-credentials line: scheme, user, password, host.
+	gitCredentialsLine = regexp.MustCompile(`(?m)^https?://[^:\s/]+:[^@\s]+@`)
+	// npmrcAuthLine matches a .npmrc auth setting, scoped to a registry host.
+	npmrcAuthLine = regexp.MustCompile(`(?m)^(//[^\s=]+:_authToken\s*=|_auth\s*=|//[^\s=]+:_password\s*=)`)
+	// pgpassLine matches a .pgpass entry: host:port:database:user:password.
+	pgpassLine = regexp.MustCompile(`(?m)^[^:\s#]*:[^:\s]*:[^:\s]*:[^:\s]*:\S+\s*$`)
+	// laravelLogLine matches one Laravel/Monolog log record.
+	laravelLogLine = regexp.MustCompile(`(?m)^\[\d{4}-\d{2}-\d{2}[ T][^\]]*\] \S+\.(ERROR|WARNING|INFO|DEBUG|CRITICAL|NOTICE|ALERT|EMERGENCY):`)
+	// phpErrorLogLine matches one PHP error-log record, the form WordPress's
+	// debug.log and a server's error_log both use.
+	phpErrorLogLine = regexp.MustCompile(`(?m)^\[[^\]]+\] PHP (Warning|Notice|Fatal error|Deprecated|Parse error):`)
+	// phpInfoMarker matches the title or the version line of a phpinfo() page.
+	phpInfoMarker = regexp.MustCompile(`(?i)<title>phpinfo\(\)</title>|PHP Version\s+\d+\.\d+`)
+	// cvsRootLine matches CVS/Root, which holds one CVSROOT such as :pserver:.
+	cvsRootLine = regexp.MustCompile(`(?m)^:(pserver|ext|local|gserver|kserver|fork):`)
+	// cvsEntriesLine matches a CVS/Entries record: /name/revision/date/.
+	cvsEntriesLine = regexp.MustCompile(`(?m)^/[^/\n]+/[^/\n]*/`)
+	// hgRequiresLine matches a Mercurial .hg/requires feature name.
+	hgRequiresLine = regexp.MustCompile(`(?m)^(revlogv1|store|fncache|dotencode|generaldelta|sparserevlog|dirstate-v2|shared|treemanifest)\s*$`)
+	// gitSHALine matches a line holding one full object hash.
+	gitSHALine = regexp.MustCompile(`(?m)^[0-9a-f]{40}\s*$`)
+	// gitInfoRefLine matches a .git/info/refs line: a hash followed by a ref name.
+	gitInfoRefLine = regexp.MustCompile(`(?m)^[0-9a-f]{40}\s+refs/`)
+	// gitFetchHeadLine matches a .git/FETCH_HEAD line: a hash, then a tab.
+	gitFetchHeadLine = regexp.MustCompile(`(?m)^[0-9a-f]{40}\t`)
+	// robotsDirective matches a robots.txt directive line.
+	robotsDirective = regexp.MustCompile(`(?im)^\s*(user-agent|disallow|allow|sitemap|crawl-delay)\s*:`)
+	// securityTxtContact matches the required Contact field of security.txt.
+	securityTxtContact = regexp.MustCompile(`(?im)^\s*contact\s*:`)
+	// versionStringLine matches a file whose whole content is one version number.
+	versionStringLine = regexp.MustCompile(`^\s*[vV]?\d+(\.\d+)+([-+][0-9A-Za-z.\-]+)?\s*$`)
+	// gradleBuildLine matches a Gradle build statement.
+	gradleBuildLine = regexp.MustCompile(`(?m)^\s*(apply plugin:|plugins\s*\{|dependencies\s*\{|repositories\s*\{)`)
+	// jenkinsfileLine matches a declarative or scripted Jenkins pipeline.
+	jenkinsfileLine = regexp.MustCompile(`(?m)^\s*(pipeline\s*\{|node\s*(\(|\{))`)
+	// webpackExport matches the CommonJS export that a webpack config uses.
+	webpackExport = regexp.MustCompile(`module\.exports\s*=\s*[{(]`)
+	// viteExport matches the default export of a Vite config.
+	viteExport = regexp.MustCompile(`export default\s*(defineConfig\s*\()?\s*\{`)
+	// podfileLine matches a CocoaPods platform or target declaration.
+	podfileLine = regexp.MustCompile(`(?m)^\s*(platform|target)\s+[:'"]`)
+	// setupPyLine matches the setuptools import that opens a setup.py.
+	setupPyLine = regexp.MustCompile(`(?m)^\s*(from setuptools import|import setuptools)`)
+)
+
 // maskEvidence shortens and redacts a snippet before it is stored. Values after
 // "=" or ":" are replaced so a finding never persists a live credential, and
 // PEM key bodies are dropped entirely.

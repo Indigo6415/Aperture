@@ -80,6 +80,7 @@ func main() {
 
 	eng := engine.New()
 	srv := api.NewServer(st, eng, webui.FS(), wordlistsDir)
+	srv.SetGitDumpDir(defaultGitDumpDir())
 
 	httpSrv := &http.Server{Addr: *addr, Handler: srv.Handler()}
 
@@ -165,6 +166,17 @@ func defaultWordlistsDir() string {
 		return "wordlists"
 	}
 	return filepath.Join(apDir, "wordlists")
+}
+
+// defaultGitDumpDir returns where git dump buckets are written and served
+// from. It sits next to the wordlists, and falls back to a relative dir under
+// the same conditions defaultWordlistsDir does.
+func defaultGitDumpDir() string {
+	apDir, ok := apertureDir()
+	if !ok {
+		return "gitdumps"
+	}
+	return filepath.Join(apDir, "gitdumps")
 }
 
 // apertureDir returns (and creates) the per-user directory Aperture keeps

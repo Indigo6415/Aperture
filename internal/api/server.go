@@ -91,6 +91,10 @@ type Server struct {
 	// collabListenAddr is the -collab-addr the callback listener binds, used
 	// to build callback URLs when no callbackBase is configured.
 	collabListenAddr string
+
+	// gitDumpDir is where git dump buckets (a restored .git, the checked-out
+	// files, and a zip of both) are written and served from. See SetGitDumpDir.
+	gitDumpDir string
 }
 
 // SetCollabListenAddr records the address the callback-only listener binds
@@ -245,6 +249,9 @@ func NewServer(st *store.Store, eng *engine.Engine, uiFS fs.FS, wordlistsDir str
 	s.mux.HandleFunc("POST /api/sstiscan/scan", s.requireAuth(s.handleSSTIScan))
 	s.mux.HandleFunc("POST /api/pathtraversal/scan", s.requireAuth(s.handlePathTraversal))
 	s.mux.HandleFunc("POST /api/xxe/scan", s.requireAuth(s.handleXXE))
+
+	s.mux.HandleFunc("POST /api/gitdump/scan", s.requireAuth(s.handleGitDump))
+	s.mux.HandleFunc("GET /api/gitdump/buckets/{id}/download", s.requireAuth(s.handleGitDumpDownload))
 
 	s.mux.HandleFunc("POST /api/tester/send", s.requireAuth(s.handleTesterSend))
 

@@ -7,7 +7,8 @@ import "testing"
 func danglingDNS(t *testing.T, withA bool) (Check, string) {
 	t.Helper()
 	p := takeoverProviders[0]
-	cname := "bucket" + p.cnameSuffix
+	// A real provider hostname is a label under the provider domain.
+	cname := "bucket." + p.cnameSuffix
 	data := map[string]any{"cname": cname, "a": []string{}, "aaaa": []string{}}
 	if withA {
 		data["a"] = []string{"203.0.113.9"}

@@ -56,7 +56,7 @@ func runRetireModule(ctx context.Context, t *Target, opts Options) ([]Finding, e
 		return nil, fmt.Errorf("retire: not found on PATH (npm install -g retire)")
 	}
 
-	crawl := crawlDomain(ctx, t, opts.CrawlDepth, opts.MaxPages, opts.Headers)
+	crawl := sharedCrawl(ctx, t, opts)
 	if len(crawl.Scripts) == 0 {
 		return []Finding{}, nil
 	}
@@ -73,23 +73,9 @@ func runRetireModule(ctx context.Context, t *Target, opts Options) ([]Finding, e
 	// (de-duplicated with an index suffix) rather than being renamed to
 	// something generic -- that signal would otherwise be thrown away.
 	fileToURL := map[string]string{}
-	seenNames := map[string]int{}
+	used := map[string]bool{}
 	for _, sf := range crawl.Scripts {
-		name := filepath.Base(sf.URL)
-		if idx := strings.IndexAny(name, "?#"); idx >= 0 {
-			name = name[:idx]
-		}
-		if name == "" || name == "." || name == "/" {
-			name = "script.js"
-		}
-		if !strings.HasSuffix(strings.ToLower(name), ".js") {
-			name += ".js"
-		}
-		if n := seenNames[name]; n > 0 {
-			ext := filepath.Ext(name)
-			name = strings.TrimSuffix(name, ext) + "-" + strconv.Itoa(n) + ext
-		}
-		seenNames[filepath.Base(sf.URL)]++
+		name := scratchName(used, sf.URL)
 		if err := os.WriteFile(filepath.Join(dir, name), sf.Body, 0o600); err != nil {
 			continue
 		}
@@ -146,6 +132,33 @@ func runRetireModule(ctx context.Context, t *Target, opts Options) ([]Finding, e
 		findings = []Finding{}
 	}
 	return findings, nil
+}
+
+// scratchName returns the file name a downloaded script is written under. It
+// keeps the script's own base name, because retire also identifies libraries by
+// filename. It appends a -N suffix until the name is unused, comparing
+// case-insensitively because the scratch directory may sit on a case-insensitive
+// filesystem, and it records the chosen name in used.
+func scratchName(used map[string]bool, rawURL string) string {
+	name := filepath.Base(rawURL)
+	if idx := strings.IndexAny(name, "?#"); idx >= 0 {
+		name = name[:idx]
+	}
+	if name == "" || name == "." || name == "/" {
+		name = "script.js"
+	}
+	if !strings.HasSuffix(strings.ToLower(name), ".js") {
+		name += ".js"
+	}
+	ext := filepath.Ext(name)
+	base := strings.TrimSuffix(name, ext)
+	candidate := name
+	// Try the bare name first, then base-1.js, base-2.js, and so on, until one is free.
+	for n := 1; used[strings.ToLower(candidate)]; n++ {
+		candidate = base + "-" + strconv.Itoa(n) + ext
+	}
+	used[strings.ToLower(candidate)] = true
+	return candidate
 }
 
 // normalizeRetireSeverity maps retire.js's own severity strings onto

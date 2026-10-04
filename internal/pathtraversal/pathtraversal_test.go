@@ -1,17 +1,21 @@
 package pathtraversal
 
 import (
+	"bufio"
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"path"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Indigo6415/Aperture/internal/collaborator"
 )
@@ -22,9 +26,13 @@ const passwdText = "root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:daemon:/usr/sb
 // fakeFiles is the filesystem the vulnerable test servers read from, keyed by
 // absolute path. Only /etc/passwd exists, so any other name is a 404.
 var fakeFiles = map[string]string{
-	"/etc/passwd":     passwdText,
-	"/srv/etc/passwd": passwdText,
+	"/etc/passwd":              passwdText,
+	"/srv/etc/passwd":          passwdText,
+	"/srv/www/files/index.php": phpSourceText,
 }
+
+// phpSourceText is a small PHP file, the kind the php://filter source read returns.
+const phpSourceText = "<?php echo 'hello';\n"
 
 // readAt resolves name against base the way a naive app would (path.Join cleans
 // ".." steps) and returns the file, or false when it does not exist.
@@ -257,21 +265,48 @@ func TestBase64DecodeOnlyWhenEnabled(t *testing.T) {
 	}
 }
 
-// TestEncodedPayloadReachesWireIntact checks that a payload's percent sequences
-// survive into the query string as typed. Double-encoding bypasses depend on
-// this, and an encoder that re-escapes "%" would silently turn them into
-// something else.
-func TestEncodedPayloadReachesWireIntact(t *testing.T) {
-	base, _ := url.Parse("https://target.example/download?file=a")
+// TestQueryValueIsWrittenRaw checks that a payload's percent sequences reach the
+// query string as typed, and that the other parameters are kept as they were.
+// An encoder that re-escapes "%" adds a decoding layer, so a double-encoded
+// payload would arrive as triple-encoded and every encoding bypass would miss.
+func TestQueryValueIsWrittenRaw(t *testing.T) {
+	base, _ := url.Parse("https://target.example/download?file=a&keep=1")
 	p := queryPoint(requestSpec{Method: http.MethodGet}, base, "file")
 	spec := p.build("%252e%252e%252fetc/passwd")
+	if want := "https://target.example/download?keep=1&file=%252e%252e%252fetc/passwd"; spec.URL != want {
+		t.Errorf("URL = %q, want %q", spec.URL, want)
+	}
 	u, err := url.Parse(spec.URL)
 	if err != nil {
 		t.Fatalf("built URL does not parse: %v", err)
 	}
-	// The app should receive the exact payload text after one decode.
-	if got := u.Query().Get("file"); got != "%252e%252e%252fetc/passwd" {
-		t.Errorf("app-level value = %q, want the payload unchanged", got)
+	// One decode by the app turns the payload into its first-level form.
+	if got := u.Query().Get("file"); got != "%2e%2e%2fetc/passwd" {
+		t.Errorf("app-level value after one decode = %q, want %q", got, "%2e%2e%2fetc/passwd")
+	}
+}
+
+// TestRawValueFor checks which bytes rawValueFor escapes. Payload percent
+// sequences, IIS %u escapes, and the path characters are kept. Characters that
+// would split or change a query are escaped, and a "%" that starts no escape
+// becomes %25.
+func TestRawValueFor(t *testing.T) {
+	cases := map[string]string{
+		"../etc/passwd":         "../etc/passwd",
+		"%2e%2e%2f":             "%2e%2e%2f",
+		"%u2215":                "%u2215",
+		"a&b#c+d e":             "a%26b%23c%2Bd%20e",
+		"100%":                  "100%25",
+		"%zz":                   "%25zz",
+		`..\..\win.ini`:         "..%5C..%5Cwin.ini",
+		"php://filter/read=x/y": "php://filter/read=x/y",
+		"%00.png":               "%00.png",
+		"é":                     "%C3%A9",
+	}
+	for in, want := range cases {
+		if got := rawValueFor(in); got != want {
+			t.Errorf("rawValueFor(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 
@@ -306,26 +341,66 @@ func TestCrawlSkipsSeedQueryPoints(t *testing.T) {
 // TestPayloadWireStrings pins the exact strings a sample of payloads produce,
 // so a change to a shared helper cannot silently alter what is sent.
 func TestPayloadWireStrings(t *testing.T) {
+	// Each case looks its payload up by name, so adding a payload to a module
+	// never shifts the expectations for the others.
 	cases := []struct {
-		name string
-		got  string
-		want string
+		label string
+		p     payload
+		pt    point
+		file  string
+		want  string
 	}{
-		{"classic x4", classicModule.payloads[1].build("etc/passwd", point{}), "../../../../etc/passwd"},
-		{"windows x4", windowsModule.payloads[0].build("win.ini", point{}), `..\..\..\..\windows\win.ini`},
-		{"windows 8.3", windowsModule.payloads[6].build("win.ini", point{}), `..\..\..\..\WINDOW~1\win.ini`},
-		{"encoded %2f", encodedModule.payloads[0].build("etc/passwd", point{}), "%2e%2e%2f%2e%2e%2f%2e%2e%2f%2e%2e%2f" + "etc%2fpasswd"},
-		{"double-encoded", encodedModule.payloads[3].build("etc/passwd", point{}), "%252e%252e%252f" + "%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f" + "etc%252fpasswd"},
-		{"null byte", encodedModule.payloads[12].build("etc/passwd", point{}), "../../../../../../../../etc/passwd%00.png"},
-		{"absolute file://", absoluteModule.payloads[2].build("etc/passwd", point{}), "file:///etc/passwd"},
-		{"php base64", phpWrapperModule.payloads[0].build("etc/passwd", point{}), "php://filter/convert.base64-encode/resource=" + strings.Repeat("../", 8) + "etc/passwd"},
-		{"nginx alias", aliasModule.payloads[0].build("etc/passwd", point{segment: "static"}), "static../etc/passwd"},
+		{"classic x4", payloadNamed(t, classicModule, "../ x4"), point{}, "etc/passwd", "../../../../etc/passwd"},
+		{"windows x4", payloadNamed(t, windowsModule, `..\ x4`), point{}, "win.ini", `..\..\..\..\windows\win.ini`},
+		{"windows 8.3", payloadNamed(t, windowsModule, `WINDOW~1 short name`), point{}, "win.ini", `..\..\..\..\WINDOW~1\win.ini`},
+		{"windows root-relative", payloadNamed(t, windowsModule, `/windows/ root-relative`), point{}, "win.ini", "/windows/win.ini"},
+		{"windows env var", payloadNamed(t, windowsModule, `%SYSTEMROOT%\ variable`), point{}, "win.ini", `%SYSTEMROOT%\win.ini`},
+		{"encoded %2f", payloadNamed(t, encodedModule, "%2e%2e%2f x4"), point{}, "etc/passwd", "%2e%2e%2f%2e%2e%2f%2e%2e%2f%2e%2e%2f" + "etc%2fpasswd"},
+		{"double-encoded", payloadNamed(t, encodedModule, "%252e%252e%252f double-encoded x8"), point{}, "etc/passwd", strings.Repeat("%252e%252e%252f", 8) + "etc%252fpasswd"},
+		{"IIS unicode", payloadNamed(t, encodedModule, "..%u2215 IIS unicode slash x4"), point{}, "etc/passwd", "..%u2215..%u2215..%u2215..%u2215etc%u2215passwd"},
+		{"null byte .png", payloadNamed(t, encodedModule, "%00.png null-byte suffix"), point{}, "etc/passwd", "../../../../../../../../etc/passwd%00.png"},
+		{"null byte bare", payloadNamed(t, encodedModule, "%00 bare null byte x8"), point{}, "etc/passwd", "../../../../../../../../etc/passwd%00"},
+		{"absolute file://", payloadNamed(t, absoluteModule, "file:///etc/passwd"), point{}, "etc/passwd", "file:///etc/passwd"},
+		{"absolute file:/", payloadNamed(t, absoluteModule, "file:/etc/passwd"), point{}, "etc/passwd", "file:/etc/passwd"},
+		{"php base64", payloadNamed(t, phpWrapperModule, "php://filter base64 ../ x8"), point{}, "etc/passwd", "php://filter/convert.base64-encode/resource=" + strings.Repeat("../", 8) + "etc/passwd"},
+		{"php source", payloadNamed(t, phpWrapperModule, "php://filter base64 index.php source"), point{}, "index.php", "php://filter/convert.base64-encode/resource=index.php"},
+		{"nginx alias", payloadNamed(t, aliasModule, "segment.. (nginx alias)"), point{segment: "static"}, "etc/passwd", "static../etc/passwd"},
 	}
 	for _, c := range cases {
-		if c.got != c.want {
-			t.Errorf("%s: got %q, want %q", c.name, c.got, c.want)
+		if got := c.p.build(c.file, c.pt); got != c.want {
+			t.Errorf("%s: got %q, want %q", c.label, got, c.want)
 		}
 	}
+}
+
+// payloadNamed returns the payload of m with the given name, failing the test
+// when there is none.
+func payloadNamed(t *testing.T, m module, name string) payload {
+	t.Helper()
+	for _, p := range m.payloads {
+		if p.name == name {
+			return p
+		}
+	}
+	t.Fatalf("module %s has no payload %q", m.id, name)
+	return payload{}
+}
+
+// TestPayloadNamesUnique checks that no two payloads in a module share a name.
+// The name is the label a finding reports, and payloadNamed relies on it.
+func TestPayloadNamesUnique(t *testing.T) {
+	total := 0
+	for _, m := range modules {
+		seen := map[string]bool{}
+		for _, p := range m.payloads {
+			if seen[p.name] {
+				t.Errorf("module %s has two payloads named %q", m.id, p.name)
+			}
+			seen[p.name] = true
+			total++
+		}
+	}
+	t.Logf("%d payloads across %d modules", total, len(modules))
 }
 
 // fetchTarget stands in for an app that takes a file name and fetches it when it
@@ -450,6 +525,365 @@ func TestRunWithoutListenerSkipsCallbackModule(t *testing.T) {
 		if mod.ID == oobCallbackModule.id {
 			t.Error("callback module ran with no listener")
 		}
+	}
+}
+
+// TestDoubleDecodeBypassFound checks an encoding bypass end to end. The app
+// decodes the query value once, filters out "../", then decodes again before
+// the file lookup. Only a payload written raw reaches that second decode. The
+// classic payload must not get through the filter.
+func TestDoubleDecodeBypassFound(t *testing.T) {
+	srv := vulnServer(t, "/srv/www/files", func(r *http.Request, _ string) string {
+		once := r.URL.Query().Get("file")
+		// The filter sees the once-decoded value.
+		if strings.Contains(once, "../") {
+			return ""
+		}
+		twice, err := url.PathUnescape(once)
+		if err != nil {
+			return ""
+		}
+		return twice
+	})
+	defer srv.Close()
+
+	res, err := Run(context.Background(), Request{URL: srv.URL + "/download?file=report.pdf"}, OOBConfig{})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if _, ok := findHit(res, "encoded-traversal", `query parameter "file"`); !ok {
+		t.Fatalf("double-decode bypass not found; findings: %d", totalFindings(res))
+	}
+	if _, ok := findHit(res, "classic-traversal", `query parameter "file"`); ok {
+		t.Error("classic ../ got through a filter that blocks ../")
+	}
+}
+
+// TestPHPSourceReadIsLikely checks the PHP source read. The app refuses
+// traversal, so the only php://filter payload that gets through is the one that
+// reads the app's own index.php. That read is confirmed by the weak PHP-source
+// signature, so it is reported as "likely", not "confirmed".
+func TestPHPSourceReadIsLikely(t *testing.T) {
+	srv := vulnServer(t, "/srv/www/files", func(r *http.Request, _ string) string {
+		name := r.URL.Query().Get("file")
+		if strings.Contains(name, "..") {
+			return ""
+		}
+		return name
+	})
+	defer srv.Close()
+
+	res, err := Run(context.Background(), Request{URL: srv.URL + "/download?file=report.pdf"}, OOBConfig{})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	m := moduleResultByID(t, res, "php-filter-wrapper")
+	var got *Finding
+	for i := range m.Findings {
+		if strings.Contains(m.Findings[i].Payload, "index.php") {
+			got = &m.Findings[i]
+		}
+	}
+	if got == nil {
+		t.Fatalf("no php-filter finding for index.php; findings: %d", len(m.Findings))
+	}
+	if got.Confidence != ConfidenceLikely {
+		t.Errorf("confidence = %q, want %q (weak PHP signature)", got.Confidence, ConfidenceLikely)
+	}
+	if !strings.HasPrefix(got.Evidence, "base64-decoded:") {
+		t.Errorf("evidence = %q, want a base64-decoded snippet", got.Evidence)
+	}
+}
+
+// TestXMLBodyRead checks that a traversal in an XML text node is found, and
+// that the label names the element.
+func TestXMLBodyRead(t *testing.T) {
+	srv := vulnServer(t, "/srv/www/files", func(r *http.Request, body string) string {
+		if r.Method != http.MethodPost {
+			return ""
+		}
+		var doc struct {
+			File string `xml:"file"`
+		}
+		if err := xml.Unmarshal([]byte(body), &doc); err != nil {
+			return ""
+		}
+		return doc.File
+	})
+	defer srv.Close()
+
+	res, err := Run(context.Background(), Request{
+		URL:         srv.URL + "/api/render",
+		Body:        `<req><file>report.pdf</file><note>hello</note></req>`,
+		ContentType: "application/xml",
+	}, OOBConfig{})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if _, ok := findHit(res, "classic-traversal", `XML text of <file>`); !ok {
+		t.Fatalf("no XML finding on the file element; findings: %d", totalFindings(res))
+	}
+	// The unrelated <note> text is not a file name, so it must not produce a finding.
+	if _, ok := findHit(res, "classic-traversal", `XML text of <note>`); ok {
+		t.Error("finding reported on the note element")
+	}
+}
+
+// TestXMLBodyDetectedWithoutContentType checks that a body that starts with "<"
+// is treated as XML when no Content-Type is given, so its text nodes are tested.
+func TestXMLBodyDetectedWithoutContentType(t *testing.T) {
+	pts := bodyPoints(requestSpec{Method: http.MethodPost, URL: "https://t.example/x", Headers: map[string]string{}}, `<a><b>c</b></a>`, "")
+	if len(pts) != 1 {
+		t.Fatalf("points = %d, want 1 (the text of <b>)", len(pts))
+	}
+	if !strings.Contains(pts[0].label, "<b>") {
+		t.Errorf("label = %q, want it to name <b>", pts[0].label)
+	}
+}
+
+// TestXMLPayloadIsEscaped checks that a payload with XML-special characters
+// stays well formed, and that the parser hands the app the same characters back.
+func TestXMLPayloadIsEscaped(t *testing.T) {
+	pts := xmlPoints(requestSpec{Method: http.MethodPost, URL: "https://t.example/x"}, `<req><file>report.pdf</file></req>`)
+	if len(pts) != 1 {
+		t.Fatalf("points = %d, want 1", len(pts))
+	}
+	value := `../a&b<"c'`
+	spec := pts[0].build(value)
+	var doc struct {
+		File string `xml:"file"`
+	}
+	if err := xml.Unmarshal([]byte(spec.Body), &doc); err != nil {
+		t.Fatalf("body is not well-formed XML: %v\n%s", err, spec.Body)
+	}
+	if doc.File != value {
+		t.Errorf("parsed value = %q, want %q", doc.File, value)
+	}
+}
+
+// rawLineServer accepts connections and records each request line as sent.
+// Unlike httptest, it does not parse the request target, so a payload with an
+// IIS-style "%u" escape reaches it as written.
+func rawLineServer(t *testing.T) (string, <-chan string) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	lines := make(chan string, 16)
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				line, err := bufio.NewReader(c).ReadString('\n')
+				if err != nil {
+					return
+				}
+				lines <- strings.TrimRight(line, "\r\n")
+				io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+			}(conn)
+		}
+	}()
+	return ln.Addr().String(), lines
+}
+
+// TestRequestTargetSentAsWritten checks that the request line carries the
+// payload's bytes unchanged. A raw backslash, a %u escape, and a "//" target
+// each have to survive, since the bypasses depend on them.
+func TestRequestTargetSentAsWritten(t *testing.T) {
+	addr, lines := rawLineServer(t)
+	targets := []string{
+		`/static/..\..\windows\win.ini`,
+		`/a/..%u2215..%u2215etc%u2215passwd`,
+		`/download?file=%252e%252e%252fetc/passwd&x=%u2215`,
+		`///etc/passwd`,
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	for _, target := range targets {
+		// The response is not checked: the test reads the request line only.
+		send(context.Background(), client, nil, requestSpec{Method: http.MethodGet, URL: "http://" + addr + target})
+		select {
+		case got := <-lines:
+			if want := "GET " + target + " HTTP/1.1"; got != want {
+				t.Errorf("request line = %q, want %q", got, want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("no request line recorded for %q", target)
+		}
+	}
+}
+
+// verifyCase is one scenario for verifyRead. The server answers the control
+// request with controlBody (or drops the connection when controlHijack is set),
+// and answers the replay with replayBody, or probeBody when replayBody is empty.
+type verifyCase struct {
+	name          string
+	probeBody     string
+	replayBody    string
+	controlBody   string
+	controlHijack bool
+	status        int
+	want          readVerdict
+	confidence    string
+	detailHas     string
+}
+
+// TestVerifyRead checks each way a candidate read can come out: reproduced,
+// shown by the control (a catch-all), not reproduced on replay, control
+// unavailable, weak signature, and server-error status. Each case states the
+// confidence and the detail sentence the operator should see.
+func TestVerifyRead(t *testing.T) {
+	cases := []verifyCase{
+		{name: "reproduced and clean", probeBody: passwdText, controlBody: "ok",
+			want: verdictReported, confidence: ConfidenceConfirmed, detailHas: "returned it again"},
+		{name: "control shows the same signature", probeBody: passwdText, controlBody: passwdText,
+			want: verdictCatchAll},
+		{name: "replay does not show it", probeBody: passwdText, replayBody: "ok", controlBody: "ok",
+			want: verdictNotReproduced},
+		{name: "control cannot be fetched", probeBody: passwdText, controlHijack: true,
+			want: verdictReported, confidence: ConfidenceLikely, detailHas: "could not be fetched"},
+		{name: "weak signature", probeBody: "<?php echo 1;", controlBody: "ok",
+			want: verdictReported, confidence: ConfidenceLikely, detailHas: "weak one"},
+		{name: "server error status", probeBody: passwdText, controlBody: "ok", status: http.StatusInternalServerError,
+			want: verdictReported, confidence: ConfidenceLikely, detailHas: "status was 500"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f, verdict := runVerify(t, c)
+			if verdict != c.want {
+				t.Fatalf("verdict = %v, want %v", verdict, c.want)
+			}
+			if c.want != verdictReported {
+				return
+			}
+			if f.Confidence != c.confidence {
+				t.Errorf("confidence = %q, want %q", f.Confidence, c.confidence)
+			}
+			if !strings.Contains(f.Detail, c.detailHas) {
+				t.Errorf("detail = %q, want it to contain %q", f.Detail, c.detailHas)
+			}
+		})
+	}
+}
+
+// runVerify sets up one verifyCase against a test server and returns what
+// verifyRead decided.
+func runVerify(t *testing.T, c verifyCase) (Finding, readVerdict) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		name := r.URL.Query().Get("file")
+		if strings.Contains(name, negativeControlName) {
+			if c.controlHijack {
+				// Dropping the connection makes the control a transport error.
+				if hj, ok := w.(http.Hijacker); ok {
+					if conn, _, err := hj.Hijack(); err == nil {
+						conn.Close()
+					}
+				}
+				return
+			}
+			io.WriteString(w, c.controlBody)
+			return
+		}
+		// Every other request is a replay, since verifyRead is given the probe result.
+		body := c.replayBody
+		if body == "" {
+			body = c.probeBody
+		}
+		io.WriteString(w, body)
+	}))
+	t.Cleanup(srv.Close)
+
+	target, err := url.Parse(srv.URL + "/download?file=report.pdf")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	pt := queryPoint(requestSpec{Method: http.MethodGet}, target, "file")
+	p := payloadNamed(t, classicModule, "../ x1")
+	value := p.build(p.target, pt)
+	probe := pt.build(value)
+
+	status := c.status
+	if status == 0 {
+		status = http.StatusOK
+	}
+	res := &sendResult{StatusCode: status, Body: c.probeBody, Request: CapturedRequest{Method: http.MethodGet, URL: probe.URL}}
+	sig, evidence, ok := matchFile(res.Body, "", false)
+	if !ok {
+		t.Fatalf("probe body %q does not match any signature", c.probeBody)
+	}
+	deps := runDeps{client: &http.Client{Timeout: 5 * time.Second}}
+	f, verdict := verifyRead(context.Background(), deps, classicModule, pt, p, value, probe, res, sig, evidence)
+	return f, verdict
+}
+
+// TestVerifyReadDropsCancelledRun checks that a run cancelled mid-verification
+// drops the candidate instead of reporting it at a lower confidence. Both the
+// control and the replay fail on a cancelled context, and that failure must
+// not count as evidence.
+func TestVerifyReadDropsCancelledRun(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, passwdText)
+	}))
+	defer srv.Close()
+
+	target, _ := url.Parse(srv.URL + "/download?file=report.pdf")
+	pt := queryPoint(requestSpec{Method: http.MethodGet}, target, "file")
+	p := payloadNamed(t, classicModule, "../ x1")
+	value := p.build(p.target, pt)
+	probe := pt.build(value)
+	res := &sendResult{StatusCode: http.StatusOK, Body: passwdText, Request: CapturedRequest{Method: http.MethodGet, URL: probe.URL}}
+	sig, evidence, ok := matchFile(passwdText, "", false)
+	if !ok {
+		t.Fatal("passwd text does not match")
+	}
+
+	// Cancel before verification starts, so every request fails.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	deps := runDeps{client: &http.Client{Timeout: 5 * time.Second}}
+	if _, verdict := verifyRead(ctx, deps, classicModule, pt, p, value, probe, res, sig, evidence); verdict != verdictNotReproduced {
+		t.Errorf("verdict = %v on a cancelled run, want verdictNotReproduced", verdict)
+	}
+}
+
+// TestSignatures checks the strengthened signatures on both sides. The
+// /etc/passwd match needs a listing, not one quoted root line. The /proc/version
+// match needs the kernel build line, not the bare words "Linux version".
+func TestSignatures(t *testing.T) {
+	quotedRoot := "root:x:0:0:root:/root:/bin/bash\n<p>the first line of passwd</p>"
+	if _, _, ok := matchFile(quotedRoot, "", false); ok {
+		t.Error("a single quoted root line was reported as /etc/passwd")
+	}
+	if _, _, ok := matchFile(passwdText, "", false); !ok {
+		t.Error("a passwd listing was not reported")
+	}
+
+	banner := "Linux version 5.15.0-91-generic (buildd@lcy02-amd64-068) (gcc (Ubuntu 11.4.0-1ubuntu1~22.04) 11.4.0, GNU ld (GNU Binutils for Ubuntu) 2.38) #101-Ubuntu SMP Tue Nov 14 13:30:08 UTC 2023"
+	if sig, _, ok := matchFile(banner, "", false); !ok || sig.name != "/proc/version" {
+		t.Errorf("kernel banner not matched as /proc/version (ok=%v, sig=%q)", ok, sig.name)
+	}
+	if _, _, ok := matchFile("Linux version 5.4 is supported by this app.", "", false); ok {
+		t.Error("prose mentioning a Linux version was reported as /proc/version")
+	}
+}
+
+// TestMatchFilePrefersStrong checks that a strong signature beats a weak one in
+// the same text, whatever the table order, and that a weak match alone is still
+// returned, with its own weak strength.
+func TestMatchFilePrefersStrong(t *testing.T) {
+	sig, _, ok := matchFile("<?php echo 1; ?>\n"+passwdText, "", false)
+	if !ok || sig.name != "/etc/passwd" || !sig.strong {
+		t.Errorf("sig = %q (strong=%v, ok=%v), want strong /etc/passwd", sig.name, sig.strong, ok)
+	}
+	sig, _, ok = matchFile("<?php echo 1; ?>", "", false)
+	if !ok || sig.name != "PHP source" || sig.strong {
+		t.Errorf("sig = %q (strong=%v, ok=%v), want weak PHP source", sig.name, sig.strong, ok)
 	}
 }
 

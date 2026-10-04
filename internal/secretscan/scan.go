@@ -32,6 +32,11 @@ const (
 	// page -- one hit is signal, a hundred (e.g. a JWT appearing in every
 	// row of a rendered table) is just noise multiplying the result count.
 	maxMatchesPerPatternPerPage = 3
+	// maxRawMatchesPerPattern bounds how many raw regex hits one pattern is
+	// examined for on a page, before placeholder and validator filtering. It is
+	// well above maxMatchesPerPatternPerPage so filtering can skip the
+	// placeholders without cutting off a real secret that follows them.
+	maxRawMatchesPerPattern = 50
 )
 
 // Match is one secret found at one location. Value is always the masked form
@@ -134,13 +139,23 @@ func fetch(ctx context.Context, client *http.Client, target string, headers map[
 func scanText(text, location string, patterns []Pattern, withEntropy bool) []Match {
 	var matches []Match
 	for _, p := range patterns {
+		// kept counts only the hits that survive filtering, so a page whose first
+		// few matches are placeholders still reports a real key further down.
+		kept := 0
 		// Each hit keeps the secret group when the pattern has one, so the
 		// value is the credential itself and not the key name around it.
-		for _, idx := range p.Regex.FindAllStringSubmatchIndex(text, maxMatchesPerPatternPerPage) {
+		for _, idx := range p.Regex.FindAllStringSubmatchIndex(text, maxRawMatchesPerPattern) {
+			// The per-page cap applies to kept secrets, not to raw regex hits.
+			if kept >= maxMatchesPerPatternPerPage {
+				break
+			}
 			raw := secretGroup(text, idx)
-			if raw == "" || isPlaceholder(raw) {
+			// Drop empty values, documentation placeholders, and anything the
+			// pattern's own validator rejects (such as a non-JSON JWT header).
+			if raw == "" || isPlaceholder(raw) || (p.Validate != nil && !p.Validate(raw)) {
 				continue
 			}
+			kept++
 			matches = append(matches, newMatch(p.Name, "regex", raw, location, p.Engine, p.Public))
 		}
 	}

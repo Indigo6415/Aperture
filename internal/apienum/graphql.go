@@ -4,15 +4,26 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"strings"
+	"regexp"
 )
 
 // graphqlPaths is every well-known location a GraphQL endpoint turns up at
-// -- the same candidate list probescan's api_endpoints.go checks, kept in
-// sync by hand since the two packages serve different enough purposes
-// (probescan reports a misconfiguration finding; this package wants to
-// fold the endpoint into the unified route list) not to share a type.
-var graphqlPaths = []string{"/graphql", "/api/graphql", "/graphiql", "/playground", "/v1/graphql"}
+// -- the same candidate list probescan's api_endpoints.go and graphqlenum's
+// alternate paths check, kept in sync by hand since the packages serve
+// different enough purposes (probescan reports a misconfiguration finding;
+// this package wants to fold the endpoint into the unified route list) not to
+// share a type.
+var graphqlPaths = []string{
+	"/graphql", "/api/graphql", "/v1/graphql", "/v2/graphql", "/api/v1/graphql", "/api/v2/graphql",
+	"/graphql/v1", "/graphql/api", "/gql", "/api/gql", "/graph", "/api/graph", "/query", "/graphql.php",
+	"/graphiql", "/playground", "/graphql/console",
+}
+
+// graphqlErrorRe matches the wording GraphQL servers use in their own errors. A
+// response carrying a data object with __typename is confirmation on its own;
+// a bare error object needs one of these phrases, since many JSON APIs answer
+// with an "errors" key too.
+var graphqlErrorRe = regexp.MustCompile(`(?i)(graphql|cannot query field|syntax error|must provide a query|unknown type|must have a selection|unknown argument)`)
 
 // introspectionQuery asks for just enough to list queries/mutations with
 // their arguments -- a deliberately shallow query compared to
@@ -43,6 +54,32 @@ type introspectionType struct {
 	} `json:"fields"`
 }
 
+// looksLikeGraphQLResponse reports whether a response is a GraphQL answer: a
+// JSON object with a data object carrying __typename, or an error object
+// worded the way GraphQL servers word their own errors. Anything else -- an
+// HTML shell, a generic JSON envelope -- is not.
+func looksLikeGraphQLResponse(res *apiResult) bool {
+	if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusBadRequest {
+		return false
+	}
+	var m map[string]json.RawMessage
+	if json.Unmarshal(res.Body, &m) != nil {
+		return false
+	}
+	if data, ok := m["data"]; ok {
+		var d map[string]json.RawMessage
+		if json.Unmarshal(data, &d) == nil {
+			if _, hasTypename := d["__typename"]; hasTypename {
+				return true
+			}
+		}
+	}
+	if errs, ok := m["errors"]; ok {
+		return graphqlErrorRe.Match(errs)
+	}
+	return false
+}
+
 // discoverGraphQL checks every well-known GraphQL path with a universal
 // "{__typename}" query (same confirmation technique as
 // graphqlenum.Run -- see its doc comment for why that's the right first
@@ -58,10 +95,7 @@ func discoverGraphQL(ctx context.Context, c *apiClient, t *Target) (*GraphQLSumm
 		}
 		url := t.URL + p
 		res, err := c.do(ctx, http.MethodPost, url, map[string]string{"Content-Type": "application/json"}, false, []byte(`{"query":"{__typename}"}`))
-		if err != nil || res.StatusCode != 200 {
-			continue
-		}
-		if !strings.Contains(res.Text, `"data"`) && !strings.Contains(res.Text, `"errors"`) {
+		if err != nil || !looksLikeGraphQLResponse(res) {
 			continue
 		}
 		summary := &GraphQLSummary{Found: true, URL: url}

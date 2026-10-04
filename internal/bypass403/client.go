@@ -29,6 +29,22 @@ type httpResult struct {
 	StatusCode    int
 	ContentLength int // len(Body) actually read, capped by maxBodyBytes
 	BodyLower     string
+	// Location and ContentType are the response headers the judging rules
+	// read: a redirect's destination (sign-in detection) and the body's type.
+	Location    string
+	ContentType string
+}
+
+// newHTTPResult builds the trimmed response every attempt is judged by from a
+// raw http.Response and its already-read body.
+func newHTTPResult(resp *http.Response, body []byte) *httpResult {
+	return &httpResult{
+		StatusCode:    resp.StatusCode,
+		ContentLength: len(body),
+		BodyLower:     strings.ToLower(string(body)),
+		Location:      resp.Header.Get("Location"),
+		ContentType:   resp.Header.Get("Content-Type"),
+	}
 }
 
 // doAttempt issues one bypass attempt's request. literalTarget is the exact,
@@ -69,7 +85,7 @@ func doAttempt(ctx context.Context, client *http.Client, method, scheme, connect
 	if err != nil {
 		return nil, err
 	}
-	return &httpResult{StatusCode: resp.StatusCode, ContentLength: len(body), BodyLower: strings.ToLower(string(body))}, nil
+	return newHTTPResult(resp, body), nil
 }
 
 // rawRequestOptions tunes doRawRequest beyond the request line itself.
@@ -162,5 +178,5 @@ func doRawRequest(ctx context.Context, scheme, connectHost, hostHeader, literalT
 	// Feed the outcome to the governor so a WAF blocking raw requests pauses
 	// the host the same way it would pause http.Client traffic.
 	netgov.Report(connectHost, resp.StatusCode, resp.Header, body)
-	return &httpResult{StatusCode: resp.StatusCode, ContentLength: len(body), BodyLower: strings.ToLower(string(body))}, nil
+	return newHTTPResult(resp, body), nil
 }

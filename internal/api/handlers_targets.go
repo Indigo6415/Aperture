@@ -314,32 +314,76 @@ func (s *Server) handlePingTargetList(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	writeJSON(w, http.StatusOK, pingTargets(r.Context(), targets))
+	// Results are streamed as NDJSON: one pingResult per line, flushed the
+	// moment each check finishes, so the UI can show verdicts as they land
+	// instead of waiting for the whole list.
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.WriteHeader(http.StatusOK)
+	flusher, _ := w.(http.Flusher)
+	enc := json.NewEncoder(w)
+	if flusher != nil {
+		flusher.Flush()
+	}
+
+	streamPingTargets(r.Context(), targets, func(_ int, res pingResult) {
+		// A failed write means the browser went away; the request context is
+		// then cancelled, so the remaining checks wind down on their own.
+		if err := enc.Encode(res); err != nil {
+			return
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+	})
 }
 
-// pingTargets checks each target with up to pingConcurrency running at once.
-// Results come back in the same order as targets, so the UI can line them up
-// with the list it already has on screen.
-func pingTargets(ctx context.Context, targets []store.Target) []pingResult {
+// streamPingTargets checks each target with up to pingConcurrency running at
+// once and calls emit for every verdict as soon as it is ready. emit is only
+// ever called from the caller's goroutine, so it needs no locking. The index
+// passed to emit is the target's position in targets.
+func streamPingTargets(ctx context.Context, targets []store.Target, emit func(int, pingResult)) {
 	// Routed through netgov like every other outbound scan. Redirects are not
 	// followed: a 3xx is itself proof the host answered.
 	client := netgov.NewClient(pingTimeout, false)
 
-	out := make([]pingResult, len(targets))
-	sem := make(chan struct{}, pingConcurrency)
-	var wg sync.WaitGroup
-	// The send on sem blocks while pingConcurrency checks are already in
-	// flight, which is what keeps the number of running goroutines bounded.
-	for i, t := range targets {
-		sem <- struct{}{}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			defer func() { <-sem }()
-			out[i] = pingTarget(ctx, client, t)
-		}()
+	type indexed struct {
+		i   int
+		res pingResult
 	}
-	wg.Wait()
+	done := make(chan indexed)
+
+	// The producer runs in its own goroutine so this function can drain done
+	// and emit each verdict while checks are still running.
+	go func() {
+		sem := make(chan struct{}, pingConcurrency)
+		var wg sync.WaitGroup
+		// The send on sem blocks while pingConcurrency checks are already in
+		// flight, which is what keeps the number of running goroutines bounded.
+		for i, t := range targets {
+			sem <- struct{}{}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer func() { <-sem }()
+				done <- indexed{i, pingTarget(ctx, client, t)}
+			}()
+		}
+		wg.Wait()
+		close(done)
+	}()
+
+	for d := range done {
+		emit(d.i, d.res)
+	}
+}
+
+// pingTargets runs streamPingTargets to completion and returns every verdict
+// in the same order as targets, for callers that want the whole batch at once.
+func pingTargets(ctx context.Context, targets []store.Target) []pingResult {
+	out := make([]pingResult, len(targets))
+	streamPingTargets(ctx, targets, func(i int, res pingResult) {
+		out[i] = res
+	})
 	return out
 }
 

@@ -15,7 +15,8 @@
 //   - the path itself: each segment replaced in turn, and a segment appended
 //     at the end (see pathSegmentPoint and pathSuffixPoint);
 //   - the request body when the operator supplies one: every string leaf of a
-//     JSON body, or every field of a form-encoded body;
+//     JSON body, every text node of an XML body, or every field of a
+//     form-encoded body;
 //   - a fixed set of request headers that apps read as file or path names
 //     (X-Original-URL, X-File-Name, ...);
 //   - cookies: those the operator sent, those the seed response set, and a
@@ -23,10 +24,10 @@
 //
 // Six check modules run against every point (see modules in payloads.go):
 // classic ../ sequences, Windows separators and paths, encoding and
-// filter-evasion bypasses, absolute paths and file:// URLs, the PHP
-// php://filter base64 wrapper, and the nginx alias off-by-slash for path
-// segments. Each module stops at the first payload that reads a file on a
-// given point.
+// filter-evasion bypasses (including IIS %u escapes), absolute paths and
+// file:// URLs, the PHP php://filter base64 wrapper, and the nginx alias
+// off-by-slash for path segments. Each module stops at the first payload that
+// reads a file on a given point.
 //
 // One further module, oob-callback (see oob.go), runs only when a callback
 // listener is configured. It is the exception to the rule above: it puts a
@@ -37,7 +38,10 @@
 // baseline did not contain. A negative control then sends the same request
 // with a nonexistent file in its place. If that control also shows the
 // signature, the page always contains it, so the point is dropped as a
-// catch-all. Shaped like the other scanners: a battery of check modules, each
+// catch-all. A replay then sends the probe again, and a match that does not
+// come back is dropped as a one-off. Confidence is "confirmed" only when the
+// signature is strong, the status is below 500, and both checks ran; a check
+// that could not be fetched leaves the finding at "likely". Shaped like the other scanners: a battery of check modules, each
 // with fixed severity and findings present even when empty.
 package pathtraversal
 
@@ -50,6 +54,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/Indigo6415/Aperture/internal/paramminer"
 	"github.com/Indigo6415/Aperture/internal/scanprogress"
 )
 
@@ -78,6 +83,10 @@ type Finding struct {
 	StatusCode int    `json:"statusCode,omitempty"`
 	// Confidence is "confirmed" or "likely" (see the constants above).
 	Confidence string `json:"confidence,omitempty"`
+	// Callback is true when the target called back to Aperture's collaborator
+	// listener, which proves the finding out-of-band. The frontend shows a
+	// CALLBACK tag for it.
+	Callback bool `json:"callback,omitempty"`
 	// Request is the exact request this finding sent, so the frontend's "Send to
 	// Tester" action can replay it.
 	Request *CapturedRequest `json:"request,omitempty"`
@@ -105,8 +114,12 @@ type Request struct {
 	ContentType string `json:"contentType,omitempty"`
 	// Params are extra query parameter names to test on URL, beyond the ones
 	// it already carries and the common list.
-	Params  []string          `json:"params,omitempty"`
-	Headers map[string]string `json:"headers,omitempty"`
+	Params []string `json:"params,omitempty"`
+	// MineParams, when true, runs parameter mining (internal/paramminer) against
+	// the GET query of URL and folds every hidden parameter it finds into Params,
+	// so the rest of the run tests them too. Off by default.
+	MineParams bool              `json:"mineParams,omitempty"`
+	Headers    map[string]string `json:"headers,omitempty"`
 	// RecursionDepth is how many hops of same-origin links the crawl follows
 	// beyond URL. 0 scans only that page.
 	RecursionDepth int `json:"recursionDepth,omitempty"`
@@ -157,6 +170,12 @@ func Run(ctx context.Context, req Request, oob OOBConfig) (*Result, error) {
 		return nil, err
 	}
 
+	// Parameter mining folds hidden names into req.Params before anything
+	// reads them, so every candidate-building path below picks them up.
+	if req.MineParams {
+		req.Params = append(append([]string{}, req.Params...), paramminer.Names(ctx, seed, req.Headers, newClient(), req.Params)...)
+	}
+
 	method := strings.ToUpper(strings.TrimSpace(req.Method))
 	if method == "" {
 		method = http.MethodGet
@@ -169,11 +188,15 @@ func Run(ctx context.Context, req Request, oob OOBConfig) (*Result, error) {
 	contentType := req.ContentType
 	if req.Body != "" {
 		if contentType == "" {
-			// Same rule bodyPoints uses: JSON-looking bodies are JSON.
+			// Same rules bodyPoints uses: JSON-looking bodies are JSON,
+			// angle-bracket bodies are XML, and anything else is form-encoded.
 			trimmed := strings.TrimSpace(req.Body)
-			if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
+			switch {
+			case strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "["):
 				contentType = "application/json"
-			} else {
+			case strings.HasPrefix(trimmed, "<"):
+				contentType = "application/xml"
+			default:
 				contentType = "application/x-www-form-urlencoded"
 			}
 		}
@@ -380,13 +403,32 @@ func indexed(pts []point) []indexedPoint {
 	return out
 }
 
+// readVerdict is what checking one signature match came to.
+type readVerdict int
+
+const (
+	// verdictReported means the match held up and a finding was made.
+	verdictReported readVerdict = iota
+	// verdictCatchAll means the nonexistent-file control showed the same
+	// signature. The point returns it for any input, so later payloads on the
+	// point are not worth sending either.
+	verdictCatchAll
+	// verdictNotReproduced means the replay did not show the signature. The
+	// first match was a one-off, so the point is dropped, but later payloads
+	// on it are still tried.
+	verdictNotReproduced
+)
+
 // probePoint tries the module's payloads on one point in order, and stops at the
 // first that reads a file. It returns that finding and true, or false when no
 // payload reads anything.
 func probePoint(ctx context.Context, deps runDeps, m module, pt point) (Finding, bool) {
+	// Payloads run in module order. Each one that does not read a file moves
+	// the loop on to the next.
 	for _, p := range m.payloads {
 		value := p.build(p.target, pt)
-		res := send(ctx, deps.client, deps.sem, pt.build(value))
+		probe := pt.build(value)
+		res := send(ctx, deps.client, deps.sem, probe)
 		if res.Err != nil {
 			continue
 		}
@@ -395,33 +437,109 @@ func probePoint(ctx context.Context, deps runDeps, m module, pt point) (Finding,
 			continue
 		}
 
-		// Negative control: the same request with a file that does not exist.
-		// If the signature still shows, the response carries it regardless of
-		// input, so this point is a catch-all and is dropped.
-		control := send(ctx, deps.client, deps.sem, pt.build(p.build(negativeControlName, pt)))
-		if control.Err == nil {
-			if _, _, again := matchFile(control.Body, deps.baseline, m.decodeBase64); again {
-				return Finding{}, false
-			}
+		f, verdict := verifyRead(ctx, deps, m, pt, p, value, probe, res, sig, evidence)
+		switch verdict {
+		case verdictReported:
+			return f, true
+		case verdictCatchAll:
+			return Finding{}, false
 		}
-
-		confidence := ConfidenceLikely
-		if sig.strong {
-			confidence = ConfidenceConfirmed
-		}
-		captured := res.Request
-		return Finding{
-			Label:      "Arbitrary file read via " + pt.label,
-			Detail:     fmt.Sprintf("Payload %q (%s) returned the contents of %s. A control request for a nonexistent file at the same point did not.", value, p.name, sig.name),
-			Evidence:   truncate(evidence, 200),
-			Payload:    value,
-			Method:     res.Request.Method,
-			StatusCode: res.StatusCode,
-			Confidence: confidence,
-			Request:    &captured,
-		}, true
 	}
 	return Finding{}, false
+}
+
+// verifyRead checks one signature match before it becomes a finding. It sends
+// the negative control and a replay of the probe, and sets the confidence from
+// what those showed. A match the control reproduces is a catch-all, and a
+// match the replay does not reproduce is dropped. A control or replay that
+// cannot be fetched does not drop the match, but caps it at "likely", since
+// the check that would have ruled out a false positive did not run.
+func verifyRead(ctx context.Context, deps runDeps, m module, pt point, p payload, value string, probe requestSpec, res *sendResult, sig fileSig, evidence string) (Finding, readVerdict) {
+	confidence := ConfidenceConfirmed
+	// Each caveat is one sentence of the detail, saying why the finding is not
+	// fully confirmed.
+	var caveats []string
+	if !sig.strong {
+		confidence = ConfidenceLikely
+		caveats = append(caveats, "The signature is a weak one that can appear on ordinary pages.")
+	}
+	// A server error can still carry file text in its body, for example a
+	// debug trace that quotes source, so the finding stays at "likely".
+	if res.StatusCode >= 500 {
+		confidence = ConfidenceLikely
+		caveats = append(caveats, fmt.Sprintf("The response status was %d, so the text may come from an error page.", res.StatusCode))
+	}
+
+	// Negative control: the same request with a file that does not exist. A
+	// signature the control also shows means the page carries it regardless of
+	// input.
+	control := sendWithRetry(ctx, deps, pt.build(p.build(negativeControlName, pt)))
+	controlRan := control.Err == nil
+	if controlRan {
+		if _, _, again := matchFile(control.Body, deps.baseline, m.decodeBase64); again {
+			return Finding{}, verdictCatchAll
+		}
+	} else {
+		confidence = ConfidenceLikely
+		caveats = append(caveats, "The negative control could not be fetched, so a catch-all page cannot be ruled out.")
+	}
+
+	// A cancelled run cannot verify anything. The candidate is dropped rather
+	// than reported at a lower confidence because of the cancellation.
+	if ctx.Err() != nil {
+		return Finding{}, verdictNotReproduced
+	}
+
+	// Replay: the same probe again. A real read returns the same contents every
+	// time, but a one-off page, a rate-limit message, or a flaky backend may
+	// not.
+	replay := send(ctx, deps.client, deps.sem, probe)
+	replayRan := replay.Err == nil
+	if replayRan {
+		if _, _, again := matchFile(replay.Body, deps.baseline, m.decodeBase64); !again {
+			return Finding{}, verdictNotReproduced
+		}
+	} else {
+		confidence = ConfidenceLikely
+		caveats = append(caveats, "The replay could not be fetched, so the read was not seen twice.")
+	}
+
+	// The detail names every check that ran and what it showed, so the operator
+	// can see how the finding was reached.
+	detail := fmt.Sprintf("Payload %q (%s) returned the contents of %s.", value, p.name, sig.name)
+	if controlRan {
+		detail += " A control request for a nonexistent file at the same point did not."
+	}
+	if replayRan {
+		detail += " Sending the payload again returned it again."
+	}
+	for _, c := range caveats {
+		detail += " " + c
+	}
+
+	captured := res.Request
+	return Finding{
+		Label:      "Arbitrary file read via " + pt.label,
+		Detail:     detail,
+		Evidence:   truncate(evidence, 200),
+		Payload:    value,
+		Method:     res.Request.Method,
+		StatusCode: res.StatusCode,
+		Confidence: confidence,
+		Request:    &captured,
+	}, verdictReported
+}
+
+// sendWithRetry sends spec and sends it once more on a transport error, unless
+// the run itself was cancelled. Used for the negative control, where one
+// dropped connection would otherwise leave a point unverified.
+func sendWithRetry(ctx context.Context, deps runDeps, spec requestSpec) *sendResult {
+	res := send(ctx, deps.client, deps.sem, spec)
+	// A cancelled run is not retried, since another attempt cannot succeed.
+	if res.Err != nil && ctx.Err() == nil {
+		res = send(ctx, deps.client, deps.sem, spec)
+	}
+	return res
 }
 
 // truncate shortens s to at most n bytes, marking the cut.

@@ -3,6 +3,7 @@ import { api } from '../api'
 import type { JwtScannerRequest } from '../jwtHandoff'
 import type { CallbackSelection, CaseScan, Credential, JwtAttempt, JwtScanResponse, JwtTestResult, JwtTestStatus, Target, WordlistInfo } from '../types'
 import { CopyButton } from './CopyButton'
+import { StatusBadge } from './FindingBadges'
 import { CollapsibleFormPanel } from './CollapsibleFormPanel'
 import { TargetButtons } from './TargetButtons'
 import { CredentialPicker } from './CredentialPicker'
@@ -645,7 +646,7 @@ function AttemptRow({ attempt }: { attempt: JwtAttempt }) {
       {attempt.error ? (
         <span className="shrink-0 text-neutral-600">error</span>
       ) : (
-        <span className="shrink-0 text-neutral-500">{attempt.httpStatus}</span>
+        <StatusBadge code={attempt.httpStatus} />
       )}
     </li>
   )

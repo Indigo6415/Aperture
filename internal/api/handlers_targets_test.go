@@ -41,3 +41,42 @@ func TestPingTargetsAliveAndDead(t *testing.T) {
 		t.Errorf("dead target: got %+v, want not alive with an error", got[1])
 	}
 }
+
+// TestStreamPingTargetsEmitsAsFinished checks that a fast target's verdict is
+// emitted before a slow one that was listed first, so the UI can show results
+// as they land. Each verdict still carries the index of its target.
+func TestStreamPingTargetsEmitsAsFinished(t *testing.T) {
+	// The first target's handler blocks until the test releases it, so it
+	// cannot finish before the fast target has been emitted.
+	release := make(chan struct{})
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+		http.NotFound(w, r)
+	}))
+	defer slow.Close()
+	fast := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer fast.Close()
+
+	targets := []store.Target{
+		{ID: "slow", Value: slow.URL},
+		{ID: "fast", Value: fast.URL},
+	}
+
+	var order []string
+	streamPingTargets(context.Background(), targets, func(i int, res pingResult) {
+		order = append(order, res.TargetID)
+		if res.TargetID == "fast" {
+			// The fast verdict has arrived; now let the slow check finish.
+			close(release)
+		}
+		if targets[i].ID != res.TargetID {
+			t.Errorf("index %d paired with target %q, want %q", i, res.TargetID, targets[i].ID)
+		}
+	})
+
+	if len(order) != 2 || order[0] != "fast" || order[1] != "slow" {
+		t.Errorf("emit order = %v, want [fast slow]", order)
+	}
+}

@@ -5,23 +5,23 @@ import (
 	"strings"
 )
 
-// flaskDjangoChecks ports flask_django.py's CHECKS table.
+// flaskDjangoChecks ports flask_django.py's CHECKS table. Paths that another
+// module already reports are left out: /django-admin/ belongs to admin_panels,
+// /media/ to directories, and the DEBUG probe to the explicit check below.
 var flaskDjangoChecks = []pathCheck{
-	{"/console", "Werkzeug interactive debugger", containsAny("werkzeug", "interactive console", "debugger")},
-	{"/?__debugger__=yes", "Werkzeug debugger probe", containsAny("werkzeug", "traceback")},
-	{"/django-admin/", "Django admin panel", containsAll("django", "login")},
+	{"/console", "Werkzeug interactive debugger", containsAll("werkzeug", "debugger")},
+	{"/?__debugger__=yes", "Werkzeug debugger probe", containsAll("werkzeug", "traceback")},
 	{"/admin/login/", "Django admin login", containsAll("csrfmiddlewaretoken", "django")},
 	{"/__debug__/", "Django debug toolbar", containsAny("djdt", "debug toolbar")},
-	{"/__debug__/sql_select/", "Django debug toolbar SQL panel", containsAny("sql")},
-	{"/this-path-should-not-exist", "Django DEBUG mode enabled", containsAll("django", "traceback", "request information")},
 	{"/api/", "Django REST framework browsable API", containsAny("django rest framework", "browsable api")},
 	{"/debug", "Flask debug page", containsAll("flask", "debug")},
-	{"/config", "Exposed config endpoint", containsAny("secret", "debug", "database")},
-	{"/settings", "Exposed settings endpoint", containsAny("secret", "debug")},
+	// A config or settings endpoint is only a leak when it is JSON that names
+	// the settings themselves, not an HTML page that mentions a secret somewhere.
+	{"/config", "Exposed config endpoint", validJSONKeys("SECRET_KEY", "DEBUG", "DATABASE_URI", "SQLALCHEMY_DATABASE_URI", "DATABASES")},
+	{"/settings", "Exposed settings endpoint", validJSONKeys("SECRET_KEY", "DEBUG", "DATABASES", "INSTALLED_APPS")},
 	{"/static/admin/", "Django static admin files exposed", containsAny("index of")},
-	{"/media/", "Django media directory exposed", containsAny("index of")},
-	{"/flower/", "Celery Flower task monitor", containsAny("flower", "celery")},
-	{"/flower/dashboard", "Celery Flower dashboard", containsAny("flower", "celery")},
+	{"/flower/", "Celery Flower task monitor", containsAll("flower", "celery")},
+	{"/flower/dashboard", "Celery Flower dashboard", containsAll("flower", "celery")},
 }
 
 // detectFlaskDjango inspects the homepage's headers/body/cookies to decide

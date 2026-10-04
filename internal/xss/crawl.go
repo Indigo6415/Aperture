@@ -96,7 +96,18 @@ type crawlQueuedPage struct {
 // than a derived injectionPoint.
 type crawledPage struct {
 	URL, Body string
+	// Script is true for a same-origin external .js file, whose whole body is
+	// script (no <script> tags to strip). See crawl's external-script step.
+	Script bool
 }
+
+// maxExternalScripts caps how many same-origin external script files the crawl
+// downloads for the DOM-sink check. Each one is a separate request, so an
+// uncapped page with dozens of bundles would multiply the crawl's cost.
+const maxExternalScripts = 10
+
+// crawlScriptSrcPattern matches a <script src=...> reference on a page.
+var crawlScriptSrcPattern = regexp.MustCompile(`(?is)<script[^>]+src\s*=\s*["']([^"']+)["']`)
 
 type crawlResult struct {
 	PagesScanned []string
@@ -136,6 +147,10 @@ func crawl(ctx context.Context, client *http.Client, seed *url.URL, req Request)
 	policy := robots.Load(ctx, client, seed, req.Headers)
 	queue := []crawlQueuedPage{{seed.String(), 0}}
 	firstPage := true
+	// scriptURLs collects the same-origin external scripts the crawled pages
+	// load, in discovery order, with scriptSeen de-duplicating them.
+	var scriptURLs []*url.URL
+	scriptSeen := map[string]bool{}
 
 	for len(queue) > 0 && len(visited) < maxPages {
 		if ctx.Err() != nil {
@@ -182,6 +197,20 @@ func crawl(ctx context.Context, client *http.Client, seed *url.URL, req Request)
 			firstPage = false
 		}
 
+		// Same-origin external scripts are remembered here and fetched once the
+		// crawl ends, so a shared bundle referenced from many pages is read once.
+		for _, m := range crawlScriptSrcPattern.FindAllStringSubmatch(body, -1) {
+			src, err := pageURL.Parse(m[1])
+			if err != nil || !strings.EqualFold(src.Host, seed.Host) {
+				continue
+			}
+			src.Fragment = ""
+			if key := src.String(); !scriptSeen[key] {
+				scriptSeen[key] = true
+				scriptURLs = append(scriptURLs, src)
+			}
+		}
+
 		if item.depth >= req.RecursionDepth {
 			continue
 		}
@@ -196,6 +225,23 @@ func crawl(ctx context.Context, client *http.Client, seed *url.URL, req Request)
 			}
 			queue = append(queue, crawlQueuedPage{resolved.String(), item.depth + 1})
 		}
+	}
+
+	// Fetch the external scripts after the page crawl, up to the cap. Each goes
+	// through the same client, headers, and robots policy as the pages do, and
+	// only a 2xx answer counts.
+	for i, su := range scriptURLs {
+		if i >= maxExternalScripts {
+			break
+		}
+		if !policy.Allowed(su) {
+			continue
+		}
+		res := fetchPlain(ctx, client, su.String(), req.Headers)
+		if res.Err != nil || res.StatusCode < 200 || res.StatusCode >= 300 {
+			continue
+		}
+		pages = append(pages, crawledPage{URL: su.String(), Body: res.Body, Script: true})
 	}
 
 	sort.Slice(points, func(i, j int) bool {

@@ -261,6 +261,15 @@ export function Xxe({ caseId, targets, credentials }: { caseId: string; targets:
   )
 }
 
+// endpointsOf returns a result's endpoints, or [] when the field is missing or
+// null. Results saved before the backend started returning [] for an empty run
+// still carry null here, and reading .length on that would crash the page.
+function endpointsOf(result: XxeResponse | undefined): XxeResponse['endpoints'] {
+  return result?.endpoints ?? []
+}
+
+// xxeSummary is the one-line status a scan card shows in the batch header and
+// the history list.
 function xxeSummary(scan: TargetScanState): BatchResultSummary {
   if (scan.status === 'cancelled') return stoppedSummary
   if (scan.status === 'running') return { label: 'Running…', tone: 'neutral', running: true }
@@ -268,7 +277,7 @@ function xxeSummary(scan: TargetScanState): BatchResultSummary {
   const result = scan.result
   // An auto-discover run that found no XML endpoint has nothing to report, so
   // it is not a clean pass.
-  if (result && result.endpoints.length === 0) return { label: 'No XML endpoints', tone: 'neutral' }
+  if (result && endpointsOf(result).length === 0) return { label: 'No XML endpoints', tone: 'neutral' }
   const modules = result?.modules ?? []
   const total = totalFindingsOf(modules)
   if (total === 0) return { label: 'Clean', tone: 'clean' }
@@ -294,6 +303,7 @@ function TargetScanCard({ target, scan }: { target: string; scan: TargetScanStat
   const findings = result?.modules.flatMap((m) => m.findings) ?? []
   const confirmed = findings.filter((f) => f.confidence === 'confirmed').length
   const likely = findings.filter((f) => f.confidence === 'likely').length
+  const endpoints = endpointsOf(result)
 
   return (
     <div className="space-y-3 rounded-lg border border-neutral-800 bg-neutral-950/40 p-3">
@@ -312,7 +322,7 @@ function TargetScanCard({ target, scan }: { target: string; scan: TargetScanStat
                 Baseline → <span className="font-mono text-neutral-200">{result.baseline.statusCode}</span>
               </span>
               <span>
-                Endpoints tested → <span className="font-mono text-neutral-300">{result.endpoints.length}</span>
+                Endpoints tested → <span className="font-mono text-neutral-300">{endpoints.length}</span>
               </span>
               <span>
                 Injection points → <span className="font-mono text-neutral-300">{result.pointsTested}</span>
@@ -326,15 +336,15 @@ function TargetScanCard({ target, scan }: { target: string; scan: TargetScanStat
             </div>
           </div>
 
-          {result.endpoints.length === 0 && (
+          {endpoints.length === 0 && (
             <div className="rounded-lg border border-dashed border-neutral-800 p-3 text-xs text-neutral-500">
               No same-origin endpoint answered XML, so nothing was tested. This is not a clean result.
             </div>
           )}
 
-          {result.endpoints.length > 0 && (
+          {endpoints.length > 0 && (
             <ul className="space-y-1 rounded-lg border border-neutral-800 bg-neutral-900 p-3 text-xs">
-              {result.endpoints.map((e) => (
+              {endpoints.map((e) => (
                 <li key={`${e.method} ${e.url}`} className="flex flex-wrap items-baseline gap-x-2">
                   <span className="font-mono text-neutral-300">
                     {e.method} {e.url}

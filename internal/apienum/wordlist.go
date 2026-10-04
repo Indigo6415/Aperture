@@ -58,7 +58,9 @@ func bruteforceRoots(existing []Route) []string {
 		last := segs[len(segs)-1]
 		if m := versionSegment.FindStringSubmatch(last); m != nil {
 			n, _ := strconv.Atoi(m[1])
-			for _, next := range []int{n + 1, n + 2} {
+			// Newer versions, and the two versions just below: an older
+			// deprecated version often keeps routes that a newer one has locked down.
+			for _, next := range versionSiblings(n) {
 				segs[len(segs)-1] = fmt.Sprintf("v%d", next)
 				roots["/"+strings.Join(segs, "/")] = true
 			}
@@ -72,15 +74,31 @@ func bruteforceRoots(existing []Route) []string {
 	return out
 }
 
+// versionSiblings returns the version numbers worth guessing next to a
+// discovered version n: the two below it (down to v1) and the two above.
+func versionSiblings(n int) []int {
+	var out []int
+	for v := n - 2; v < n; v++ {
+		if v >= 1 {
+			out = append(out, v)
+		}
+	}
+	return append(out, n+1, n+2)
+}
+
 // bruteforcePaths tries every wordlist entry (the bundled default plus any
 // caller-supplied extra) under every root concurrently -- bounded by the
 // client's own concurrency cap and rate limiter, so this phase paces
-// itself exactly like every other request this package sends -- keeping
-// only paths that come back something other than a 404 or a 502 (a gateway
-// error that says nothing about the route). Each kept
-// path becomes an uncertain-bucket Route (Confirmed: false, same posture
-// as mineJS's finds), left for characterize.go to decide confirmed or not
-// from an actual per-method probe.
+// itself exactly like every other request this package sends.
+//
+// A guess is kept only when it answers something other than a 404 or a 502
+// (a gateway error says nothing about the route), and when it does not match
+// the directory's soft-404 profile: a host that answers every unknown path with
+// the same 200 page would otherwise make every word a "route". Requests go
+// through the no-redirect client, so a redirect is recorded as the answer it
+// is. Each kept path becomes an uncertain-bucket Route (Confirmed: false, same
+// posture as mineJS's finds), left for characterize.go to decide confirmed or
+// not from an actual per-method probe.
 func bruteforcePaths(ctx context.Context, c *apiClient, t *Target, roots, extra []string, onProgress func(done, total int)) []Route {
 	words := append(append([]string{}, defaultWordlist()...), extra...)
 
@@ -120,7 +138,7 @@ func bruteforcePaths(ctx context.Context, c *apiClient, t *Target, roots, extra 
 			if ctx.Err() != nil {
 				return
 			}
-			res, err := c.get(ctx, t.URL+p)
+			res, err := c.getNoFollow(ctx, t.URL+p)
 			// A plain 404 means "not here" and a 502 means a gateway in front
 			// of the app couldn't reach an upstream -- neither says anything
 			// about whether the route exists. Everything else (2xx, a 401/
@@ -128,6 +146,12 @@ func bruteforcePaths(ctx context.Context, c *apiClient, t *Target, roots, extra 
 			// at least not "unmapped") is worth keeping for characterization
 			// to make the real confirmed/uncertain call on.
 			if err != nil || res.StatusCode == http.StatusNotFound || res.StatusCode == http.StatusBadGateway {
+				return
+			}
+			// The directory's own "not found" answer is not a route, even when
+			// it's a 200. The profile is per directory, so a guess is judged
+			// against the same directory it sits in.
+			if prof := c.catchAllFor(ctx, t, catchAllDir(parentDir(p))); prof.Matches(observe(res)) {
 				return
 			}
 			mu.Lock()

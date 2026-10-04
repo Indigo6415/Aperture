@@ -87,10 +87,19 @@ type MethodProbe struct {
 // request got back alongside it. RequiresAuth is the derived verdict a
 // caller can render directly rather than re-deriving it from the two codes
 // every time.
+//
+// Verdict names what the unauthenticated answer means: "public", "requires-auth"
+// (401), "forbidden" (403), "login-redirect" (a 3xx to a sign-in page),
+// "site-wide-gate" (the same 401/403/login answer comes back for a nonexistent
+// path in the same directory, so the control isn't this route's own; RequiresAuth
+// is false then), "not-found", "unreachable", or "other". Challenge is the
+// WWW-Authenticate header, when one came back.
 type AuthProbe struct {
-	UnauthenticatedStatus int  `json:"unauthenticatedStatus"`
-	AuthenticatedStatus   *int `json:"authenticatedStatus,omitempty"`
-	RequiresAuth          bool `json:"requiresAuth"`
+	UnauthenticatedStatus int    `json:"unauthenticatedStatus"`
+	AuthenticatedStatus   *int   `json:"authenticatedStatus,omitempty"`
+	RequiresAuth          bool   `json:"requiresAuth"`
+	Verdict               string `json:"verdict,omitempty"`
+	Challenge             string `json:"challenge,omitempty"`
 }
 
 // Route is one discovered endpoint, method-agnostic (MethodProbe is where
@@ -212,6 +221,11 @@ type Options struct {
 	// default wordlist brute force draws from (see wordlist.go) -- e.g. a
 	// wordlist the operator has already downloaded/curated for this target.
 	ExtraWordlist []string
+	// AllowWriteMethods lets characterization send PUT, PATCH and DELETE to
+	// each route, with a sample body. Those requests can change or delete data
+	// on the target, so they are off by default; the method swap then sends
+	// GET and POST only. See isWriteMethod.
+	AllowWriteMethods bool
 	// Progress, when set, receives one check per module as it starts and
 	// finishes. Nil means nobody is watching.
 	Progress scanprogress.Reporter `json:"-"`

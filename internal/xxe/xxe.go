@@ -22,11 +22,21 @@
 //     parser reports that path back, it has tried to open it. Confidence is
 //     "likely", not "confirmed", because a parser error can prove the
 //     resolution without proving a read.
+//   - local-dtd-error: a DTD already on the server, redefined from the
+//     DOCTYPE so that a missing-file error carries /etc/passwd's first line.
+//     The file's contents in the response prove the read, so it is confirmed.
 //   - xinclude: an XInclude element, for when the operator cannot add a DOCTYPE.
 //   - ssrf-metadata: an external entity pointing at a cloud metadata service.
 //   - oob-callback: a blind XXE. Payloads point at Aperture's collaborator
 //     listener, and a callback is the only proof that works when nothing
-//     reaches the response. Confidence is "confirmed".
+//     reaches the response. Variants are a general entity, a parameter entity,
+//     an external DTD named in the DOCTYPE, and an out-of-band file read whose
+//     callback carries /etc/passwd (confirmed as a file read), plus a DNS
+//     hostname when a DNS domain is set. Confidence is "confirmed".
+//
+// Every text value and every attribute value of the operator's XML is an
+// injection point. Payloads that reference an external entity from a value
+// are skipped on attribute values, since XML forbids that in an attribute.
 //
 // Denial-of-service variants (billion-laughs-style entity expansion) are
 // deliberately left out, since their only effect is to exhaust the target.
@@ -42,6 +52,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -80,8 +91,12 @@ type Finding struct {
 	Method     string `json:"method,omitempty"`
 	StatusCode int    `json:"statusCode,omitempty"`
 	// Confidence is "confirmed" or "likely" (see the constants above).
-	Confidence string           `json:"confidence,omitempty"`
-	Request    *CapturedRequest `json:"request,omitempty"`
+	Confidence string `json:"confidence,omitempty"`
+	// Callback is true when the parser called back to Aperture's collaborator
+	// listener, which proves the finding out-of-band. The frontend shows a
+	// CALLBACK tag for it.
+	Callback bool             `json:"callback,omitempty"`
+	Request  *CapturedRequest `json:"request,omitempty"`
 }
 
 // ModuleResult is one check module's outcome across every endpoint tested.
@@ -266,7 +281,9 @@ func Run(ctx context.Context, req Request, oob OOBConfig) (*Result, error) {
 		targets = []discovered{{target: seed, source: "seed"}}
 	}
 
-	res := &Result{OOBEnabled: oobConfigured(oob)}
+	// Endpoints starts as an empty slice, not nil, so a run that tests no
+	// endpoint still serializes as [] rather than null for the frontend.
+	res := &Result{OOBEnabled: oobConfigured(oob), Endpoints: []EndpointResult{}}
 	merged := map[string]*ModuleResult{}
 	var order []string
 	baselineSet := false
@@ -427,6 +444,11 @@ func (e *endpointRun) runPoints(mod moduleMeta, points []leaf, check func(pt lea
 // they would only repeat the same read.
 func (e *endpointRun) runInband(ctx context.Context, m inbandModule, pt leaf) []Finding {
 	for _, p := range m.payloads {
+		// A text-only payload cannot go in an attribute value, and the parser
+		// would reject the whole document for it. Skip it on that point.
+		if pt.attr != "" && p.needsText {
+			continue
+		}
 		// The signature is already in the untouched response, so a match
 		// here says nothing about this point. Skip the payload.
 		if p.pattern.MatchString(e.baseline.Body) {
@@ -493,6 +515,11 @@ func (e *endpointRun) runOOB(ctx context.Context, oob OOBConfig, points []leaf) 
 	var wg sync.WaitGroup
 	for i, pt := range points {
 		for _, v := range variants {
+			// A variant that references its callback through &xxe; cannot sit in an
+			// attribute value, so it is not sent on that point.
+			if pt.attr != "" && v.needsText {
+				continue
+			}
 			wg.Add(1)
 			go func(pt leaf, token string, v oobVariant) {
 				defer wg.Done()
@@ -517,7 +544,7 @@ func (e *endpointRun) runOOB(ctx context.Context, oob OOBConfig, points []leaf) 
 			e.rep.Done(id, 0, nil)
 			continue
 		}
-		h := hits[0]
+		h := preferredHit(hits)
 		r, ok := sent[tokens[i]+"|"+h.Identifier]
 		var req *CapturedRequest
 		if ok {
@@ -547,6 +574,10 @@ func (e *endpointRun) runOOBShared(ctx context.Context, oob OOBConfig, points []
 		for _, v := range oobVariants(oob) {
 			// webhook.site has no DNS side, so its DNS variant is skipped.
 			if v.dns && oob.SharedProvider == "webhooksite" {
+				continue
+			}
+			// Same attribute-value restriction as runOOB.
+			if pt.attr != "" && v.needsText {
 				continue
 			}
 			ident := sharedIdentifier(e.ordinal, pt, v)
@@ -580,7 +611,7 @@ func (e *endpointRun) runOOBShared(ctx context.Context, oob OOBConfig, points []
 			e.rep.Done(id, 0, nil)
 			continue
 		}
-		h := matched[0]
+		h := preferredHit(matched)
 		r, ok := sent[h.Identifier]
 		var req *CapturedRequest
 		if ok {
@@ -592,10 +623,60 @@ func (e *endpointRun) runOOBShared(ctx context.Context, oob OOBConfig, points []
 	return out
 }
 
+// passwdEvidencePattern captures the passwd line that an exfiltrating callback
+// carries in its query string, so it can be shown as the finding's evidence.
+var passwdEvidencePattern = regexp.MustCompile(`root:[x*!]:0:0:[^&\n]{0,160}`)
+
+// exfiltratedPasswd returns the /etc/passwd line that one of hits carried in its
+// query string, and whether any did. The file-exfil variant puts the file there,
+// so a hit with it proves the read, not only that the parser made a request.
+func exfiltratedPasswd(hits []collaborator.Interaction) (string, bool) {
+	for _, h := range hits {
+		// The query may be percent-encoded, so decode it before matching. A
+		// value that won't decode is matched as it arrived.
+		q := h.Query
+		if dec, err := url.QueryUnescape(h.Query); err == nil {
+			q = dec
+		}
+		if m := passwdEvidencePattern.FindString(q); m != "" {
+			return m, true
+		}
+	}
+	return "", false
+}
+
+// preferredHit returns the interaction that names the request behind a
+// finding: the one that carried exfiltrated file contents if any did, else the
+// first hit. A finding's request then replays the exact payload that worked.
+func preferredHit(hits []collaborator.Interaction) collaborator.Interaction {
+	for _, h := range hits {
+		if _, ok := exfiltratedPasswd([]collaborator.Interaction{h}); ok {
+			return h
+		}
+	}
+	return hits[0]
+}
+
 // blindFinding builds the confirmed blind-XXE finding for pt. hits is every
-// interaction the point drew, and variant names the probe that fired first.
+// interaction the point drew, and variant names the probe that fired first. A
+// callback that carried /etc/passwd is reported as a file read through the
+// callback, which is stronger than a fetch alone.
 func (e *endpointRun) blindFinding(pt leaf, hits []collaborator.Interaction, variant string, req *CapturedRequest) Finding {
 	h := hits[0]
+	if passwd, ok := exfiltratedPasswd(hits); ok {
+		return Finding{
+			Label: fmt.Sprintf("%s on %s: blind XXE read /etc/passwd through a callback", pt.describe(), e.label),
+			Detail: fmt.Sprintf(
+				"Injected a parameter entity that loads /etc/passwd and sends its contents as the query string of a request to Aperture's callback listener (%s variant). The parser's %s callback carried the file's first line, which proves the file was read by the target's parser even though nothing came back in the HTTP response.",
+				variant, h.Protocol,
+			),
+			Evidence:   truncateEvidence(passwd),
+			Method:     e.method,
+			Confidence: ConfidenceConfirmed,
+			Callback:   true,
+			Request:    req,
+		}
+	}
 	return Finding{
 		Label: fmt.Sprintf("%s on %s: blind XXE callback", pt.describe(), e.label),
 		Detail: fmt.Sprintf(
@@ -605,6 +686,7 @@ func (e *endpointRun) blindFinding(pt leaf, hits []collaborator.Interaction, var
 		Evidence:   fmt.Sprintf("%s callback from %s at %s", h.Protocol, h.RemoteAddr, h.Timestamp.Format(time.RFC3339)),
 		Method:     e.method,
 		Confidence: ConfidenceConfirmed,
+		Callback:   true,
 		Request:    req,
 	}
 }

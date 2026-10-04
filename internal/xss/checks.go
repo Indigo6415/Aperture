@@ -106,11 +106,14 @@ func checkPoint(ctx context.Context, deps runDeps, client *http.Client, m payloa
 	if res.Err != nil {
 		return payloadOutcome{}
 	}
-	// A JSON or plain-text response never runs reflected markup, so it
-	// cannot be a finding, whatever it echoes back.
-	if !htmlResponse(res.ContentType) {
+	// A JSON or plain-text response never runs reflected markup, and an
+	// attachment is saved rather than rendered, so neither can be a finding,
+	// whatever it echoes back.
+	if !rendersAsHTML(res.ContentType, res.Disposition) {
 		return payloadOutcome{}
 	}
+	// Both the payload's own match and the parser-state check must agree before
+	// a reflection counts as executable.
 	if evidence, ok := m.match(res.Body, payload, deps.canary); ok && payloadExecutes(res.Body, payload) {
 		deps.confirmed.Store(key, true)
 		return payloadOutcome{finding: &pointFinding{
@@ -192,26 +195,61 @@ func capitalize(s string) string {
 // markup alone. Every Finding here is therefore a lead to confirm manually,
 // reported at low severity with heuristic confidence.
 var (
+	// domSinkPattern lists the calls and assignments that render a string as live
+	// HTML, run it as code, or hand it to a URL-navigating or selector-parsing API.
 	domSinkPattern = regexp.MustCompile(
-		`(?i)\.(?:innerHTML|outerHTML)\s*=|document\.write(?:ln)?\s*\(|insertAdjacentHTML\s*\(|\beval\s*\(|new\s+Function\s*\(|setTimeout\s*\(\s*["'` + "`" + `]|setInterval\s*\(\s*["'` + "`" + `]|execScript\s*\(|\$\([^)]*\)\s*\.\s*html\s*\(`,
+		`(?i)\.(?:innerHTML|outerHTML)\s*=|document\.write(?:ln)?\s*\(|insertAdjacentHTML\s*\(|\beval\s*\(|new\s+Function\s*\(|setTimeout\s*\(\s*["'` + "`" + `]|setInterval\s*\(\s*["'` + "`" + `]|execScript\s*\(|\$\([^)]*\)\s*\.\s*html\s*\(` +
+			`|\.srcdoc\s*=[^=]|createContextualFragment\s*\(|location(?:\.href)?\s*=[^=]|location\.(?:assign|replace)\s*\(|window\.open\s*\(|(?:\$|jQuery)\s*\(\s*(?:location|window\.location|document\.URL)`,
 	)
+	// domTaintSourcePattern lists browser-side values an attacker controls
+	// through the URL, the referrer, a window name, or a postMessage they can
+	// send from another origin.
 	domTaintSourcePattern = regexp.MustCompile(
-		`(?i)location\.(?:hash|search|href|pathname)|document\.(?:URL|documentURI|referrer|cookie|baseURI)|window\.name`,
+		`(?i)location\.(?:hash|search|href|pathname)|document\.(?:URL|documentURI|referrer|cookie|baseURI)|window\.name|addEventListener\s*\(\s*["']message["']`,
 	)
+	// domSanitizerPattern names a sanitizer or escaper; a sink on the same line
+	// as one of these is treated as already protected.
+	domSanitizerPattern = regexp.MustCompile(`(?i)DOMPurify|sanitiz|escapeHtml|encodeHTML`)
 	inlineScriptPattern = regexp.MustCompile(`(?is)<script(?:\s[^>]*)?>(.*?)</script>`)
 )
 
-// runDomSinkModule scans crawled pages' inline scripts for a tainted source
-// and a rendering sink in the same block.
+// sinkSanitized reports whether the line holding sink's first occurrence in
+// script also calls a sanitizer. That line is then treated as protected, so
+// it is not reported.
+func sinkSanitized(script, sink string) bool {
+	idx := strings.Index(script, sink)
+	if idx < 0 {
+		return false
+	}
+	// Walk out to the line's edges, which are the nearest newlines.
+	start := strings.LastIndexByte(script[:idx], '\n') + 1
+	end := len(script)
+	if nl := strings.IndexByte(script[idx:], '\n'); nl >= 0 {
+		end = idx + nl
+	}
+	return domSanitizerPattern.MatchString(script[start:end])
+}
+
+// runDomSinkModule scans crawled pages for a tainted source and a rendering
+// sink in the same script. Inline <script> blocks are read from each page's
+// markup. A same-origin external script (crawled as its own entry with
+// Script set) is read whole.
 func runDomSinkModule(pages []crawledPage) []Finding {
 	var findings []Finding
 	seen := map[string]bool{}
 	for _, pg := range pages {
-		for _, m := range inlineScriptPattern.FindAllStringSubmatch(pg.Body, -1) {
-			script := m[1]
+		var scripts []string
+		if pg.Script {
+			scripts = []string{pg.Body}
+		} else {
+			for _, m := range inlineScriptPattern.FindAllStringSubmatch(pg.Body, -1) {
+				scripts = append(scripts, m[1])
+			}
+		}
+		for _, script := range scripts {
 			source := domTaintSourcePattern.FindString(script)
 			sink := domSinkPattern.FindString(script)
-			if source == "" || sink == "" {
+			if source == "" || sink == "" || sinkSanitized(script, sink) {
 				continue
 			}
 			key := pg.URL + "|" + sink
@@ -219,11 +257,15 @@ func runDomSinkModule(pages []crawledPage) []Finding {
 				continue
 			}
 			seen[key] = true
+			where := "an inline <script> block"
+			if pg.Script {
+				where = "the external script " + pg.URL
+			}
 			findings = append(findings, Finding{
-				Label: fmt.Sprintf("Inline script combines a tainted source (%s) with a dangerous sink (%s)", source, sink),
+				Label: fmt.Sprintf("Script combines a tainted source (%s) with a dangerous sink (%s)", source, sink),
 				Detail: fmt.Sprintf(
-					"Found on %s: an inline <script> block reads attacker-influenceable data (%s) and passes a value into %s without this scanner seeing it sanitized/encoded first. This is a static heuristic over the page's own markup, not a confirmed DOM XSS -- confirm manually by tracing whether the tainted value actually reaches the sink unescaped at runtime (e.g. craft a URL whose #hash/query contains a payload and watch it execute).",
-					pg.URL, source, sink,
+					"Found on %s: %s reads attacker-influenceable data (%s) and passes a value into %s without this scanner seeing it sanitized/encoded first. This is a static heuristic over the page's own script, not a confirmed DOM XSS -- confirm manually by tracing whether the tainted value actually reaches the sink unescaped at runtime (e.g. craft a URL whose #hash/query contains a payload and watch it execute).",
+					pg.URL, where, source, sink,
 				),
 				Evidence:   snippetAround(script, sink),
 				Method:     "GET",

@@ -63,12 +63,33 @@ func TestVerifyPayloadSetsMarkerInsteadOfAlert(t *testing.T) {
 	if strings.Contains(got, "alert(") {
 		t.Errorf("alert survived the rewrite: %s", got)
 	}
-	want := fmt.Sprintf("document.documentElement.setAttribute('%s','%s')", verifyMarkerAttr, canary)
+	want := fmt.Sprintf("document.documentElement.setAttribute(`%s`,`%s`)", verifyMarkerAttr, canary)
 	if !strings.Contains(got, want) {
 		t.Errorf("rewrite missing marker write; got %s", got)
 	}
 	if !strings.HasPrefix(got, "<script>") {
 		t.Errorf("breakout changed: %s", got)
+	}
+}
+
+// TestVerifyPayloadKeepsSingleQuotedBreakoutValid checks that the marker
+// setter does not use single quotes, so a breakout out of a single-quoted JS
+// string is still valid after the rewrite.
+func TestVerifyPayloadKeepsSingleQuotedBreakoutValid(t *testing.T) {
+	payload := `';alert(/*apxss1*/document.domain);'`
+	got := verifyPayload(payload, "apxss1")
+	// The payload's own quotes are the only single quotes allowed after the rewrite.
+	if strings.Count(got, "'") != strings.Count(payload, "'") {
+		t.Errorf("setter added single quotes that would cut the JS string short: %s", got)
+	}
+}
+
+// TestVerifyPayloadRewritesTaggedTemplateAlert checks that alert`...` (no
+// parentheses) is rewritten too, so the browser check can still confirm it.
+func TestVerifyPayloadRewritesTaggedTemplateAlert(t *testing.T) {
+	got := verifyPayload("<img src=x onerror=alert`/*apxss2*/document.domain`>", "apxss2")
+	if strings.Contains(got, "alert") {
+		t.Errorf("tagged-template alert survived the rewrite: %s", got)
 	}
 }
 
@@ -155,23 +176,29 @@ func TestVerifyPointFindingStaysLikelyWithoutBrowser(t *testing.T) {
 }
 
 // TestNonHTMLAndTextareaReflectionsAreNotFindings runs the whole scanner
-// against two endpoints that echo input in ways a browser never runs, and
-// checks that neither produces a confirmed or likely injection.
+// against endpoints that echo input in ways a browser never runs: a JSON body,
+// a download, and a textarea whose markup characters are encoded. None may
+// produce a confirmed or likely injection.
 func TestNonHTMLAndTextareaReflectionsAreNotFindings(t *testing.T) {
+	withoutBrowser(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query().Get("q")
 		switch r.URL.Path {
 		case "/json":
 			w.Header().Set("Content-Type", "application/json")
 			fmt.Fprintf(w, `{"echo":%q}`, q)
-		case "/textarea":
+		case "/download":
 			w.Header().Set("Content-Type", "text/html")
-			fmt.Fprintf(w, `<html><body><textarea name="x">%s</textarea></body></html>`, q)
+			w.Header().Set("Content-Disposition", "attachment; filename=out.html")
+			fmt.Fprint(w, q)
+		case "/encoded-textarea":
+			w.Header().Set("Content-Type", "text/html")
+			fmt.Fprintf(w, `<html><body><textarea name="x">%s</textarea></body></html>`, htmlEscape(q))
 		}
 	}))
 	defer srv.Close()
 
-	for _, path := range []string{"/json", "/textarea"} {
+	for _, path := range []string{"/json", "/download", "/encoded-textarea"} {
 		res, err := Run(context.Background(), Request{URL: srv.URL + path + "?q=seed", RecursionDepth: 0})
 		if err != nil {
 			t.Fatalf("Run(%s): %v", path, err)

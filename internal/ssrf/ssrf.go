@@ -3,10 +3,11 @@
 // server-side request forgery: the server itself making an outbound request
 // to a URL the operator supplies, which lets an attacker reach hosts the
 // server can see but the attacker otherwise can't -- cloud metadata
-// services (the single highest-value SSRF target: AWS/GCP/Azure/DO/Alibaba
-// all expose instance credentials over plain HTTP to whatever can reach
-// 169.254.169.254), the rest of an internal network behind a firewall, or
-// the server's own loopback-bound admin interfaces.
+// services (the single highest-value SSRF target: AWS/GCP/Azure/DO/Alibaba/
+// Oracle/OpenStack all expose instance credentials over plain HTTP to
+// whatever can reach 169.254.169.254), the rest of an internal network behind
+// a firewall, the local filesystem through a file:// URL, or the server's own
+// loopback-bound admin interfaces.
 //
 // This is deliberately narrower than internal/probescan's own path-
 // traversal/SSTI checks: those fuzz *any* discovered parameter with
@@ -14,15 +15,21 @@
 // that are actually URL-shaped (see ssrfParams in checks.go) with payloads
 // that are only meaningful when the server fetches them server-side.
 //
-// Three module categories, run concurrently:
+// Modules, run concurrently against every injection point:
 //   - cloudMetadataModule: signature-matches the response body against known
-//     cloud-metadata-service content -- high precision, since a false
-//     positive here would need the target to coincidentally already contain
-//     AWS/GCP/Azure-shaped JSON.
-//   - internalNetworkModule: compares each internal-IP payload's response
-//     against a same-parameter "blackhole" control (a non-routable address
-//     the server can never reach) -- lower precision than signature
-//     matching, so findings are phrased as "possible", not confirmed.
+//     cloud-metadata-service content. A signature counts only when the same
+//     text is absent from the point's own non-routable controls and from the
+//     normal response, so a page that merely documents metadata keys is not
+//     reported. Includes same-origin redirect bounces, for filters that
+//     allow the target's own host and then follow a redirect.
+//   - internalNetworkModule: compares each internal-address payload's
+//     response against non-routable controls, after scrubbing every echo of
+//     the scanner's own payloads from both sides. It also runs against request
+//     headers (Host, X-Forwarded-Host, ...), reported at heuristic confidence.
+//     Findings are phrased as "possible", not confirmed.
+//   - fileSchemeModule: reads a file:// URL and matches a known file's
+//     content (/etc/passwd, win.ini), with the same control gating as the
+//     cloud module.
 //   - oobCallbackModule: the actually-reliable confirmation for a *blind*
 //     SSRF (one whose response gives no visible signal either way) --
 //     points a payload at an internal/collaborator token and checks whether
@@ -43,6 +50,7 @@ import (
 	"sync"
 
 	"github.com/Indigo6415/Aperture/internal/collaborator"
+	"github.com/Indigo6415/Aperture/internal/paramminer"
 	"github.com/Indigo6415/Aperture/internal/scanprogress"
 )
 
@@ -56,9 +64,15 @@ type Finding struct {
 	// CapturedRequest in client.go) -- lets the frontend's "Send to Tester"
 	// action replay precisely what triggered the finding.
 	Request *CapturedRequest `json:"request,omitempty"`
-	// Confidence is "confirmed" for an out-of-band callback, "likely" for an
-	// internal-network difference that reproduced.
+	// Confidence is "confirmed" for an out-of-band callback or a metadata/file
+	// body that only the server could have produced, "likely" for an
+	// internal-network difference that reproduced in a parameter, and
+	// "heuristic" for a difference seen only through a request header.
 	Confidence string `json:"confidence,omitempty"`
+	// Callback is true when the target called back to Aperture's collaborator
+	// listener, which proves the finding out-of-band. The frontend shows a
+	// CALLBACK tag for it.
+	Callback bool `json:"callback,omitempty"`
 }
 
 type ModuleResult struct {
@@ -90,6 +104,17 @@ type Request struct {
 	// was discovered on. Off by default: a request with AutoDiscover unset
 	// behaves exactly as before.
 	AutoDiscover bool `json:"autoDiscover,omitempty"`
+	// MineParams, when true, runs parameter mining (see internal/paramminer)
+	// against URL before the candidate set is built. Any undocumented
+	// parameter whose value changes the response, or is reflected back, is
+	// folded into the candidates, so hidden fetch parameters are tested too.
+	// Off by default.
+	MineParams bool `json:"mineParams,omitempty"`
+	// NoKnownEndpoints turns off the product-specific endpoint probes (see
+	// knownEndpoints in endpoints.go). They are on by default: each one is
+	// gated by an existence check, so a product that is not installed costs
+	// one request.
+	NoKnownEndpoints bool `json:"noKnownEndpoints,omitempty"`
 	// RecursionDepth is how many hops of same-origin <a href> links the
 	// AutoDiscover crawl follows beyond URL itself -- 0 scans just that one
 	// page. Ignored when AutoDiscover is false.
@@ -98,7 +123,7 @@ type Request struct {
 	// for the AutoDiscover crawl. Ignored when AutoDiscover is false.
 	MaxPages int `json:"maxPages,omitempty"`
 	// Progress, when set, receives this run's per-check progress -- one
-	// check per (target, module, parameter) -- as it happens. Nil means
+	// check per (target, module, injection point) -- as it happens. Nil means
 	// nobody is watching. See internal/scanprogress.
 	Progress scanprogress.Reporter `json:"-"`
 }
@@ -106,7 +131,7 @@ type Request struct {
 // OOBConfig is how Run reaches the shared out-of-band listener for
 // oobCallbackModule -- see internal/collaborator. The zero value (nil
 // Registry) just reports that module as unavailable rather than failing the
-// whole scan, since the other two modules work regardless.
+// whole scan, since the other modules work regardless.
 type OOBConfig struct {
 	Registry *collaborator.Registry
 	// CallbackBaseURL is this Aperture instance's own externally-reachable
@@ -146,28 +171,74 @@ type Result struct {
 }
 
 // maxConcurrentRequests bounds how many requests this scanner has in
-// flight at once, across every module combined. Without it, the three
-// modules' own fan-outs (cloud-metadata and internal-network alone can each
-// run into the hundreds, tested against every candidate parameter) would
-// all fire at essentially the same instant -- needlessly aggressive against
-// the target (a burst indistinguishable from a small denial-of-service),
-// and self-defeating for internal-network's own control-vs-payload
-// comparison: a target that can't keep up with that burst starts erroring
-// out across the board, which reads as "every payload looks anomalous"
-// rather than any real signal. See fetchWithParamThrottled in client.go.
+// flight at once, across every module combined. Without it, the modules'
+// own fan-outs (cloud-metadata and internal-network alone can each run into
+// the hundreds, tested against every candidate parameter) would all fire at
+// essentially the same instant -- needlessly aggressive against the target
+// (a burst indistinguishable from a small denial-of-service), and
+// self-defeating for internal-network's own control-vs-payload comparison: a
+// target that can't keep up with that burst starts erroring out across the
+// board, which reads as "every payload looks anomalous" rather than any real
+// signal. See fetchParamThrottled in client.go.
 const maxConcurrentRequests = 16
 
+// checkConcurrency bounds how many points a single module checks at once.
+// Each check fans its own payloads out concurrently, and the shared request
+// semaphore is what actually caps total in-flight requests -- this bound just
+// keeps only a handful of checks "testing" at a time, so the progress grid
+// moves steadily instead of every square flipping orange at once and then
+// green all together.
+const checkConcurrency = 8
+
+// probePoint is one place a payload is written: a named request parameter
+// (query string for GET, form field for POST) or a request header on a plain
+// GET of the target. Header points only run in the modules that set headers
+// (see moduleMeta).
+type probePoint struct {
+	name   string
+	header bool
+}
+
+// headerProbeNames are the request headers the internal-network module injects
+// a payload into. Each one is read by a common class of proxy or virtual-host
+// router that builds its upstream URL or chooses its backend from a
+// client-supplied host name, so the same loopback spellings used for
+// parameters are tried here too.
+var headerProbeNames = []string{"Host", "X-Forwarded-Host", "X-Host", "X-Forwarded-Server"}
+
+// paramPoints wraps names as parameter points.
+func paramPoints(names []string) []probePoint {
+	out := make([]probePoint, 0, len(names))
+	for _, n := range names {
+		out = append(out, probePoint{name: n})
+	}
+	return out
+}
+
+// headerPoints returns one header point per entry in headerProbeNames.
+func headerPoints() []probePoint {
+	out := make([]probePoint, 0, len(headerProbeNames))
+	for _, h := range headerProbeNames {
+		out = append(out, probePoint{name: h, header: true})
+	}
+	return out
+}
+
+// runDeps is what a module needs to test one target: the target and method,
+// the injection points, the shared request semaphore, the client, and the
+// normal responses used for control comparison.
 type runDeps struct {
 	target *url.URL
-	// method is the HTTP method every check in this runDeps sends --
-	// GET for req.URL itself and for a discovered <form method="get">, POST
-	// for a discovered <form method="post"> (see fetchParam in client.go for
-	// how a POST target's param is sent in the body rather than the query
-	// string).
+	// method is the HTTP method every parameter check in this runDeps sends
+	// -- GET for req.URL itself and for a discovered <form method="get">,
+	// POST for a discovered <form method="post"> (see fetchParam in client.go
+	// for how a POST target's param is sent in the body rather than the query
+	// string). Header points always use GET.
 	method string
 	req    Request
-	params []string
+	points []probePoint
 	sem    chan struct{}
+	client *http.Client
 	// key identifies this runDeps' target across every check it plans, so
 	// check IDs stay unique when a discovered form adds a second target to
 	// the same run. label is the human-readable suffix shown on a check's
@@ -175,67 +246,129 @@ type runDeps struct {
 	key   string
 	label string
 	rep   scanprogress.Reporter
+	// baseline is the body of the plain request to the primary target, used
+	// to ignore text the page shows on every request. Empty for a form target,
+	// since the primary baseline is a different endpoint.
+	baseline string
+	// echoes is every spelling of the scanner's own payload values that a
+	// server might echo back (see echoesFor). Scrubbed from every body before
+	// it is compared, so an echo of the payload is not mistaken for a response
+	// from the internal address it names.
+	echoes []string
+	// controls holds each point's non-routable control responses, fetched once
+	// and shared by every module that compares against them.
+	controls *controlCache
 }
 
-// checkConcurrency bounds how many parameter checks a single module runs at
-// once. Each check fans its own payloads out concurrently, and the shared
-// request semaphore is what actually caps total in-flight requests -- this
-// bound just keeps only a handful of checks "testing" at a time, so the
-// progress grid moves steadily instead of every square flipping orange at
-// once and then green all together.
-const checkConcurrency = 8
-
-// check builds the progress entry for mod's check against param on this
-// runDeps' target. The label names the parameter; a non-primary target adds
-// its own method and path so two forms that share a field name stay
-// distinguishable.
-func (d runDeps) check(mod moduleMeta, param string) scanprogress.Check {
-	label := param
-	if d.label != "" {
-		label = param + " on " + d.label
+// newRunDeps builds the runDeps for one target. Callers set label afterward
+// when the target is a form action rather than req.URL itself.
+func newRunDeps(target *url.URL, method string, req Request, points []probePoint, sem chan struct{}, rep scanprogress.Reporter, baseline string, client *http.Client) runDeps {
+	return runDeps{
+		target:   target,
+		method:   method,
+		req:      req,
+		points:   points,
+		sem:      sem,
+		client:   client,
+		key:      method + " " + target.String(),
+		rep:      rep,
+		baseline: baseline,
+		echoes:   echoesFor(target),
+		controls: newControlCache(),
 	}
-	return scanprogress.Check{ID: d.key + "|" + mod.id + "|" + param, Label: label, Group: mod.name}
 }
 
-// runParamChecks runs check once per parameter in deps.params, with at most
-// checkConcurrency checks in flight, bracketing each with progress Start/Done
-// reports. A check's square only turns "testing" once it actually gets a slot,
-// so anything still waiting for one correctly reads as queued. Findings from
-// every check are merged into one slice.
-func runParamChecks(deps runDeps, mod moduleMeta, check func(param string) []Finding) []Finding {
-	var mu sync.Mutex
-	var out []Finding
-	var wg sync.WaitGroup
-	slots := make(chan struct{}, checkConcurrency)
-	for _, param := range deps.params {
-		wg.Add(1)
-		go func(param string) {
-			defer wg.Done()
-			slots <- struct{}{}
-			defer func() { <-slots }()
-
-			id := deps.check(mod, param).ID
-			deps.rep.Start(id)
-			found := check(param)
-			deps.rep.Done(id, len(found), nil)
-
-			mu.Lock()
-			out = append(out, found...)
-			mu.Unlock()
-		}(param)
+// pointsFor returns the points mod runs against: every point for a module
+// that sets headers, and only parameter points otherwise.
+func (d runDeps) pointsFor(mod moduleMeta) []probePoint {
+	var out []probePoint
+	for _, pt := range d.points {
+		if pt.header && !mod.headers {
+			continue
+		}
+		out = append(out, pt)
 	}
-	wg.Wait()
 	return out
 }
 
-// Run resolves req.URL, takes a plain baseline request, then runs every
-// check module concurrently -- once against req.URL itself, and (when
-// AutoDiscover turns up any <form>) once more per distinct form action/
-// method, each with its own fields folded into that form's candidate set.
-// Findings from every target are merged into one ModuleResult per module
-// (cloud-metadata, internal-network, oob-callback), so the result still
-// reads as "the three modules this scan ran", just against more than one
-// target under the hood.
+// check builds the progress entry for mod's check against pt on this runDeps'
+// target. The label names the point; a non-primary target adds its own method
+// and path so two forms that share a field name stay distinguishable.
+func (d runDeps) check(mod moduleMeta, pt probePoint) scanprogress.Check {
+	label := pt.name
+	idPart := "p:" + pt.name
+	if pt.header {
+		label = "header " + pt.name
+		idPart = "h:" + pt.name
+	}
+	if d.label != "" {
+		label = label + " on " + d.label
+	}
+	return scanprogress.Check{ID: d.key + "|" + mod.id + "|" + idPart, Label: label, Group: mod.name}
+}
+
+// controlCache holds, per injection point, the non-routable control responses
+// for that point. Each point's controls are fetched exactly once, even when
+// several modules ask for them at the same moment.
+type controlCache struct {
+	mu sync.Mutex
+	m  map[probePoint]*controlEntry
+}
+
+// controlEntry is one point's cached controls, filled by its once.
+type controlEntry struct {
+	once sync.Once
+	res  []*ssrfResult
+}
+
+// newControlCache returns an empty cache.
+func newControlCache() *controlCache {
+	return &controlCache{m: map[probePoint]*controlEntry{}}
+}
+
+// get returns the controls for pt, calling fetch only the first time pt is
+// asked for. Concurrent callers for the same point all wait for that one fetch.
+func (c *controlCache) get(pt probePoint, fetch func() []*ssrfResult) []*ssrfResult {
+	c.mu.Lock()
+	e, ok := c.m[pt]
+	if !ok {
+		e = &controlEntry{}
+		c.m[pt] = e
+	}
+	c.mu.Unlock()
+	e.once.Do(func() { e.res = fetch() })
+	return e.res
+}
+
+// controlsFor returns pt's scrubbed control responses, fetching them on first
+// use. Each control is a non-routable address the server can never reach (see
+// controlURLs), so a difference from it signals that the server acted on the
+// value.
+func (d runDeps) controlsFor(ctx context.Context, pt probePoint) []*ssrfResult {
+	return d.controls.get(pt, func() []*ssrfResult {
+		out := make([]*ssrfResult, len(controlURLs))
+		var wg sync.WaitGroup
+		for i, cu := range controlURLs {
+			wg.Add(1)
+			// Each control fills its own slot, so no lock is needed.
+			go func(i int, cu string) {
+				defer wg.Done()
+				out[i] = scrubResult(fetchPointThrottled(ctx, d, pt, cu), d.echoes)
+			}(i, cu)
+		}
+		wg.Wait()
+		return out
+	})
+}
+
+// Run resolves req.URL, takes a plain baseline request, then runs every check
+// module concurrently -- once against req.URL itself (with the header points
+// as well), and (when AutoDiscover turns up any <form>) once more per distinct
+// form action/method, each with its own fields folded into that form's
+// candidate set. Findings from every target are merged into one ModuleResult
+// per module (cloud-metadata, internal-network, file-scheme, oob-callback), so
+// the result still reads as "the modules this scan ran", just against more than
+// one target under the hood.
 func Run(ctx context.Context, req Request, oob OOBConfig) (*Result, error) {
 	rep := scanprogress.Or(req.Progress)
 
@@ -260,6 +393,21 @@ func Run(ctx context.Context, req Request, oob OOBConfig) (*Result, error) {
 		extraParams = append(append([]string{}, req.Params...), discovered...)
 		formTargets = forms
 	}
+	if req.MineParams {
+		rep.Phase("Mining hidden parameters")
+		mined, _ := paramminer.Mine(ctx, paramminer.Options{
+			URL:     target,
+			Headers: req.Headers,
+			Client:  client,
+			Known:   extraParams,
+		})
+		extraParams = append(append([]string{}, extraParams...), mined.Names...)
+	}
+	if !req.NoKnownEndpoints {
+		rep.Phase("Checking known product endpoints")
+		origin := &url.URL{Scheme: target.Scheme, Host: target.Host}
+		formTargets = append(formTargets, endpointTargets(ctx, client, origin, req.Headers)...)
+	}
 	params := candidateParams(target, extraParams)
 	sem := make(chan struct{}, maxConcurrentRequests)
 
@@ -277,14 +425,28 @@ func Run(ctx context.Context, req Request, oob OOBConfig) (*Result, error) {
 		}
 	}
 
-	merge(runModulesForTarget(ctx, runDeps{target: target, method: http.MethodGet, req: req, params: params, sem: sem, key: http.MethodGet + " " + target.String(), rep: rep}, oob))
+	// The primary target also gets the header points. A form target gets only
+	// its own fields, since those are the only input its handler reads.
+	primaryPoints := append(paramPoints(params), headerPoints()...)
+	primary := newRunDeps(target, http.MethodGet, req, primaryPoints, sem, rep, baselineRes.Body, client)
+	merge(runModulesForTarget(ctx, primary, oob))
 
 	paramsTested := append([]string{}, params...)
+	for _, h := range headerProbeNames {
+		paramsTested = append(paramsTested, "header:"+h)
+	}
 	for _, ft := range formTargets {
-		ftParams := candidateParams(ft.url, ft.params)
-		ftDeps := runDeps{
-			target: ft.url, method: ft.method, req: req, params: ftParams, sem: sem,
-			key: ft.method + " " + ft.url.String(), label: ft.method + " " + ft.url.Path, rep: rep,
+		// A form target tests only its own fields. A known endpoint is the
+		// same: its single parameter is the whole candidate set, so the
+		// product's full ssrfParams list is not fired at it.
+		ftParams := ft.params
+		if ft.name == "" {
+			ftParams = candidateParams(ft.url, ft.params)
+		}
+		ftDeps := newRunDeps(ft.url, ft.method, req, paramPoints(ftParams), sem, rep, "", client)
+		ftDeps.label = ft.method + " " + ft.url.Path
+		if ft.name != "" {
+			ftDeps.label = ft.name + " (" + ft.url.Path + ")"
 		}
 		merge(runModulesForTarget(ctx, ftDeps, oob))
 		for _, p := range ftParams {
@@ -311,6 +473,8 @@ func runModulesForTarget(ctx context.Context, deps runDeps, oob OOBConfig) []Mod
 	runs := []moduleRun{
 		{cloudMetadataModule, func() []Finding { return runCloudMetadataModule(ctx, deps) }},
 		{internalNetworkModule, func() []Finding { return runInternalNetworkModule(ctx, deps) }},
+		{fileSchemeModule, func() []Finding { return runFileSchemeModule(ctx, deps) }},
+		{protocolModule, func() []Finding { return runProtocolModule(ctx, deps) }},
 		{oobCallbackModule, func() []Finding { return runOOBCallbackModule(ctx, deps, oob) }},
 	}
 
@@ -325,12 +489,12 @@ func runModulesForTarget(ctx context.Context, deps runDeps, oob OOBConfig) []Mod
 		if m.meta.id == oobCallbackModule.id && !oobConfigured(oob) {
 			continue
 		}
-		for _, p := range deps.params {
-			checks = append(checks, deps.check(m.meta, p))
+		for _, pt := range deps.pointsFor(m.meta) {
+			checks = append(checks, deps.check(m.meta, pt))
 		}
 	}
 	deps.rep.Plan(checks...)
-	deps.rep.Phase(fmt.Sprintf("Testing %d parameter(s)", len(deps.params)))
+	deps.rep.Phase(fmt.Sprintf("Testing %d injection point(s)", len(deps.points)))
 
 	results := make([]ModuleResult, len(runs))
 	var wg sync.WaitGroup
@@ -385,4 +549,5 @@ func candidateParams(target *url.URL, extra []string) []string {
 const (
 	ConfidenceConfirmed = "confirmed"
 	ConfidenceLikely    = "likely"
+	ConfidenceHeuristic = "heuristic"
 )

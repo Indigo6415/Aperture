@@ -24,6 +24,7 @@ import type {
   DomainScanRequest,
   DomainScanStartResult,
   Finding,
+  GitDumpRequest,
   GraphqlEnumRequest,
   Job,
   JobOptions,
@@ -93,6 +94,39 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   }
   if (res.status === 204) return undefined as T
   return res.json() as Promise<T>
+}
+
+// streamPingTargetList runs the list liveness check and calls onResult for each
+// target's verdict as the server finishes it. The endpoint answers with NDJSON
+// (one JSON object per line), so the body is read incrementally instead of
+// waiting for the whole response. Resolves once the server closes the stream.
+async function streamPingTargetList(id: string, onResult: (r: TargetPingResult) => void): Promise<void> {
+  const res = await fetch(`/api/target-lists/${id}/ping`, { method: 'POST' })
+  if (!res.ok) {
+    const body = await res.text()
+    throw new ApiError(res.status, `${res.status} ${res.statusText}: ${body}`)
+  }
+  if (!res.body) throw new Error('ping: response has no body')
+
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  // buffer holds a trailing partial line until the rest of it arrives.
+  let buffer = ''
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    let nl: number
+    while ((nl = buffer.indexOf('\n')) >= 0) {
+      const line = buffer.slice(0, nl).trim()
+      buffer = buffer.slice(nl + 1)
+      if (line) onResult(JSON.parse(line) as TargetPingResult)
+    }
+  }
+  // Flush any final line that had no trailing newline.
+  buffer += decoder.decode()
+  const last = buffer.trim()
+  if (last) onResult(JSON.parse(last) as TargetPingResult)
 }
 
 // screenshotPreviewEnabled is the frontend half of the screenshot preview
@@ -167,7 +201,7 @@ export const api = {
   renameTargetList: (id: string, name: string) =>
     req<TargetList>(`/api/target-lists/${id}`, { method: 'PATCH', body: JSON.stringify({ name }) }),
   deleteTargetList: (id: string) => req<void>(`/api/target-lists/${id}`, { method: 'DELETE' }),
-  pingTargetList: (id: string) => req<TargetPingResult[]>(`/api/target-lists/${id}/ping`, { method: 'POST' }),
+  pingTargetList: (id: string, onResult: (r: TargetPingResult) => void) => streamPingTargetList(id, onResult),
 
   listCredentials: (caseId: string) => req<Credential[]>(`/api/cases/${caseId}/credentials`),
   addCredential: (
@@ -277,6 +311,8 @@ export const api = {
     req<ScanStartResult>('/api/breach/crawl-emails', { method: 'POST', body: JSON.stringify(crawlReq) }),
 
   bypass403: (runReq: Bypass403Request) => req<ScanStartResult>('/api/bypass403/run', { method: 'POST', body: JSON.stringify(runReq) }),
+
+  gitDump: (runReq: GitDumpRequest) => req<ScanStartResult>('/api/gitdump/scan', { method: 'POST', body: JSON.stringify(runReq) }),
 
   pwReset: (scanReq: PwResetRequest) => req<ScanStartResult>('/api/pwreset/scan', { method: 'POST', body: JSON.stringify(scanReq) }),
 

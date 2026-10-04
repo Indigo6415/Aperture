@@ -47,9 +47,25 @@ var devArtifactsModule = moduleDef{
 		strong := []pathCheck{
 			{"/.vscode/settings.json", "VSCode settings", validJSONAnyKey("editor.tabSize", "editor.formatOnSave", "files.exclude", "files.associations", "python.defaultInterpreterPath")},
 			{"/.vscode/launch.json", "VSCode launch config", validJSONAnyKey("version", "configurations")},
+			// .DS_Store is checked by sensitive_files only, so it is reported once.
 			{"/.idea/workspace.xml", "JetBrains workspace", validXMLRoot("project")},
-			{"/.DS_Store", "macOS DS_Store file", validDSStore},
+			{"/.idea/misc.xml", "JetBrains project settings", validXMLRoot("project")},
+			{"/.idea/modules.xml", "JetBrains module list", validXMLRoot("project")},
+			// A JetBrains data source holds database connection details.
+			{"/.idea/dataSources.xml", "JetBrains database connections", validXMLRoot("project")},
+			{"/.vscode/sftp.json", "VSCode SFTP deployment config", validJSONKeys("host", "remotePath", "uploadOnSave", "password")},
+			// Vim swap files hold a copy of a file being edited, source included.
+			{"/index.php.swp", "Vim swap file", validVimSwap},
+			{"/.index.php.swp", "Vim swap file", validVimSwap},
 			{"/Thumbs.db", "Windows Thumbs.db file", validOLE},
+			{"/Cargo.toml", "Rust Cargo manifest", validINIMatch(`\[(package|dependencies)\]`)},
+			{"/pyproject.toml", "Python pyproject manifest", validINIMatch(`\[(tool\.poetry|project|build-system)[^\]]*\]`)},
+			{"/phpunit.xml", "PHPUnit configuration", validXMLRoot("phpunit")},
+			{"/.circleci/config.yml", "CircleCI config", validYAMLAny("jobs", "workflows")},
+			{"/bitbucket-pipelines.yml", "Bitbucket Pipelines config", validYAMLAny("pipelines", "image")},
+			{"/azure-pipelines.yml", "Azure Pipelines config", validYAMLAny("trigger", "pool", "stages")},
+			{"/serverless.yml", "Serverless Framework config", validYAMLKey("provider")},
+			{"/Vagrantfile", "Vagrant configuration", notHTML(containsCase("Vagrant.configure"))},
 			{"/composer.json", "PHP Composer manifest", validJSONAnyKey("require", "require-dev", "autoload")},
 			{"/composer.lock", "PHP Composer lockfile", validJSONAnyKey("packages", "packages-dev")},
 			{"/package.json", "Node.js package manifest", validJSONAnyKey("dependencies", "devDependencies", "scripts")},
@@ -75,19 +91,22 @@ var devArtifactsModule = moduleDef{
 		// Plain-text or weakly-shaped files: reported as "likely".
 		weak := []pathCheck{
 			{"/.idea/.name", "JetBrains project name", validPlainText},
-			{"/build.gradle", "Gradle build file", notHTML(containsCase("dependencies"))},
-			{"/Jenkinsfile", "Jenkinsfile", notHTML(containsCase("pipeline"))},
-			{"/webpack.config.js", "Webpack config", notHTML(containsCase("module.exports"))},
-			{"/vite.config.js", "Vite config", notHTML(containsCase("export default"))},
-			{"/vite.config.ts", "Vite config", notHTML(containsCase("export default"))},
+			{"/build.gradle", "Gradle build file", validRegexp(gradleBuildLine)},
+			{"/Jenkinsfile", "Jenkinsfile", validRegexp(jenkinsfileLine)},
+			{"/Podfile", "CocoaPods Podfile", validRegexp(podfileLine)},
+			{"/setup.py", "Python setup script", validRegexp(setupPyLine)},
+			{"/webpack.config.js", "Webpack config", validRegexp(webpackExport)},
+			{"/vite.config.js", "Vite config", validRegexp(viteExport)},
+			{"/vite.config.ts", "Vite config", validRegexp(viteExport)},
 		}
-		// PHP pages and directory listings are HTML by design, so they keep
-		// the non-strict path; the catch-all gate still applies to them.
+		// PHP info pages and directory listings are HTML by design, so they keep
+		// the non-strict path; the catch-all gate still applies to them. A
+		// phpinfo page is identified by its title or its version line, and a
+		// bare page at test.php or debug.php has no such marker, so those are
+		// not reported.
 		pages := []pathCheck{
-			{"/phpinfo.php", "PHP info page", containsAny("phpinfo()", "php version")},
-			{"/info.php", "PHP info page", containsAny("phpinfo()")},
-			{"/test.php", "PHP test page", nonEmptyBody},
-			{"/debug.php", "PHP debug page", nonEmptyBody},
+			{"/phpinfo.php", "PHP info page", matchesRegexp(phpInfoMarker)},
+			{"/info.php", "PHP info page", matchesRegexp(phpInfoMarker)},
 			{"/.github/workflows", "GitHub Actions workflows", containsAny("index of")},
 		}
 

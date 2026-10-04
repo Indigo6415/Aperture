@@ -19,6 +19,7 @@ import { ScanHistoryPanel } from './ScanHistoryPanel'
 import { ScanWindowTabs } from './ScanWindowTabs'
 import { latestByTarget, loadCaseScans } from '../scanHistory'
 import { CopyButton } from './CopyButton'
+import { StatusBadge } from './FindingBadges'
 import { useAutoCollapseOnce, useCollapsible } from '../collapsible'
 import { inputBase } from '../formStyles'
 import { toAbsoluteUrl } from '../url'
@@ -304,6 +305,11 @@ function TargetScanCard({ target, scan }: { target: string; scan: TargetScanStat
                   </>
                 )}
               </span>
+              {result.baseline.resolvedUrl && (
+                <span>
+                  Checks ran against <span className="break-all font-mono text-neutral-300">{result.baseline.resolvedUrl}</span>
+                </span>
+              )}
             </div>
           </div>
 
@@ -474,6 +480,7 @@ function FindingRow({ finding }: { finding: GraphqlEnumFinding }) {
         className={`flex items-start gap-2 ${hasExpandable ? 'cursor-pointer' : ''}`}
       >
         {hasExpandable && <span className="mt-0.5 shrink-0 text-neutral-600">{expanded ? '▾' : '▸'}</span>}
+        <StatusBadge code={finding.statusCode} />
         <div className="min-w-0 flex-1">
           <p className="break-all text-neutral-300">{finding.label}</p>
           {finding.detail && <p className="mt-0.5 text-neutral-600">{finding.detail}</p>}

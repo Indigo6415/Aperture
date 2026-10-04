@@ -55,6 +55,7 @@ import (
 	"sync"
 
 	"github.com/Indigo6415/Aperture/internal/collaborator"
+	"github.com/Indigo6415/Aperture/internal/paramminer"
 	"github.com/Indigo6415/Aperture/internal/scanprogress"
 )
 
@@ -66,6 +67,10 @@ type Finding struct {
 	StatusCode int    `json:"statusCode,omitempty"`
 	// Confidence is "confirmed", "likely", or "heuristic".
 	Confidence string `json:"confidence,omitempty"`
+	// Callback is true when the target called back to Aperture's collaborator
+	// listener, which proves the finding out-of-band. The frontend shows a
+	// CALLBACK tag for it.
+	Callback bool `json:"callback,omitempty"`
 	// Request is the exact request this finding's check sent (see
 	// CapturedRequest in client.go) -- lets the frontend's "Send to Tester"
 	// action replay precisely what triggered the finding.
@@ -86,8 +91,12 @@ type Request struct {
 	// Params are extra parameter names to fuzz directly onto URL's own query
 	// string, in addition to every point the crawl itself discovers -- same
 	// reasoning as ssrf.Request.Params/openredirect.Request.Params.
-	Params  []string          `json:"params,omitempty"`
-	Headers map[string]string `json:"headers,omitempty"`
+	Params []string `json:"params,omitempty"`
+	// MineParams, when true, runs parameter mining (internal/paramminer) against
+	// the GET query of URL and folds every hidden parameter it finds into Params,
+	// so the rest of the run tests them too. Off by default.
+	MineParams bool              `json:"mineParams,omitempty"`
+	Headers    map[string]string `json:"headers,omitempty"`
 	// RecursionDepth is how many hops of same-origin <a href> links the
 	// crawl follows beyond URL itself -- 0 scans just that one page.
 	RecursionDepth int `json:"recursionDepth,omitempty"`
@@ -163,6 +172,12 @@ func Run(ctx context.Context, req Request, oob OOBConfig) (*Result, error) {
 	seed, err := parseTarget(req.URL)
 	if err != nil {
 		return nil, err
+	}
+
+	// Parameter mining folds hidden names into req.Params before anything
+	// reads them, so every candidate-building path below picks them up.
+	if req.MineParams {
+		req.Params = append(append([]string{}, req.Params...), paramminer.Names(ctx, seed, req.Headers, newClient(), req.Params)...)
 	}
 
 	client := newClient()
