@@ -2,9 +2,12 @@ package domainscan
 
 import (
 	"context"
-	"github.com/Indigo6415/Aperture/internal/scanprogress"
+	"fmt"
 	"sort"
+	"strings"
 	"sync"
+
+	"github.com/Indigo6415/Aperture/internal/scanprogress"
 )
 
 // registeredModules is every domain-wide scanner this master tool wraps,
@@ -56,6 +59,11 @@ func Modules() []ModuleInfo {
 // progress instead of waiting for every module (some of which crawl the
 // whole site before their tool even starts) to finish together.
 func RunScanStreaming(ctx context.Context, rawTarget string, opts Options, onModule func(ModuleResult)) (*ScanResponse, error) {
+	// A blank target would otherwise start every module and have each one fail
+	// on its own, which buries the real problem in a page of per-module errors.
+	if strings.TrimSpace(rawTarget) == "" {
+		return nil, fmt.Errorf("domainscan: target is required")
+	}
 	t := ResolveTarget(rawTarget)
 
 	rep := scanprogress.Or(opts.Progress)

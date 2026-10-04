@@ -350,6 +350,18 @@ func (s *Server) handleStartJob(w http.ResponseWriter, r *http.Request) {
 
 	targets := dedupeTargets(req.Targets)
 
+	// One scope lookup covers the whole job. A rejected target fails the request
+	// before any job or flow row is written.
+	scope, err := s.scopeFor(caseID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := checkTargetsInScope(scope, targets...); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
 	// Identify has no engine.Flow underneath -- it runs internal/recon
 	// directly against each target (see runIdentifyJob) -- so its job row
 	// is created without a flow_id/run_id and it skips buildToolFlow
@@ -360,7 +372,7 @@ func (s *Server) handleStartJob(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		go s.runIdentifyJob(caseID, jobID, targets)
+		go s.runIdentifyJob(caseID, jobID, targets, scope)
 		writeJSON(w, http.StatusAccepted, jobStartResult{JobID: jobID})
 		return
 	}
@@ -405,7 +417,9 @@ func (s *Server) handleStartJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	go s.executeToolJob(caseID, flow, jobID, runID, jobPolicy(req.Options))
+	pol := jobPolicy(req.Options)
+	pol.Scope = scope
+	go s.executeToolJob(caseID, flow, jobID, runID, pol)
 
 	writeJSON(w, http.StatusAccepted, jobStartResult{JobID: jobID})
 }

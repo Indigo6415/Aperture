@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -30,7 +31,13 @@ func randomID() string {
 }
 
 type Store struct {
+	// db is the single writer connection: SQLite allows one writer at a time,
+	// so writes are serialized through it.
 	db *sql.DB
+	// rdb serves read-only queries from a small pool. With WAL journaling,
+	// readers run alongside the writer, so a long report or list query no
+	// longer blocks scanners writing results.
+	rdb *sql.DB
 	// requests queues request-log rows for the single background writer
 	// (see requests.go). requestsStop asks it to finish, and requestsDone
 	// closes once it has.
@@ -42,7 +49,11 @@ type Store struct {
 // Open opens (creating if necessary) the SQLite database at path and
 // applies the schema.
 func Open(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path)
+	// Both pools share one DSN so every connection gets the same settings.
+	// busy_timeout is per connection, and journal_mode=WAL lets readers
+	// proceed during a write. The driver applies _pragma to each new connection.
+	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("store: open %s: %w", path, err)
 	}
@@ -50,18 +61,32 @@ func Open(path string) (*Store, error) {
 	// avoids "database is locked" errors under concurrent goroutines.
 	db.SetMaxOpenConns(1)
 
-	s := &Store{db: db}
+	rdb, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("store: open read pool %s: %w", path, err)
+	}
+	rdb.SetMaxOpenConns(readPoolSize)
+
+	s := &Store{db: db, rdb: rdb}
 	if err := s.migrate(); err != nil {
 		db.Close()
+		rdb.Close()
 		return nil, err
 	}
 	s.startRequestWriter()
 	return s, nil
 }
 
-// Close drains any queued request-log rows, then closes the database.
+// readPoolSize caps concurrent read-only connections. Small on purpose: this
+// is a single-operator local tool, and WAL readers only need enough to avoid
+// queueing behind each other on ordinary page loads.
+const readPoolSize = 4
+
+// Close drains any queued request-log rows, then closes both pools.
 func (s *Store) Close() error {
 	s.stopRequestWriter()
+	s.rdb.Close()
 	return s.db.Close()
 }
 
@@ -125,6 +150,15 @@ CREATE TABLE IF NOT EXISTS cases (
 -- the user wants to group separately (like a Spotify playlist). Every
 -- target belongs to exactly one list; kind is a UI hint (icon/placeholder)
 -- only, same as targets.kind was before this table existed.
+-- Scope rules for a case: the hosts a scan launched under this case may touch
+-- (see netgov.Scope). A case with no rows is unrestricted. pattern is kept as
+-- the operator typed it, normalized only by netgov.NewScope when it is used.
+CREATE TABLE IF NOT EXISTS case_scope (
+	case_id TEXT NOT NULL,
+	pattern TEXT NOT NULL,
+	PRIMARY KEY (case_id, pattern)
+);
+
 CREATE TABLE IF NOT EXISTS target_lists (
 	id TEXT PRIMARY KEY,
 	case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
@@ -440,7 +474,7 @@ CREATE TABLE IF NOT EXISTS request_hits (
 // already saved silently disappears from the Targets tab. A no-op once
 // every target already has a list_id.
 func (s *Store) backfillTargetLists() error {
-	rows, err := s.db.Query(`SELECT DISTINCT case_id FROM targets WHERE list_id IS NULL OR list_id = ''`)
+	rows, err := s.rdb.Query(`SELECT DISTINCT case_id FROM targets WHERE list_id IS NULL OR list_id = ''`)
 	if err != nil {
 		return fmt.Errorf("store: backfill target lists: %w", err)
 	}
@@ -470,12 +504,27 @@ func (s *Store) backfillTargetLists() error {
 	return nil
 }
 
+// identPattern matches a plain SQL identifier: letters, digits, underscore.
+var identPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// validIdentifier reports whether name is safe to splice into SQL as a table
+// or column name.
+func validIdentifier(name string) bool {
+	return identPattern.MatchString(name)
+}
+
 // ensureColumn adds column to table (via ALTER TABLE ... ADD COLUMN decl) if
 // it isn't already present -- SQLite has no "ADD COLUMN IF NOT EXISTS", and
 // re-running the bare ALTER on every startup would fail once the column
 // already exists.
 func (s *Store) ensureColumn(table, column, decl string) error {
-	rows, err := s.db.Query(fmt.Sprintf(`PRAGMA table_info(%s)`, table))
+	// table is spliced into a PRAGMA (no bind parameters there), so refuse
+	// anything that isn't a plain identifier. Callers are internal, but this
+	// keeps the interpolation safe if one ever passes user input.
+	if !validIdentifier(table) || !validIdentifier(column) {
+		return fmt.Errorf("store: refusing non-identifier table %q or column %q", table, column)
+	}
+	rows, err := s.rdb.Query(fmt.Sprintf(`PRAGMA table_info(%s)`, table))
 	if err != nil {
 		return fmt.Errorf("store: inspect %s: %w", table, err)
 	}
@@ -524,7 +573,7 @@ func (s *Store) SaveFlow(f engine.Flow) error {
 
 func (s *Store) GetFlow(id string) (engine.Flow, error) {
 	var def string
-	err := s.db.QueryRow(`SELECT definition FROM flows WHERE id = ?`, id).Scan(&def)
+	err := s.rdb.QueryRow(`SELECT definition FROM flows WHERE id = ?`, id).Scan(&def)
 	if err == sql.ErrNoRows {
 		return engine.Flow{}, fmt.Errorf("store: flow %s: %w", id, ErrNotFound)
 	}
@@ -581,7 +630,7 @@ func (s *Store) GetRun(id string) (Run, error) {
 	var r Run
 	var finishedAt sql.NullTime
 	var errMsg sql.NullString
-	err := s.db.QueryRow(`SELECT id, flow_id, status, error, started_at, finished_at FROM runs WHERE id = ?`, id).
+	err := s.rdb.QueryRow(`SELECT id, flow_id, status, error, started_at, finished_at FROM runs WHERE id = ?`, id).
 		Scan(&r.ID, &r.FlowID, &r.Status, &errMsg, &r.StartedAt, &finishedAt)
 	if err == sql.ErrNoRows {
 		return Run{}, fmt.Errorf("store: run %s: %w", id, ErrNotFound)
@@ -634,7 +683,7 @@ func (s *Store) ListFindings(runID, nodeID string) ([]model.Finding, error) {
 	}
 	query += ` ORDER BY timestamp ASC`
 
-	rows, err := s.db.Query(query, args...)
+	rows, err := s.rdb.Query(query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("store: list findings: %w", err)
 	}
@@ -707,7 +756,7 @@ func (s *Store) CreateCase(id, name, description string) error {
 func (s *Store) GetCase(id string) (Case, error) {
 	var c Case
 	var description sql.NullString
-	err := s.db.QueryRow(`SELECT id, name, description, created_at, updated_at FROM cases WHERE id = ?`, id).
+	err := s.rdb.QueryRow(`SELECT id, name, description, created_at, updated_at FROM cases WHERE id = ?`, id).
 		Scan(&c.ID, &c.Name, &description, &c.CreatedAt, &c.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return Case{}, fmt.Errorf("store: case %s: %w", id, ErrNotFound)
@@ -720,7 +769,7 @@ func (s *Store) GetCase(id string) (Case, error) {
 }
 
 func (s *Store) ListCases() ([]Case, error) {
-	rows, err := s.db.Query(`SELECT id, name, description, created_at, updated_at FROM cases ORDER BY created_at DESC`)
+	rows, err := s.rdb.Query(`SELECT id, name, description, created_at, updated_at FROM cases ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("store: list cases: %w", err)
 	}
@@ -753,6 +802,12 @@ func (s *Store) DeleteCase(id string) error {
 		return fmt.Errorf("store: delete case: %w", err)
 	}
 	defer tx.Rollback()
+
+	// case_scope has no foreign-key cascade (foreign keys are not enforced
+	// here), so its rows are removed explicitly with the case.
+	if _, err := tx.Exec(`DELETE FROM case_scope WHERE case_id = ?`, id); err != nil {
+		return fmt.Errorf("store: delete case scope: %w", err)
+	}
 
 	if _, err := tx.Exec(`
 		DELETE FROM requests
@@ -793,7 +848,7 @@ func (s *Store) CreateTargetList(l TargetList) error {
 }
 
 func (s *Store) ListTargetLists(caseID string) ([]TargetList, error) {
-	rows, err := s.db.Query(`
+	rows, err := s.rdb.Query(`
 		SELECT id, case_id, name, kind, created_at FROM target_lists WHERE case_id = ? ORDER BY created_at ASC
 	`, caseID)
 	if err != nil {
@@ -818,7 +873,7 @@ func (s *Store) ListTargetLists(caseID string) ([]TargetList, error) {
 // list.
 func (s *Store) GetTargetListByID(id string) (TargetList, error) {
 	var l TargetList
-	err := s.db.QueryRow(`SELECT id, case_id, name, kind, created_at FROM target_lists WHERE id = ?`, id).
+	err := s.rdb.QueryRow(`SELECT id, case_id, name, kind, created_at FROM target_lists WHERE id = ?`, id).
 		Scan(&l.ID, &l.CaseID, &l.Name, &l.Kind, &l.CreatedAt)
 	if err == sql.ErrNoRows {
 		return TargetList{}, fmt.Errorf("store: target list %s: %w", id, ErrNotFound)
@@ -834,7 +889,7 @@ func (s *Store) GetTargetListByID(id string) (TargetList, error) {
 // backfillTargetLists to find-or-make each case's default "Domains" list.
 func (s *Store) getOrCreateTargetList(caseID, name, kind string) (string, error) {
 	var id string
-	err := s.db.QueryRow(`SELECT id FROM target_lists WHERE case_id = ? AND name = ?`, caseID, name).Scan(&id)
+	err := s.rdb.QueryRow(`SELECT id FROM target_lists WHERE case_id = ? AND name = ?`, caseID, name).Scan(&id)
 	if err == nil {
 		return id, nil
 	}
@@ -924,7 +979,7 @@ func (s *Store) AddTarget(t Target) error {
 }
 
 func (s *Store) ListTargets(caseID string) ([]Target, error) {
-	rows, err := s.db.Query(`SELECT `+targetSelectCols+`WHERE t.case_id = ? ORDER BY t.created_at ASC`, caseID)
+	rows, err := s.rdb.Query(`SELECT `+targetSelectCols+`WHERE t.case_id = ? ORDER BY t.created_at ASC`, caseID)
 	if err != nil {
 		return nil, fmt.Errorf("store: list targets: %w", err)
 	}
@@ -945,7 +1000,7 @@ func (s *Store) ListTargets(caseID string) ([]Target, error) {
 // promotion to report back the (possibly pre-existing) target a value
 // resolved to.
 func (s *Store) GetTargetByValue(caseID, value string) (Target, error) {
-	t, err := scanTarget(s.db.QueryRow(`SELECT `+targetSelectCols+`WHERE t.case_id = ? AND t.value = ?`, caseID, value))
+	t, err := scanTarget(s.rdb.QueryRow(`SELECT `+targetSelectCols+`WHERE t.case_id = ? AND t.value = ?`, caseID, value))
 	if err == sql.ErrNoRows {
 		return Target{}, fmt.Errorf("store: target %s/%s: %w", caseID, value, ErrNotFound)
 	}
@@ -959,7 +1014,7 @@ func (s *Store) GetTargetByValue(caseID, value string) (Target, error) {
 // handleDeleteTarget (whose route only carries the target id) to tell a
 // missing target apart from a successful delete.
 func (s *Store) GetTargetByID(id string) (Target, error) {
-	t, err := scanTarget(s.db.QueryRow(`SELECT `+targetSelectCols+`WHERE t.id = ?`, id))
+	t, err := scanTarget(s.rdb.QueryRow(`SELECT `+targetSelectCols+`WHERE t.id = ?`, id))
 	if err == sql.ErrNoRows {
 		return Target{}, fmt.Errorf("store: target %s: %w", id, ErrNotFound)
 	}
@@ -1029,7 +1084,7 @@ func (s *Store) GetJob(id string) (Job, error) {
 	var j Job
 	var flowID, runID, config, errMsg, targets sql.NullString
 	var finishedAt sql.NullTime
-	err := s.db.QueryRow(`
+	err := s.rdb.QueryRow(`
 		SELECT id, case_id, tool, flow_id, run_id, targets, config, status, error, created_at, finished_at
 		FROM jobs WHERE id = ?
 	`, id).Scan(&j.ID, &j.CaseID, &j.Tool, &flowID, &runID, &targets, &config, &j.Status, &errMsg, &j.CreatedAt, &finishedAt)
@@ -1063,7 +1118,7 @@ func (s *Store) ListCaseJobs(caseID string) ([]Job, error) {
 	// merged in Go instead -- COALESCE on two DATETIME columns loses the
 	// column's declared type, so the sqlite driver hands back a raw string
 	// instead of converting it to time.Time, which sql.NullTime can't Scan.
-	rows, err := s.db.Query(`
+	rows, err := s.rdb.Query(`
 		SELECT j.id, j.case_id, j.tool, j.flow_id, j.run_id, j.targets, j.config,
 			COALESCE(r.status, j.status), COALESCE(r.error, j.error), j.created_at,
 			r.finished_at, j.finished_at
@@ -1107,7 +1162,7 @@ func (s *Store) ListCaseJobs(caseID string) ([]Job, error) {
 // run of the same tool rather than piling up redundant subprocesses.
 func (s *Store) ToolRunning(caseID, tool string) (bool, error) {
 	var running bool
-	err := s.db.QueryRow(`
+	err := s.rdb.QueryRow(`
 		SELECT EXISTS(
 			SELECT 1 FROM jobs j LEFT JOIN runs r ON r.id = j.run_id
 			WHERE j.case_id = ? AND j.tool = ? AND COALESCE(r.status, j.status) = 'running'
@@ -1124,7 +1179,7 @@ func (s *Store) ToolRunning(caseID, tool string) (bool, error) {
 // ToolRunning's whole-tool check, so restarting one target doesn't get
 // blocked by (or itself block) a different target's job of the same tool.
 func (s *Store) TargetRunning(caseID, tool, target string) (bool, error) {
-	rows, err := s.db.Query(`
+	rows, err := s.rdb.Query(`
 		SELECT j.targets FROM jobs j LEFT JOIN runs r ON r.id = j.run_id
 		WHERE j.case_id = ? AND j.tool = ? AND COALESCE(r.status, j.status) = 'running'
 	`, caseID, tool)
@@ -1159,7 +1214,7 @@ func (s *Store) TargetRunning(caseID, tool, target string) (bool, error) {
 
 func (s *Store) CaseTargetCount(caseID string) (int, error) {
 	var count int
-	err := s.db.QueryRow(`SELECT COUNT(*) FROM targets WHERE case_id = ?`, caseID).Scan(&count)
+	err := s.rdb.QueryRow(`SELECT COUNT(*) FROM targets WHERE case_id = ?`, caseID).Scan(&count)
 	if err != nil {
 		return 0, fmt.Errorf("store: case target count: %w", err)
 	}
@@ -1168,7 +1223,7 @@ func (s *Store) CaseTargetCount(caseID string) (int, error) {
 
 func (s *Store) CaseJobCount(caseID string) (int, error) {
 	var count int
-	err := s.db.QueryRow(`SELECT COUNT(*) FROM jobs WHERE case_id = ?`, caseID).Scan(&count)
+	err := s.rdb.QueryRow(`SELECT COUNT(*) FROM jobs WHERE case_id = ?`, caseID).Scan(&count)
 	if err != nil {
 		return 0, fmt.Errorf("store: case job count: %w", err)
 	}
@@ -1179,7 +1234,7 @@ func (s *Store) CaseJobCount(caseID string) (int, error) {
 // ("table") across every job belonging to a case.
 func (s *Store) CaseFindingCount(caseID string) (int, error) {
 	var count int
-	err := s.db.QueryRow(`
+	err := s.rdb.QueryRow(`
 		SELECT COUNT(*) FROM findings f
 		JOIN jobs j ON j.run_id = f.run_id
 		WHERE j.case_id = ? AND f.node_id = 'table'
@@ -1194,7 +1249,7 @@ func (s *Store) CaseFindingCount(caseID string) (int, error) {
 // the case list can show a "running..." vs "idle" pill.
 func (s *Store) CaseRunning(caseID string) (bool, error) {
 	var running bool
-	err := s.db.QueryRow(`
+	err := s.rdb.QueryRow(`
 		SELECT EXISTS(
 			SELECT 1 FROM jobs j LEFT JOIN runs r ON r.id = j.run_id
 			WHERE j.case_id = ? AND COALESCE(r.status, j.status) = 'running'
@@ -1229,7 +1284,7 @@ func (s *Store) SaveCaseCheck(caseID, jobID string, c recon.Check) error {
 // order they were started, so a client reloading a case sees them roughly
 // as they originally streamed in.
 func (s *Store) ListCaseChecks(caseID string) ([]recon.Check, error) {
-	rows, err := s.db.Query(`SELECT target, kind, status, data, error, started_at, finished_at FROM case_checks WHERE case_id = ? ORDER BY started_at ASC`, caseID)
+	rows, err := s.rdb.Query(`SELECT target, kind, status, data, error, started_at, finished_at FROM case_checks WHERE case_id = ? ORDER BY started_at ASC`, caseID)
 	if err != nil {
 		return nil, fmt.Errorf("store: list case checks: %w", err)
 	}
@@ -1284,7 +1339,7 @@ func (s *Store) SaveCaseScreenshot(caseID, target, url string, image []byte) err
 // ListCaseScreenshots returns metadata for every screenshot captured so far
 // for a case, so the UI knows which targets have a thumbnail to fetch.
 func (s *Store) ListCaseScreenshots(caseID string) ([]ScreenshotMeta, error) {
-	rows, err := s.db.Query(`SELECT target, url, captured_at FROM case_screenshots WHERE case_id = ? ORDER BY target ASC`, caseID)
+	rows, err := s.rdb.Query(`SELECT target, url, captured_at FROM case_screenshots WHERE case_id = ? ORDER BY target ASC`, caseID)
 	if err != nil {
 		return nil, fmt.Errorf("store: list case screenshots: %w", err)
 	}
@@ -1304,7 +1359,7 @@ func (s *Store) ListCaseScreenshots(caseID string) ([]ScreenshotMeta, error) {
 // GetCaseScreenshot returns one target's captured PNG bytes.
 func (s *Store) GetCaseScreenshot(caseID, target string) ([]byte, error) {
 	var image []byte
-	err := s.db.QueryRow(`SELECT image FROM case_screenshots WHERE case_id = ? AND target = ?`, caseID, target).Scan(&image)
+	err := s.rdb.QueryRow(`SELECT image FROM case_screenshots WHERE case_id = ? AND target = ?`, caseID, target).Scan(&image)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("store: case screenshot %s/%s: %w", caseID, target, ErrNotFound)
 	}
@@ -1319,7 +1374,7 @@ func (s *Store) GetCaseScreenshot(caseID, target string) ([]byte, error) {
 // shot instead of re-launching a browser for it on every check that fires.
 func (s *Store) HasCaseScreenshot(caseID, target string) (bool, error) {
 	var exists bool
-	err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM case_screenshots WHERE case_id = ? AND target = ?)`, caseID, target).Scan(&exists)
+	err := s.rdb.QueryRow(`SELECT EXISTS(SELECT 1 FROM case_screenshots WHERE case_id = ? AND target = ?)`, caseID, target).Scan(&exists)
 	if err != nil {
 		return false, fmt.Errorf("store: has case screenshot: %w", err)
 	}
@@ -1397,7 +1452,7 @@ func (s *Store) UpdateCredentialSession(id string, headers map[string]string, co
 }
 
 func (s *Store) ListCredentials(caseID string) ([]Credential, error) {
-	rows, err := s.db.Query(`
+	rows, err := s.rdb.Query(`
 		SELECT id, case_id, name, headers, cookie, notes,
 			username, password, login_url, login_method, username_field, password_field, token_field, session_created_at,
 			created_at
@@ -1420,7 +1475,7 @@ func (s *Store) ListCredentials(caseID string) ([]Credential, error) {
 }
 
 func (s *Store) GetCredential(id string) (Credential, error) {
-	row := s.db.QueryRow(`
+	row := s.rdb.QueryRow(`
 		SELECT id, case_id, name, headers, cookie, notes,
 			username, password, login_url, login_method, username_field, password_field, token_field, session_created_at,
 			created_at
@@ -1494,7 +1549,7 @@ type DomainCookie struct {
 }
 
 func (s *Store) ListDomainCookies(caseID string) ([]DomainCookie, error) {
-	rows, err := s.db.Query(`
+	rows, err := s.rdb.Query(`
 		SELECT case_id, domain, cookie, updated_at FROM domain_cookies WHERE case_id = ? ORDER BY domain ASC
 	`, caseID)
 	if err != nil {
@@ -1541,7 +1596,7 @@ func (s *Store) SetDomainCookie(caseID, domain, cookie string) error {
 func (s *Store) CookieForDomain(caseID, domain string) (string, error) {
 	domain = strings.ToLower(strings.TrimSpace(domain))
 	var cookie string
-	err := s.db.QueryRow(`SELECT cookie FROM domain_cookies WHERE case_id = ? AND domain = ?`, caseID, domain).Scan(&cookie)
+	err := s.rdb.QueryRow(`SELECT cookie FROM domain_cookies WHERE case_id = ? AND domain = ?`, caseID, domain).Scan(&cookie)
 	if err == sql.ErrNoRows {
 		return "", nil
 	}
@@ -1575,7 +1630,7 @@ func (s *Store) SaveJobTemplate(t JobTemplate) error {
 }
 
 func (s *Store) ListJobTemplates(tool string) ([]JobTemplate, error) {
-	rows, err := s.db.Query(`
+	rows, err := s.rdb.Query(`
 		SELECT id, tool, name, options, created_at FROM job_templates WHERE tool = ? ORDER BY created_at ASC
 	`, tool)
 	if err != nil {
@@ -1638,12 +1693,12 @@ func (s *Store) ListCaseScans(caseID, tool string) ([]CaseScan, error) {
 	var rows *sql.Rows
 	var err error
 	if tool == "" {
-		rows, err = s.db.Query(`
+		rows, err = s.rdb.Query(`
 			SELECT id, case_id, target, tool, severity, summary, created_at
 			FROM case_scans WHERE case_id = ? ORDER BY created_at DESC
 		`, caseID)
 	} else {
-		rows, err = s.db.Query(`
+		rows, err = s.rdb.Query(`
 			SELECT id, case_id, target, tool, severity, summary, created_at
 			FROM case_scans WHERE case_id = ? AND tool = ? ORDER BY created_at DESC
 		`, caseID, tool)
@@ -1668,7 +1723,7 @@ func (s *Store) ListCaseScans(caseID, tool string) ([]CaseScan, error) {
 // payload -- used when a case scan's details are opened individually.
 func (s *Store) GetCaseScan(id string) (CaseScan, error) {
 	var c CaseScan
-	err := s.db.QueryRow(`
+	err := s.rdb.QueryRow(`
 		SELECT id, case_id, target, tool, severity, summary, data, created_at FROM case_scans WHERE id = ?
 	`, id).Scan(&c.ID, &c.CaseID, &c.Target, &c.Tool, &c.Severity, &c.Summary, &c.Data, &c.CreatedAt)
 	if err == sql.ErrNoRows {
@@ -1699,7 +1754,7 @@ func (s *Store) SetSetting(key, value string) error {
 
 // GetSetting returns a setting's value and whether it's been set at all.
 func (s *Store) GetSetting(key string) (value string, ok bool, err error) {
-	err = s.db.QueryRow(`SELECT value FROM settings WHERE key = ?`, key).Scan(&value)
+	err = s.rdb.QueryRow(`SELECT value FROM settings WHERE key = ?`, key).Scan(&value)
 	if err == sql.ErrNoRows {
 		return "", false, nil
 	}
@@ -1716,7 +1771,7 @@ func (s *Store) GetSetting(key string) (value string, ok bool, err error) {
 // is still fresh enough to use (see cveCacheTTL in api/handlers_scan.go)
 // rather than this layer enforcing any particular TTL.
 func (s *Store) GetCVECache(product, version string) (data string, fetchedAt time.Time, ok bool, err error) {
-	err = s.db.QueryRow(`SELECT data, fetched_at FROM cve_cache WHERE product = ? AND version = ?`, product, version).Scan(&data, &fetchedAt)
+	err = s.rdb.QueryRow(`SELECT data, fetched_at FROM cve_cache WHERE product = ? AND version = ?`, product, version).Scan(&data, &fetchedAt)
 	if err == sql.ErrNoRows {
 		return "", time.Time{}, false, nil
 	}
@@ -1768,7 +1823,7 @@ func (s *Store) CreateUserWithPassword(id, email, password string) error {
 // whether to seed a default one on first run.
 func (s *Store) UserCount() (int, error) {
 	var n int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&n); err != nil {
+	if err := s.rdb.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&n); err != nil {
 		return 0, fmt.Errorf("store: user count: %w", err)
 	}
 	return n, nil
@@ -1778,15 +1833,18 @@ func (s *Store) UserCount() (int, error) {
 // -- called once at startup so a fresh install always has something to log
 // in with, without ever overwriting or recreating an account someone has
 // since changed, renamed, or deleted.
-func (s *Store) EnsureDefaultUser(email, password string) error {
+func (s *Store) EnsureDefaultUser(email, password string) (bool, error) {
 	n, err := s.UserCount()
 	if err != nil {
-		return err
+		return false, err
 	}
 	if n > 0 {
-		return nil
+		return false, nil
 	}
-	return s.CreateUserWithPassword(randomID(), email, password)
+	if err := s.CreateUserWithPassword(randomID(), email, password); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // VerifyPassword looks up email and checks password against its stored
@@ -1796,7 +1854,7 @@ func (s *Store) EnsureDefaultUser(email, password string) error {
 func (s *Store) VerifyPassword(email, password string) (User, bool, error) {
 	var u User
 	var hash string
-	err := s.db.QueryRow(`SELECT id, email, password_hash, created_at FROM users WHERE email = ?`, strings.ToLower(email)).
+	err := s.rdb.QueryRow(`SELECT id, email, password_hash, created_at FROM users WHERE email = ?`, strings.ToLower(email)).
 		Scan(&u.ID, &u.Email, &hash, &u.CreatedAt)
 	if err == sql.ErrNoRows {
 		return User{}, false, nil
@@ -1813,8 +1871,14 @@ func (s *Store) VerifyPassword(email, password string) (User, bool, error) {
 // CreateSession records a new login session token for userID, valid until
 // expiresAt.
 func (s *Store) CreateSession(token, userID string, expiresAt time.Time) error {
+	now := time.Now()
+	// Expired rows are otherwise only removed when that exact token is presented
+	// again, so sweep them here on each new login to keep the table bounded.
+	if _, err := s.db.Exec(`DELETE FROM sessions WHERE expires_at < ?`, now); err != nil {
+		return fmt.Errorf("store: prune sessions: %w", err)
+	}
 	_, err := s.db.Exec(`INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)`,
-		token, userID, time.Now(), expiresAt)
+		token, userID, now, expiresAt)
 	if err != nil {
 		return fmt.Errorf("store: create session: %w", err)
 	}
@@ -1827,7 +1891,7 @@ func (s *Store) CreateSession(token, userID string, expiresAt time.Time) error {
 func (s *Store) GetSessionUser(token string) (User, error) {
 	var u User
 	var expiresAt time.Time
-	err := s.db.QueryRow(`
+	err := s.rdb.QueryRow(`
 		SELECT u.id, u.email, u.created_at, s.expires_at
 		FROM sessions s JOIN users u ON u.id = s.user_id
 		WHERE s.token = ?
@@ -1856,3 +1920,54 @@ func (s *Store) DeleteSession(token string) error {
 }
 
 var ErrNotFound = fmt.Errorf("not found")
+
+// GetCaseScope returns the scope patterns saved for caseID, in insertion order.
+// An empty result means the case is unrestricted.
+func (s *Store) GetCaseScope(caseID string) ([]string, error) {
+	rows, err := s.rdb.Query(`SELECT pattern FROM case_scope WHERE case_id = ? ORDER BY rowid`, caseID)
+	if err != nil {
+		return nil, fmt.Errorf("store: get case scope: %w", err)
+	}
+	defer rows.Close()
+
+	out := []string{}
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, fmt.Errorf("store: case scope row: %w", err)
+		}
+		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: case scope rows: %w", err)
+	}
+	return out, nil
+}
+
+// SetCaseScope replaces caseID's scope patterns with patterns in a single
+// transaction, so a failed write never leaves a half-updated scope behind.
+// Blank entries are dropped and duplicates collapse; an empty list clears the
+// scope, making the case unrestricted again.
+func (s *Store) SetCaseScope(caseID string, patterns []string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("store: set case scope: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`DELETE FROM case_scope WHERE case_id = ?`, caseID); err != nil {
+		return fmt.Errorf("store: clear case scope: %w", err)
+	}
+	seen := map[string]bool{}
+	for _, raw := range patterns {
+		p := strings.TrimSpace(raw)
+		if p == "" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		if _, err := tx.Exec(`INSERT INTO case_scope (case_id, pattern) VALUES (?, ?)`, caseID, p); err != nil {
+			return fmt.Errorf("store: insert case scope: %w", err)
+		}
+	}
+	return tx.Commit()
+}

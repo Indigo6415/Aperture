@@ -5,6 +5,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io/fs"
 	"log"
 	"net/http"
@@ -162,6 +163,8 @@ func NewServer(st *store.Store, eng *engine.Engine, uiFS fs.FS, wordlistsDir str
 	s.mux.HandleFunc("GET /api/cases/{id}", s.requireAuth(s.handleGetCase))
 	s.mux.HandleFunc("DELETE /api/cases/{id}", s.requireAuth(s.handleDeleteCase))
 	s.mux.HandleFunc("GET /api/cases/{id}/checks", s.requireAuth(s.handleListCaseChecks))
+	s.mux.HandleFunc("GET /api/cases/{id}/scope", s.requireAuth(s.handleGetCaseScope))
+	s.mux.HandleFunc("PUT /api/cases/{id}/scope", s.requireAuth(s.handleSetCaseScope))
 	s.mux.HandleFunc("GET /api/cases/{id}/report", s.requireAuth(s.handleCaseReport))
 	s.mux.HandleFunc("GET /api/cases/{id}/screenshots", s.requireAuth(s.handleListCaseScreenshots))
 	s.mux.HandleFunc("GET /api/cases/{id}/screenshots/{target}", s.requireAuth(s.handleGetCaseScreenshot))
@@ -277,7 +280,26 @@ const maxRequestBody = 10 << 20
 // Handler returns the full HTTP handler: the route mux, wrapped so every
 // request body is capped at maxRequestBody.
 func (s *Server) Handler() http.Handler {
-	return withLogging(limitBody(s.mux))
+	return withLogging(limitBody(refuseCrossOriginWrites(s.mux)))
+}
+
+// refuseCrossOriginWrites rejects state-changing requests (POST, PUT, PATCH,
+// DELETE) whose Origin names another site. Browsers attach Origin to these, so
+// a page on another site can't start scans or delete data with the operator's
+// session cookie, even where SameSite=Lax is the only other defense. Requests
+// with no Origin (curl, the CLI) pass through, as do same-origin and
+// loopback-origin requests (the Vite dev server).
+func refuseCrossOriginWrites(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+			if !originAllowed(r) {
+				writeError(w, http.StatusForbidden, errors.New("cross-origin request refused"))
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // limitBody wraps next so each request body is read through

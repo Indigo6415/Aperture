@@ -8,10 +8,10 @@ import (
 	"testing"
 )
 
-// TestCheckWSOrigin pins which Origin headers may open a WebSocket: same-host,
+// TestOriginAllowed pins which Origin headers may open a WebSocket: same-host,
 // loopback (for the Vite dev proxy), or absent (non-browser clients). Anything
 // else from another site must be refused.
-func TestCheckWSOrigin(t *testing.T) {
+func TestOriginAllowed(t *testing.T) {
 	cases := []struct {
 		name   string
 		host   string
@@ -34,8 +34,8 @@ func TestCheckWSOrigin(t *testing.T) {
 			if tc.origin != "" {
 				r.Header.Set("Origin", tc.origin)
 			}
-			if got := checkWSOrigin(r); got != tc.want {
-				t.Fatalf("checkWSOrigin(origin=%q, host=%q) = %v, want %v", tc.origin, tc.host, got, tc.want)
+			if got := originAllowed(r); got != tc.want {
+				t.Fatalf("originAllowed(origin=%q, host=%q) = %v, want %v", tc.origin, tc.host, got, tc.want)
 			}
 		})
 	}

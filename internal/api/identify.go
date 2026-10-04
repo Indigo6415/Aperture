@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/Indigo6415/Aperture/internal/cve"
+	"github.com/Indigo6415/Aperture/internal/netgov"
 	"github.com/Indigo6415/Aperture/internal/recon"
 	"github.com/Indigo6415/Aperture/internal/store"
 )
@@ -28,8 +29,8 @@ const cveCacheTTL = 7 * 24 * time.Hour
 // bounds its own internal subdomain fan-out per target, and stacking N of
 // those (each doing its own WHOIS/crt.sh lookups) at once would multiply
 // that fan-out unbounded.
-func (s *Server) runIdentifyJob(caseID, jobID string, targets []string) {
-	ctx, cancel := context.WithCancel(context.Background())
+func (s *Server) runIdentifyJob(caseID, jobID string, targets []string, scope *netgov.Scope) {
+	ctx, cancel := context.WithCancel(netgov.WithPolicy(context.Background(), netgov.Policy{Scope: scope}))
 	s.trackJobCancel(jobID, cancel)
 	defer func() {
 		s.untrackJobCancel(jobID)

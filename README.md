@@ -61,9 +61,29 @@ rebuild the frontend step above after making UI changes).
 ## Run
 
 ```sh
-./aperture                 # serves the UI on http://127.0.0.1:8080 and opens it
+./aperture                 # serves the UI on http://127.0.0.1:8337 and opens it
 ./aperture -addr :9000 -db ./aperture.db -open=false
 ```
+
+## First run and login
+
+A fresh install creates one login, `user`, with a random password. That password
+is printed once to the log when the account is created (look for `created first
+login`). Copy it from there. Aperture has no in-app password change yet, so keep
+that password. Existing installs are unaffected.
+
+## Scope
+
+Each case can carry a scope: the hosts scans launched under it may touch. Set it
+from the **Scope** button in the case header. One pattern per line:
+
+- `example.com` matches the host and all its subdomains
+- `*.lab.test` matches subdomains only
+- `10.0.0.5` or `10.0.0.0/24` match an address or range
+
+A case with no scope rules is unrestricted. When rules exist, a scan whose target
+is outside them is refused with a 400 when started, and every request a running
+scan makes to an out-of-scope host is refused before it is sent.
 
 ## Development
 
@@ -71,7 +91,7 @@ Run the Go backend and the Vite dev server side by side; Vite proxies
 `/api` and `/ws` to the backend so there's no CORS to deal with:
 
 ```sh
-go run ./cmd/aperture -addr 127.0.0.1:8080   # terminal 1
+go run ./cmd/aperture                       # terminal 1 (UI/API on 127.0.0.1:8337)
 cd web && npm run dev                        # terminal 2, http://localhost:5173
 ```
 

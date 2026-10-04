@@ -31,7 +31,9 @@ type streamedScan struct {
 	// rps is the request rate this scan's outbound requests are paced to,
 	// from scanRate. Zero leaves pacing off.
 	rps float64
-	run func(ctx context.Context, rep scanprogress.Reporter) (scanOutcome, error)
+	// scope is the case's compiled scope rules, set by queueScan. Nil allows all.
+	scope *netgov.Scope
+	run   func(ctx context.Context, rep scanprogress.Reporter) (scanOutcome, error)
 }
 
 // defaultScanRPS is the request rate a scan runs at when its request names
@@ -76,6 +78,19 @@ type scanStartResult struct {
 // a fast scan could otherwise finish, and every progress event with it,
 // before the WebSocket handshake completes.
 func (s *Server) queueScan(w http.ResponseWriter, scan streamedScan) {
+	// Scope is resolved now, not when the scan is claimed, so an out-of-scope
+	// target gets a 400 right away instead of a silent failure later.
+	scope, err := s.scopeFor(scan.caseID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := checkTargetsInScope(scope, scan.target); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	scan.scope = scope
+
 	scanID := newID()
 	s.streamMu.Lock()
 	s.pendingScans[scanID] = scan
@@ -117,7 +132,7 @@ func (s *Server) handleWatchScan(w http.ResponseWriter, r *http.Request) {
 func (s *Server) runStreamedScan(scanID string, scan streamedScan) {
 	// The rate rides on the context, which the shared netgov transport reads
 	// for every request the scan makes.
-	base := s.withScanRecorder(netgov.WithPolicy(context.Background(), netgov.Policy{MaxRPS: scan.rps}), scanID)
+	base := s.withScanRecorder(netgov.WithPolicy(context.Background(), netgov.Policy{MaxRPS: scan.rps, Scope: scan.scope}), scanID)
 	ctx, cancel := context.WithTimeout(base, scan.timeout)
 	// Registering cancel lets handleCancelScan stop this run early. Once the run
 	// returns, the deferred untrack removes the entry, so a late stop request

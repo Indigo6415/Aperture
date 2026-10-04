@@ -15,14 +15,14 @@ import (
 // session cookie (cross-site WebSocket hijacking). Access is still gated by
 // requireAuth in server.go, so this is defense in depth.
 var upgrader = websocket.Upgrader{
-	CheckOrigin: checkWSOrigin,
+	CheckOrigin: originAllowed,
 }
 
-// checkWSOrigin reports whether a WebSocket upgrade's Origin header is allowed.
+// originAllowed reports whether a request's Origin header is allowed.
 // A request with no Origin (a non-browser client such as curl) is allowed,
 // since cookies still have to match. Otherwise the origin must name the same
 // host as the request or a loopback address.
-func checkWSOrigin(r *http.Request) bool {
+func originAllowed(r *http.Request) bool {
 	origin := r.Header.Get("Origin")
 	if origin == "" {
 		return true

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 
 	"github.com/Indigo6415/Aperture/internal/wordlists"
 )
@@ -50,6 +51,12 @@ func (s *Server) handleDownloadWordlist(w http.ResponseWriter, r *http.Request) 
 	}
 	if url == "" {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("no catalog entry named %q and no url given", req.Name))
+		return
+	}
+	// Only plain web URLs are fetched, so a crafted scheme (file:, gopher:, ...)
+	// can't be used to read local files or reach other protocols.
+	if !isHTTPURL(url) {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("wordlist url must be http or https"))
 		return
 	}
 
@@ -134,4 +141,14 @@ func (s *Server) handleDuplicateWordlist(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// isHTTPURL reports whether raw parses as an absolute http or https URL with a
+// host. Anything else (a bare path, another scheme, an empty host) is refused.
+func isHTTPURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	return (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
 }

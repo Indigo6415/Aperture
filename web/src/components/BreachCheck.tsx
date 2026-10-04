@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { api } from '../api'
 import { toAbsoluteUrl } from '../url'
 import type { Breach, BreachCheckResponse, BreachCrawlResponse, CaseScan, Credential, Target } from '../types'
@@ -651,13 +651,16 @@ function EmailListPanel({
   // crawl across 100s of targets that turns up hundreds of addresses shows
   // what's actually breached first instead of requiring a scroll through
   // every clean/unchecked one to find it.
-  const rankOf = (e: string): number => {
-    const c = checks[e]
-    if (!c || c.status === 'idle') return 2
-    if (c.status === 'running' || c.status === 'error') return 1
-    return (c.breaches?.length ?? 0) > 0 ? 0 : 3
-  }
-  const sortedEmails = useMemo(() => [...emails].sort((a, b) => rankOf(a) - rankOf(b) || a.localeCompare(b)), [emails, checks])
+  const rankOf = useCallback(
+    (e: string): number => {
+      const c = checks[e]
+      if (!c || c.status === 'idle') return 2
+      if (c.status === 'running' || c.status === 'error') return 1
+      return (c.breaches?.length ?? 0) > 0 ? 0 : 3
+    },
+    [checks],
+  )
+  const sortedEmails = useMemo(() => [...emails].sort((a, b) => rankOf(a) - rankOf(b) || a.localeCompare(b)), [emails, rankOf])
   const visibleEmails = useMemo(() => {
     const q = emailFilter.trim().toLowerCase()
     return q ? sortedEmails.filter((e) => e.toLowerCase().includes(q)) : sortedEmails

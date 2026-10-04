@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"flag"
 	"log"
 	"net"
@@ -25,14 +26,24 @@ import (
 	"github.com/Indigo6415/Aperture/internal/wordlists"
 )
 
-// defaultUserEmail/defaultUserPassword seed a single test login on a fresh
-// install (see EnsureDefaultUser) so there's always something to sign in
-// with out of the box -- change or delete it via a later "manage users"
-// feature once one exists; for now it's the only account creation path.
-const (
-	defaultUserEmail    = "user"
-	defaultUserPassword = "user"
-)
+// defaultUserEmail is the login seeded on a fresh install (see
+// EnsureDefaultUser). Its password is random, generated on first run, and
+// printed once to the log, so no install ships with a guessable credential.
+const defaultUserEmail = "user"
+
+// generatePassword returns a random 24-character password drawn from
+// crypto/rand, for the first-run account.
+func generatePassword() (string, error) {
+	const alphabet = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+	b := make([]byte, 24)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	for i := range b {
+		b[i] = alphabet[int(b[i])%len(alphabet)]
+	}
+	return string(b), nil
+}
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:8337", "address to listen on")
@@ -50,8 +61,16 @@ func main() {
 	// Seeds a single test login on first run only -- see EnsureDefaultUser,
 	// which no-ops once any account exists so this never recreates a login
 	// someone has since changed or deleted.
-	if err := st.EnsureDefaultUser(defaultUserEmail, defaultUserPassword); err != nil {
+	firstPassword, err := generatePassword()
+	if err != nil {
+		log.Fatalf("aperture: generate password: %v", err)
+	}
+	created, err := st.EnsureDefaultUser(defaultUserEmail, firstPassword)
+	if err != nil {
 		log.Fatalf("aperture: %v", err)
+	}
+	if created {
+		log.Printf("aperture: created first login %q with password %q -- shown only once, change it after signing in", defaultUserEmail, firstPassword)
 	}
 
 	wordlistsDir := defaultWordlistsDir()

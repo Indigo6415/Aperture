@@ -58,6 +58,7 @@ type pendingDomainScan struct {
 	Opts   domainscan.Options
 	CaseID string
 	RPS    float64
+	Scope  *netgov.Scope
 }
 
 // domainScanStartResult is the immediate response to starting a domain
@@ -124,9 +125,19 @@ func (s *Server) handleDomainScan(w http.ResponseWriter, r *http.Request) {
 	}
 	opts.Headers = s.applyDomainCookie(req.CaseID, req.Target, opts.Headers)
 
+	scope, err := s.scopeFor(req.CaseID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := checkTargetsInScope(scope, req.Target); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
 	scanID := newID()
 	s.domainScanMu.Lock()
-	s.pendingDomainScans[scanID] = pendingDomainScan{Target: req.Target, Opts: opts, CaseID: req.CaseID, RPS: rps}
+	s.pendingDomainScans[scanID] = pendingDomainScan{Target: req.Target, Opts: opts, CaseID: req.CaseID, RPS: rps, Scope: scope}
 	s.domainScanMu.Unlock()
 	time.AfterFunc(domainScanClaimTimeout, func() {
 		s.domainScanMu.Lock()
@@ -167,7 +178,7 @@ func (s *Server) handleWatchDomainScan(w http.ResponseWriter, r *http.Request) {
 func (s *Server) runDomainScan(scanID string, pending pendingDomainScan) {
 	opts := pending.Opts
 	opts.Progress = hubReporter{hub: s.hub, scanID: scanID}
-	ctx, cancel := context.WithCancel(s.withScanRecorder(netgov.WithPolicy(context.Background(), netgov.Policy{MaxRPS: pending.RPS}), scanID))
+	ctx, cancel := context.WithCancel(s.withScanRecorder(netgov.WithPolicy(context.Background(), netgov.Policy{MaxRPS: pending.RPS, Scope: pending.Scope}), scanID))
 	s.trackScanCancel(scanID, cancel)
 	defer s.untrackScanCancel(scanID)
 	defer cancel()

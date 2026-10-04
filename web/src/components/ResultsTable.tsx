@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useMemo, useState } from 'react'
+import { Fragment, useMemo, useState } from 'react'
 import type { Finding, TriageStatus } from '../types'
 import { statusHexColor } from '../statusColor'
 import { extensionOf, hostnameOf } from '../url'
@@ -408,7 +408,13 @@ function FindingDetail({ finding: f, onTriageChange }: { finding: Finding; onTri
   // The note field is uncontrolled from the server's perspective until
   // Save is pressed -- resync it whenever a different finding's row (or an
   // update from elsewhere, e.g. a status-only edit) hands this a new value.
-  useEffect(() => setNote(f.triageNote ?? ''), [f.id, f.triageNote])
+  // Done during render, comparing against the last values seen, so the
+  // resync doesn't need a second render pass from an effect.
+  const [synced, setSynced] = useState({ id: f.id, triageNote: f.triageNote })
+  if (synced.id !== f.id || synced.triageNote !== f.triageNote) {
+    setSynced({ id: f.id, triageNote: f.triageNote })
+    setNote(f.triageNote ?? '')
+  }
 
   return (
     <div className="flex flex-col gap-3 font-mono text-xs">

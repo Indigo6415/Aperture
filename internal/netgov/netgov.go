@@ -56,6 +56,9 @@ type Policy struct {
 	MaxConcurrency int
 	// MaxRPS paces one host at this rate when it is fully open (0 = unpaced).
 	MaxRPS float64
+	// Scope limits which hosts the request may reach (nil = unrestricted). A
+	// request outside it fails with ErrOutOfScope before anything is sent.
+	Scope *Scope
 }
 
 type policyKey struct{}
@@ -297,6 +300,12 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	host := req.URL.Host
 	ctx := req.Context()
 	pol := policyFrom(ctx)
+
+	// Scope is checked first, so an out-of-scope host never gets a canary
+	// probe, a connection, or a log entry that looks like traffic.
+	if !pol.Scope.Allows(host) {
+		return nil, fmt.Errorf("%w: %s", ErrOutOfScope, host)
+	}
 
 	t.mu.Lock()
 	st := t.stateLocked(host)

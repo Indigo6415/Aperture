@@ -75,6 +75,13 @@ export class ApiError extends Error {
   }
 }
 
+// CaseScope is a case's allowlist of hosts scans may touch. An empty list
+// means the case is unrestricted. See internal/netgov/scope.go for the
+// accepted pattern forms.
+export interface CaseScope {
+  patterns: string[]
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
     headers: init?.body ? { 'Content-Type': 'application/json' } : undefined,
@@ -134,6 +141,9 @@ export const api = {
   getCase: (id: string) => req<Case>(`/api/cases/${id}`),
   deleteCase: (id: string) => req<void>(`/api/cases/${id}`, { method: 'DELETE' }),
   listCaseChecks: (caseId: string) => req<Check[]>(`/api/cases/${caseId}/checks`),
+  getCaseScope: (caseId: string) => req<CaseScope>(`/api/cases/${caseId}/scope`),
+  setCaseScope: (caseId: string, patterns: string[]) =>
+    req<CaseScope>(`/api/cases/${caseId}/scope`, { method: 'PUT', body: JSON.stringify({ patterns }) }),
   reportUrl: (caseId: string, format: 'json' | 'html' | 'pdf') => `/api/cases/${caseId}/report?format=${format}`,
   // tool narrows the list to one scan tool's own history (e.g. its "Scans"
   // tab); omit it for the case-wide list.

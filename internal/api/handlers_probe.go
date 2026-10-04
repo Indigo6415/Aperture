@@ -48,6 +48,7 @@ type pendingProbeScan struct {
 	Opts   probescan.Options
 	CaseID string
 	RPS    float64
+	Scope  *netgov.Scope
 }
 
 // probeScanStartResult is the immediate response to starting a probe scan:
@@ -104,9 +105,19 @@ func (s *Server) handleProbeScan(w http.ResponseWriter, r *http.Request) {
 	}
 	opts.Headers = s.applyDomainCookie(req.CaseID, req.Target, opts.Headers)
 
+	scope, err := s.scopeFor(req.CaseID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := checkTargetsInScope(scope, req.Target); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
 	scanID := newID()
 	s.probeMu.Lock()
-	s.pendingProbeScans[scanID] = pendingProbeScan{Target: req.Target, Opts: opts, CaseID: req.CaseID, RPS: rps}
+	s.pendingProbeScans[scanID] = pendingProbeScan{Target: req.Target, Opts: opts, CaseID: req.CaseID, RPS: rps, Scope: scope}
 	s.probeMu.Unlock()
 	time.AfterFunc(probeScanClaimTimeout, func() {
 		s.probeMu.Lock()
@@ -147,7 +158,7 @@ func (s *Server) handleWatchProbeScan(w http.ResponseWriter, r *http.Request) {
 func (s *Server) runProbeScan(scanID string, pending pendingProbeScan) {
 	opts := pending.Opts
 	opts.Progress = hubReporter{hub: s.hub, scanID: scanID}
-	ctx, cancel := context.WithCancel(s.withScanRecorder(netgov.WithPolicy(context.Background(), netgov.Policy{MaxConcurrency: pending.Opts.Concurrency, MaxRPS: pending.RPS}), scanID))
+	ctx, cancel := context.WithCancel(s.withScanRecorder(netgov.WithPolicy(context.Background(), netgov.Policy{MaxConcurrency: pending.Opts.Concurrency, MaxRPS: pending.RPS, Scope: pending.Scope}), scanID))
 	s.trackScanCancel(scanID, cancel)
 	defer s.untrackScanCancel(scanID)
 	defer cancel()

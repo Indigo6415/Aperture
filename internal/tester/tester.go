@@ -63,6 +63,11 @@ type Response struct {
 
 // newClient never verifies TLS -- this tool routinely targets self-signed
 // lab/CTF/internal boxes, same posture as jwtscan/probescan's own clients.
+//
+// Deliberately NOT routed through netgov: the tester sends exactly the one
+// request the operator wrote. netgov would retry an idempotent request after a
+// block and pause the host, so a single manual GET could be sent several times
+// without the operator asking. Scope is still the operator's own choice here.
 func newClient(followRedirects bool) *http.Client {
 	c := &http.Client{
 		Timeout:   requestTimeout,

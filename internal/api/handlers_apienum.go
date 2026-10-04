@@ -52,6 +52,7 @@ type pendingApiEnumScan struct {
 	Opts   apienum.Options
 	CaseID string
 	RPS    float64
+	Scope  *netgov.Scope
 }
 
 // apiEnumScanStartResult is the immediate response to starting an API
@@ -117,9 +118,19 @@ func (s *Server) handleApiEnumScan(w http.ResponseWriter, r *http.Request) {
 	}
 	opts.Headers = s.applyDomainCookie(req.CaseID, req.Target, opts.Headers)
 
+	scope, err := s.scopeFor(req.CaseID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := checkTargetsInScope(scope, req.Target); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
 	scanID := newID()
 	s.apiEnumMu.Lock()
-	s.pendingApiEnumScans[scanID] = pendingApiEnumScan{Target: req.Target, Opts: opts, CaseID: req.CaseID, RPS: rps}
+	s.pendingApiEnumScans[scanID] = pendingApiEnumScan{Target: req.Target, Opts: opts, CaseID: req.CaseID, RPS: rps, Scope: scope}
 	s.apiEnumMu.Unlock()
 	time.AfterFunc(apiEnumScanClaimTimeout, func() {
 		s.apiEnumMu.Lock()
@@ -161,7 +172,7 @@ func (s *Server) handleWatchApiEnumScan(w http.ResponseWriter, r *http.Request) 
 func (s *Server) runApiEnumScan(scanID string, pending pendingApiEnumScan) {
 	opts := pending.Opts
 	opts.Progress = hubReporter{hub: s.hub, scanID: scanID}
-	ctx, cancel := context.WithCancel(s.withScanRecorder(netgov.WithPolicy(context.Background(), netgov.Policy{MaxRPS: pending.RPS}), scanID))
+	ctx, cancel := context.WithCancel(s.withScanRecorder(netgov.WithPolicy(context.Background(), netgov.Policy{MaxRPS: pending.RPS, Scope: pending.Scope}), scanID))
 	s.trackScanCancel(scanID, cancel)
 	defer s.untrackScanCancel(scanID)
 	defer cancel()

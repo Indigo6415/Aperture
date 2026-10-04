@@ -3,7 +3,6 @@ package api
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Indigo6415/Aperture/internal/netgov"
 	"github.com/Indigo6415/Aperture/internal/store"
 )
 
@@ -187,15 +187,11 @@ func (s *Server) handleCreateCredentialSession(w http.ResponseWriter, r *http.Re
 	}
 	loginReq.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{
-		Timeout:   credentialSessionTimeout,
-		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}, //nolint:gosec // deliberate: authorized testing against lab/CTF/self-signed targets
-		// Not following redirects so a Set-Cookie on the login response
-		// itself (the common 302-after-login flow) lands on resp directly
-		// instead of being discarded partway through a redirect chain --
-		// same posture as the tester package.
-		CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse },
-	}
+	// Routed through netgov so the login counts against the target's shared
+	// request budget and appears in the request log. netgov's transport also
+	// skips TLS verification, which self-signed lab targets need. Redirects are
+	// not followed, so a Set-Cookie on a 302-after-login response lands on resp.
+	client := netgov.NewClient(credentialSessionTimeout, false)
 	resp, err := client.Do(loginReq)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, fmt.Errorf("login request failed: %w", err))

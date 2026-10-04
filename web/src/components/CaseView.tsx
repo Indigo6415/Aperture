@@ -40,6 +40,7 @@ import { sendToSecretScan, onSecretScanRequest, type SecretScanRequest } from '.
 import { sendToBypass403, onBypass403Request, type Bypass403HandoffRequest } from '../bypass403Handoff'
 import { sendToTester, onTesterRequest, type TesterHandoffRequest } from '../testerHandoff'
 import { CollapsibleFormPanel } from './CollapsibleFormPanel'
+import { ScopeEditor } from './ScopeEditor'
 import { useAutoCollapseOnce, useAutoExpandOnce, useCollapsible } from '../collapsible'
 import { CredentialVault } from './CredentialVault'
 import { CredentialPicker } from './CredentialPicker'
@@ -237,8 +238,12 @@ export function CaseView({ caseId }: { caseId: string }) {
   // nodes (one per target).
   const [jobProgress, setJobProgress] = useState<Record<string, { done: number; total: number }>>({})
   const [nodeStatus, setNodeStatus] = useState<Record<string, NodeStatus>>({})
-  const nodeStartedAtRef = useRef<Record<string, number>>({})
+  // When each node first started running, keyed like jobProgress. Kept in state
+  // (not a ref) because the render reads it.
+  const [nodeStartedAt, setNodeStartedAt] = useState<Record<string, number>>({})
   const [tab, setTab] = useState<Tab>('targets')
+  // Whether the scope editor is open under the case header.
+  const [scopeOpen, setScopeOpen] = useState(false)
   const [reportFormat, setReportFormat] = useState<'json' | 'html' | 'pdf'>('html')
   // Collapses the tab nav to a slim dot rail so a case with many tools open
   // gives the active tab's content the width instead of a permanently fixed
@@ -313,11 +318,11 @@ export function CaseView({ caseId }: { caseId: string }) {
         setRunFindings((prev) => ({ ...prev, [job.id]: [...(prev[job.id] ?? []), finding] }))
       } else if (ev.type === 'progress' && ev.nodeId) {
         const key = `${job.id}:${ev.nodeId}`
-        if (!nodeStartedAtRef.current[key]) nodeStartedAtRef.current[key] = Date.now()
+        setNodeStartedAt((prev) => (prev[key] ? prev : { ...prev, [key]: Date.now() }))
         setJobProgress((prev) => ({ ...prev, [key]: { done: ev.done ?? 0, total: ev.total ?? 0 } }))
       } else if (ev.type === 'status' && ev.nodeId && ev.status) {
         const key = `${job.id}:${ev.nodeId}`
-        if (ev.status === 'running' && !nodeStartedAtRef.current[key]) nodeStartedAtRef.current[key] = Date.now()
+        if (ev.status === 'running') setNodeStartedAt((prev) => (prev[key] ? prev : { ...prev, [key]: Date.now() }))
         setNodeStatus((prev) => ({ ...prev, [key]: ev.status! }))
       } else if (ev.type === 'check' && ev.check) {
         const check = ev.check
@@ -344,7 +349,7 @@ export function CaseView({ caseId }: { caseId: string }) {
     setJobStatus({})
     setJobProgress({})
     setNodeStatus({})
-    nodeStartedAtRef.current = {}
+    setNodeStartedAt({})
     setTab('targets')
     Object.values(stopJobWatches.current).forEach((stop) => stop())
     stopJobWatches.current = {}
@@ -542,6 +547,13 @@ export function CaseView({ caseId }: { caseId: string }) {
     <div className="flex h-full flex-col">
       <header className="flex items-center gap-3 border-b border-neutral-800 bg-neutral-950 px-4 py-2">
         <h1 className="text-sm font-medium text-neutral-100">{c.name}</h1>
+        <button
+          type="button"
+          onClick={() => setScopeOpen((v) => !v)}
+          className="rounded border border-neutral-700 px-2 py-0.5 text-xs text-neutral-300 hover:bg-neutral-800"
+        >
+          Scope{scopeOpen ? ' ▴' : ' ▾'}
+        </button>
         {c.description && <span className="truncate text-xs text-neutral-500">{c.description}</span>}
         <span className="text-xs text-neutral-500">{new Date(c.createdAt).toLocaleString()}</span>
         {runningJobs.length > 0 && (
@@ -567,6 +579,7 @@ export function CaseView({ caseId }: { caseId: string }) {
           </a>
         </div>
       </header>
+      {scopeOpen && <ScopeEditor key={c.id} caseId={c.id} />}
 
       <div className="flex flex-1 overflow-hidden">
         {navOpen ? (
@@ -652,7 +665,7 @@ export function CaseView({ caseId }: { caseId: string }) {
               statusOf={statusOf}
               nodeStatus={nodeStatus}
               jobProgress={jobProgress}
-              nodeStartedAtRef={nodeStartedAtRef}
+              nodeStartedAt={nodeStartedAt}
               onStart={addJob}
               onCancel={cancelJob}
               onPromote={(values) => promoteFromTool('feroxbuster', values)}
@@ -673,7 +686,7 @@ export function CaseView({ caseId }: { caseId: string }) {
               statusOf={statusOf}
               nodeStatus={nodeStatus}
               jobProgress={jobProgress}
-              nodeStartedAtRef={nodeStartedAtRef}
+              nodeStartedAt={nodeStartedAt}
               onStart={addJob}
               onCancel={cancelJob}
               onPromote={(values) => promoteFromTool('ffuf-subdomain', values)}
@@ -692,7 +705,7 @@ export function CaseView({ caseId }: { caseId: string }) {
               statusOf={statusOf}
               nodeStatus={nodeStatus}
               jobProgress={jobProgress}
-              nodeStartedAtRef={nodeStartedAtRef}
+              nodeStartedAt={nodeStartedAt}
               onStart={addJob}
               onCancel={cancelJob}
               onPromote={(values) => promoteFromTool('ffuf-vhost', values)}
@@ -712,7 +725,7 @@ export function CaseView({ caseId }: { caseId: string }) {
               statusOf={statusOf}
               nodeStatus={nodeStatus}
               jobProgress={jobProgress}
-              nodeStartedAtRef={nodeStartedAtRef}
+              nodeStartedAt={nodeStartedAt}
               onStart={addJob}
               onCancel={cancelJob}
               onPromote={(values) => promoteFromTool('subfinder', values)}
@@ -732,7 +745,7 @@ export function CaseView({ caseId }: { caseId: string }) {
               statusOf={statusOf}
               nodeStatus={nodeStatus}
               jobProgress={jobProgress}
-              nodeStartedAtRef={nodeStartedAtRef}
+              nodeStartedAt={nodeStartedAt}
               onStart={addJob}
               onCancel={cancelJob}
               onPromote={(values) => promoteFromTool('katana', values)}
@@ -751,7 +764,7 @@ export function CaseView({ caseId }: { caseId: string }) {
               statusOf={statusOf}
               nodeStatus={nodeStatus}
               jobProgress={jobProgress}
-              nodeStartedAtRef={nodeStartedAtRef}
+              nodeStartedAt={nodeStartedAt}
               onStart={addJob}
               onCancel={cancelJob}
               onPromote={(values) => promoteFromTool('ffuf-custom', values)}
@@ -769,7 +782,7 @@ export function CaseView({ caseId }: { caseId: string }) {
               statusOf={statusOf}
               nodeStatus={nodeStatus}
               jobProgress={jobProgress}
-              nodeStartedAtRef={nodeStartedAtRef}
+              nodeStartedAt={nodeStartedAt}
               onStart={addJob}
               onCancel={cancelJob}
               onPromote={(values) => promoteFromTool('nuclei', values)}
@@ -1585,7 +1598,7 @@ function ToolTab({
   statusOf,
   nodeStatus,
   jobProgress,
-  nodeStartedAtRef,
+  nodeStartedAt,
   onStart,
   onCancel,
   onPromote,
@@ -1607,7 +1620,7 @@ function ToolTab({
   statusOf: (job: Job) => RunStatus
   nodeStatus: Record<string, NodeStatus>
   jobProgress: Record<string, { done: number; total: number }>
-  nodeStartedAtRef: React.MutableRefObject<Record<string, number>>
+  nodeStartedAt: Record<string, number>
   onStart: (job: Job) => void
   onCancel: (job: Job) => void
   onPromote: (values: string[]) => void
@@ -1707,7 +1720,7 @@ function ToolTab({
         const p = jobProgress[key]
         const done = p?.done ?? 0
         const total = p?.total ?? 0
-        const startedAt = nodeStartedAtRef.current[key] ?? null
+        const startedAt = nodeStartedAt[key] ?? null
         const detail = job.nodes?.find((n) => n.nodeId === nodeId)
         rows.push({
           key, target, status, done, total, etaSeconds: estimateEtaSeconds(done, total, startedAt), startedAt,
@@ -1727,7 +1740,7 @@ function ToolTab({
         const p = jobProgress[key]
         const done = p?.done ?? 0
         const total = p?.total ?? 0
-        const startedAt = nodeStartedAtRef.current[key] ?? null
+        const startedAt = nodeStartedAt[key] ?? null
         rows.push({ key, target: 'Verify (httpx)', status, done, total, etaSeconds: estimateEtaSeconds(done, total, startedAt), startedAt })
       }
     }

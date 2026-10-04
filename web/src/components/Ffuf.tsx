@@ -51,7 +51,7 @@ export function FfufTab({
   statusOf,
   nodeStatus,
   jobProgress,
-  nodeStartedAtRef,
+  nodeStartedAt,
   onStart,
   onCancel,
   onPromote,
@@ -64,7 +64,7 @@ export function FfufTab({
   statusOf: (job: Job) => RunStatus
   nodeStatus: Record<string, NodeStatus>
   jobProgress: Record<string, { done: number; total: number }>
-  nodeStartedAtRef: React.MutableRefObject<Record<string, number>>
+  nodeStartedAt: Record<string, number>
   onStart: (job: Job) => void
   onCancel: (job: Job) => void
   onPromote: (values: string[]) => void
@@ -169,7 +169,7 @@ export function FfufTab({
         const p = jobProgress[key]
         const done = p?.done ?? 0
         const total = p?.total ?? 0
-        const startedAt = nodeStartedAtRef.current[key] ?? null
+        const startedAt = nodeStartedAt[key] ?? null
         const detail = job.nodes?.find((n) => n.nodeId === nodeId)
         rows.push({
           key, target, status, done, total, etaSeconds: estimateEtaSeconds(done, total, startedAt),
