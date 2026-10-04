@@ -19,13 +19,15 @@ import (
 // sstiscan.Request field-for-field plus the credential/case wiring every
 // other tool's request carries (see pwResetRequest).
 type sstiScanRequest struct {
-	URL            string            `json:"url"`
-	Params         []string          `json:"params,omitempty"`
-	CredentialID   string            `json:"credentialId,omitempty"`
-	Headers        map[string]string `json:"headers,omitempty"`
-	CaseID         string            `json:"caseId,omitempty"`
-	RecursionDepth int               `json:"recursionDepth,omitempty"`
-	MaxPages       int               `json:"maxPages,omitempty"`
+	// RequestsPerSecond is the scan speed the Slow/Normal/Fast/Custom control sends; zero means scanRate's default.
+	RequestsPerSecond float64           `json:"requestsPerSecond,omitempty"`
+	URL               string            `json:"url"`
+	Params            []string          `json:"params,omitempty"`
+	CredentialID      string            `json:"credentialId,omitempty"`
+	Headers           map[string]string `json:"headers,omitempty"`
+	CaseID            string            `json:"caseId,omitempty"`
+	RecursionDepth    int               `json:"recursionDepth,omitempty"`
+	MaxPages          int               `json:"maxPages,omitempty"`
 	// Callback optionally names a callback server the operator picked from
 	// their own Callback picker (see collaborator.Ref) -- when set, the
 	// out-of-band RCE module points every injection point at that one
@@ -53,6 +55,11 @@ func (s *Server) handleSSTIScan(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	rps, err := scanRate(req.RequestsPerSecond)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 	req.URL = strings.TrimSpace(req.URL)
 	if req.URL == "" {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("url is required"))
@@ -75,7 +82,7 @@ func (s *Server) handleSSTIScan(w http.ResponseWriter, r *http.Request) {
 
 	oob := sstiscan.OOBConfig{
 		Registry:        s.collab,
-		CallbackBaseURL: fmt.Sprintf("%s://%s", schemeOf(r), r.Host),
+		CallbackBaseURL: s.collabCallbackBase(r),
 	}
 	if req.Callback != nil {
 		oob.SharedToken = req.Callback.Token
@@ -83,6 +90,7 @@ func (s *Server) handleSSTIScan(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.queueScan(w, streamedScan{
+		rps:     rps,
 		caseID:  req.CaseID,
 		target:  req.URL,
 		tool:    "sstiscan",

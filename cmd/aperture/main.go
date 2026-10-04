@@ -7,6 +7,7 @@ import (
 	"context"
 	"flag"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/Indigo6415/Aperture/internal/api"
+	"github.com/Indigo6415/Aperture/internal/collaborator"
 	"github.com/Indigo6415/Aperture/internal/engine"
 	"github.com/Indigo6415/Aperture/internal/store"
 	"github.com/Indigo6415/Aperture/internal/webui"
@@ -34,6 +36,7 @@ const (
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:8337", "address to listen on")
+	collabAddr := flag.String("collab-addr", "0.0.0.0:8338", "address for the callback-only listener targets call back to (LAN/public); empty disables it")
 	dbPath := flag.String("db", defaultDBPath(), "path to the SQLite database file")
 	open := flag.Bool("open", true, "open the UI in your default browser on start")
 	flag.Parse()
@@ -61,6 +64,22 @@ func main() {
 
 	httpSrv := &http.Server{Addr: *addr, Handler: srv.Handler()}
 
+	// Separate callback-only listener, so the UI stays on -addr (localhost by
+	// default) while outside hosts can still reach /collab/... on -collab-addr.
+	// The callback listener serves HTTP and HTTPS on one port (see
+	// collaborator.Serve); both servers share the same handler.
+	var collabPlain, collabSecure *http.Server
+	if *collabAddr != "" {
+		// Refuse a collab port that equals the UI port: the two listeners
+		// would race for one socket, and the UI must stay off the public side.
+		if uiPort, collabPort := portOf(*addr), portOf(*collabAddr); uiPort != "" && uiPort == collabPort {
+			log.Fatalf("aperture: -collab-addr (%s) must use a different port than -addr (%s)", *collabAddr, *addr)
+		}
+		collabPlain = &http.Server{Handler: srv.CallbackHandler()}
+		collabSecure = &http.Server{Handler: srv.CallbackHandler(), TLSConfig: srv.CallbackTLSConfig()}
+		srv.SetCollabListenAddr(*collabAddr)
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -71,6 +90,19 @@ func main() {
 		}
 	}()
 
+	if collabPlain != nil {
+		ln, err := net.Listen("tcp", *collabAddr)
+		if err != nil {
+			log.Fatalf("aperture: collaborator listener: %v", err)
+		}
+		go func() {
+			log.Printf("aperture: collaborator callbacks on http(s)://%s/collab/", *collabAddr)
+			if err := collaborator.Serve(ln, collabPlain, collabSecure, srv.CallbackTLSEnabled); err != nil && err != http.ErrServerClosed {
+				log.Fatalf("aperture: collaborator listener: %v", err)
+			}
+		}()
+	}
+
 	if *open {
 		go openBrowser("http://" + *addr)
 	}
@@ -80,6 +112,21 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = httpSrv.Shutdown(shutdownCtx)
+	if collabPlain != nil {
+		_ = collabPlain.Shutdown(shutdownCtx)
+		_ = collabSecure.Shutdown(shutdownCtx)
+	}
+}
+
+// portOf returns the port part of a host:port listen address, or "" if it
+// can't be parsed. Used to detect when the UI and collaborator listeners were
+// given the same port.
+func portOf(addr string) string {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return ""
+	}
+	return port
 }
 
 func defaultDBPath() string {

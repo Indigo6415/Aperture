@@ -12,10 +12,11 @@ import { useAutoCollapseOnce, useCollapsible } from '../collapsible'
 import { inputBase } from '../formStyles'
 import { toAbsoluteUrl } from '../url'
 import { sendToTester } from '../testerHandoff'
-import { emptyProgress, runTrackedScan, type TrackedScan } from '../scanProgress'
+import { emptyProgress, runTrackedScan, stopTrackedScan, type TrackedScan } from '../scanProgress'
 import { ScanTargetCard } from './ScanTargetCard'
-import type { BatchResultSummary } from './BatchResultsPanel'
+import { stoppedSummary, type BatchResultSummary } from './BatchResultsPanel'
 import { ScanErrorNotice } from './ScanErrorNotice'
+import { useScanSpeed } from './scanSpeed'
 
 // b64urlDecode decodes one base64url JWT segment (header or payload) into
 // its UTF-8 text, tolerating the missing padding JWTs conventionally omit.
@@ -139,7 +140,9 @@ export function JwtScan({
     setHeaderRows((rows) => rows.map((r, idx) => (idx === i ? { ...r, ...patch } : r)))
   const removeHeaderRow = (i: number) => setHeaderRows((rows) => (rows.length === 1 ? rows : rows.filter((_, idx) => idx !== i)))
 
-  const canRun = url.trim() !== '' && token.trim() !== '' && !loading
+  const speed = useScanSpeed()
+
+  const canRun = url.trim() !== '' && token.trim() !== '' && !loading && speed.rps !== null
 
   const runScan = async () => {
     if (!canRun) return
@@ -154,6 +157,7 @@ export function JwtScan({
     const outcome = await runTrackedScan<JwtScanResponse>(
       () =>
         api.jwtScan({
+          requestsPerSecond: speed.rps ?? undefined,
           url: url.trim(),
           token: token.trim(),
           method: method.trim() || 'GET',
@@ -168,8 +172,9 @@ export function JwtScan({
         }),
       (update) => setLive((prev) => update(prev ?? { status: 'running', progress: emptyProgress() })),
     )
+    // A stopped scan has neither a result nor an error, so it leaves no error behind.
     if (outcome.result) setResult(outcome.result)
-    else setError(outcome.error ?? 'JWT scan failed')
+    else if (outcome.error) setError(outcome.error)
     setLoading(false)
   }
 
@@ -183,7 +188,7 @@ export function JwtScan({
     <div className="flex h-full min-h-0 flex-col gap-4 overflow-y-auto p-6 lg:flex-row lg:overflow-hidden">
       <div className="lg:min-h-0 lg:w-[26rem] lg:shrink-0 lg:overflow-y-auto lg:pr-1">
       <CollapsibleFormPanel
-        title="JWT Scanner"
+        title="JWT"
         open={formOpen}
         onToggle={() => setFormOpen(!formOpen)}
         summary={url.trim() ? `${method} ${url}` : 'No target set'}
@@ -193,7 +198,7 @@ export function JwtScan({
         runLabel="Run Scan"
       >
         <div>
-          <h1 className="text-sm font-semibold uppercase tracking-wide text-neutral-400">JWT Scanner</h1>
+          <h1 className="text-sm font-semibold uppercase tracking-wide text-neutral-400">JWT</h1>
           <p className="mt-1 text-xs text-neutral-500">
             Probes a protected endpoint with a battery of forged tokens (alg:none, weak HMAC secrets, JWK/kid injection, claim
             tampering, RS256→HS256 confusion) to find JWT verification misconfigurations. Authorized testing only.
@@ -291,6 +296,9 @@ export function JwtScan({
             <button onClick={addHeaderRow} className="text-xs text-sky-400 hover:text-sky-300">
               + Add header
             </button>
+
+            {speed.control}
+
             <CredentialPicker credentials={credentials} selected={credentialId} onSelect={setCredentialId} />
           </div>
         </Field>
@@ -363,7 +371,14 @@ export function JwtScan({
 
             {live && (
               <div className="max-w-md">
-                <ScanTargetCard target={url.trim() || 'JWT scan'} summary={jwtSummary(live)} progress={live.progress} selected={false} onSelect={() => {}} />
+                <ScanTargetCard
+                  target={url.trim() || 'JWT scan'}
+                  summary={jwtSummary(live)}
+                  progress={live.progress}
+                  selected={false}
+                  onSelect={() => {}}
+                  onStop={() => stopTrackedScan(live)}
+                />
               </div>
             )}
 
@@ -641,6 +656,7 @@ function AttemptRow({ attempt }: { attempt: JwtAttempt }) {
 // then how many of them found the token forgeable once the run lands.
 function jwtSummary(run: TrackedScan<JwtScanResponse>): BatchResultSummary {
   if (run.status === 'running') return { label: 'Running…', tone: 'neutral', running: true }
+  if (run.status === 'cancelled') return stoppedSummary
   if (run.status === 'error') return { label: 'Failed', tone: 'danger' }
   const vulnerable = (run.result?.results ?? []).filter((r) => r.status === 'vulnerable').length
   return vulnerable === 0 ? { label: 'Clean', tone: 'clean' } : { label: `${vulnerable} vulnerable`, tone: 'danger' }

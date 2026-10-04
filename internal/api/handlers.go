@@ -48,6 +48,11 @@ func (s *Server) executeToolJob(caseID string, flow engine.Flow, jobID, runID st
 		if f.TriageStatus == "" {
 			f.TriageStatus = model.TriageNew
 		}
+		// The request this finding captured is marked as a hit in this node's
+		// request log, so only requests that produced results are highlighted.
+		if err := s.store.RecordHits(runID, nodeID, []store.RequestHit{{Method: f.Method, URL: f.URL}}); err != nil {
+			s.hub.publish(jobID, RunEvent{Type: "status", NodeID: nodeID, Status: engine.StatusRunning, Message: "warning: failed to record request hit: " + err.Error()})
+		}
 		if err := s.store.SaveFinding(runID, nodeID, f); err != nil {
 			// The job continues even if a single write fails; the finding
 			// is still delivered live over the websocket.

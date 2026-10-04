@@ -8,6 +8,7 @@ import { sendToProbe } from '../probeHandoff'
 import { sendToSecretScan } from '../secretScanHandoff'
 import { sendToBypass403 } from '../bypass403Handoff'
 import { useAutoExpandOnce, useCollapsible } from '../collapsible'
+import { RequestLogModal } from './RequestLogModal'
 
 export interface TargetProgress {
   key: string
@@ -30,6 +31,10 @@ export interface TargetProgress {
   threads?: number
   timeoutSeconds?: number
   rateLimit?: number
+  // Where this node's HTTP request log lives (see RequestLogModal). Both are
+  // set for a job node; a row without them has no log to inspect.
+  runId?: string
+  nodeId?: string
 }
 
 // TargetProgressPanel is a job's per-target breakdown: a labeled row per
@@ -100,6 +105,8 @@ function tooltipFor(t: TargetProgress): string {
 
 function TargetRow({ t }: { t: TargetProgress }) {
   const { openMenu } = useContextMenu()
+  // inspecting controls the request-log modal opened from this row's menu.
+  const [inspecting, setInspecting] = useState(false)
   const pct = t.total > 0 ? Math.min(100, Math.round((t.done / t.total) * 100)) : null
   // The live total (from ffuf/feroxbuster's own progress ticks) is more
   // accurate once it arrives, so it takes priority over the wordlist-derived
@@ -120,66 +127,77 @@ function TargetRow({ t }: { t: TargetProgress }) {
   }, [t.status, pct])
   const elapsedSeconds = t.startedAt ? (now - t.startedAt) / 1000 : null
 
+  // The modal sits beside the row rather than inside it, so clicks and
+  // right-clicks inside it never bubble up to this row's handlers.
   return (
-    <div
-      onContextMenu={(e) => {
-        e.stopPropagation()
-        openMenu(e, [
-          { label: 'Copy target', onSelect: () => copyToClipboard(t.target, 'Copied target') },
-          { label: 'Send to JWT Scanner', onSelect: () => sendToJwtScanner(t.target) },
-          { label: 'Send to Probe', onSelect: () => sendToProbe(t.target) },
-          { label: 'Send to Secret Scanner', onSelect: () => sendToSecretScan(t.target) },
-          { label: 'Send to 403 Bypass', onSelect: () => sendToBypass403(t.target) },
-        ])
-      }}
-      title={tooltipFor(t)}
-      className="flex flex-col gap-1 px-3 py-2 text-xs hover:bg-neutral-900/60"
-    >
-      <div className="flex items-center gap-1.5">
-        <span className="inline-block h-1.5 w-1.5 shrink-0 rounded-full" style={{ background: STATUS_META[t.status].dot }} />
-        <span className="min-w-0 flex-1 truncate font-mono text-neutral-200">{t.target}</span>
-      </div>
-      {(t.wordlist || candidates !== undefined) && (
-        <div className="flex items-center gap-1 truncate text-neutral-500">
-          {t.wordlist && <span className="truncate font-mono">{t.wordlist}</span>}
-          {candidates !== undefined && (
-            <span className="shrink-0 whitespace-nowrap">
-              {t.wordlist && '· '}
-              {candidates.toLocaleString()} candidates
-            </span>
-          )}
-        </div>
-      )}
-      {/* Only 'running' has anything live to show a bar/ETA for -- every
-          other state (queued, pending, or a finished run's node this tab
-          never got a live status/progress tick for, e.g. right after a
-          page reload) would otherwise render a stale or fabricated 0%
-          bar, which is exactly the "resets to 0" confusion this avoids. */}
-      {t.status === 'running' ? (
+    <>
+      <div
+        onContextMenu={(e) => {
+          e.stopPropagation()
+          openMenu(e, [
+            { label: 'Copy target', onSelect: () => copyToClipboard(t.target, 'Copied target') },
+            { label: 'Send to JWT', onSelect: () => sendToJwtScanner(t.target) },
+            { label: 'Send to Probe', onSelect: () => sendToProbe(t.target) },
+            { label: 'Send to Secrets', onSelect: () => sendToSecretScan(t.target) },
+            { label: 'Send to 403 Bypass', onSelect: () => sendToBypass403(t.target) },
+            'separator',
+            // Disabled for a row with no node behind it (e.g. the subfinder verify
+            // row), since there is no request log to show.
+            { label: 'Inspect requests', disabled: !t.runId || !t.nodeId, onSelect: () => setInspecting(true) },
+          ])
+        }}
+        title={tooltipFor(t)}
+        className="flex flex-col gap-1 px-3 py-2 text-xs hover:bg-neutral-900/60"
+      >
         <div className="flex items-center gap-1.5">
-          <div className="h-1 flex-1 overflow-hidden rounded-full bg-neutral-800">
-            <div
-              className={`h-full rounded-full bg-sky-500 ${pct === null ? 'w-1/3 animate-pulse' : ''}`}
-              style={pct !== null ? { width: `${pct}%` } : undefined}
-            />
-          </div>
-          <span className="shrink-0 whitespace-nowrap text-neutral-500">
-            {pct !== null
-              ? `${pct}% (${t.done.toLocaleString()}/${t.total.toLocaleString()})`
-              : `${t.done.toLocaleString()} found`}
-          </span>
-          {/* An indeterminate row has no percentage/ETA to show (total is
-              unknowable), so elapsed running time fills that space instead --
-              e.g. katana's crawl, where "how many hits so far" alone doesn't
-              say whether it's about to finish or still has minutes to go. */}
-          {pct === null && elapsedSeconds !== null && (
-            <span className="shrink-0 whitespace-nowrap text-neutral-600">{formatDuration(elapsedSeconds)}</span>
-          )}
-          {t.etaSeconds !== null && <span className="shrink-0 whitespace-nowrap text-neutral-600">{formatEta(t.etaSeconds)}</span>}
+          <span className="inline-block h-1.5 w-1.5 shrink-0 rounded-full" style={{ background: STATUS_META[t.status].dot }} />
+          <span className="min-w-0 flex-1 truncate font-mono text-neutral-200">{t.target}</span>
         </div>
-      ) : (
-        <span className="whitespace-nowrap text-neutral-600">{STATUS_META[t.status].label.toLowerCase()}</span>
-      )}
-    </div>
+        {(t.wordlist || candidates !== undefined) && (
+          <div className="flex items-center gap-1 truncate text-neutral-500">
+            {t.wordlist && <span className="truncate font-mono">{t.wordlist}</span>}
+            {candidates !== undefined && (
+              <span className="shrink-0 whitespace-nowrap">
+                {t.wordlist && '· '}
+                {candidates.toLocaleString()} candidates
+              </span>
+            )}
+          </div>
+        )}
+        {/* Only 'running' has anything live to show a bar/ETA for -- every
+            other state (queued, pending, or a finished run's node this tab
+            never got a live status/progress tick for, e.g. right after a
+            page reload) would otherwise render a stale or fabricated 0%
+            bar, which is exactly the "resets to 0" confusion this avoids. */}
+        {t.status === 'running' ? (
+          <div className="flex items-center gap-1.5">
+            <div className="h-1 flex-1 overflow-hidden rounded-full bg-neutral-800">
+              <div
+                className={`h-full rounded-full bg-sky-500 ${pct === null ? 'w-1/3 animate-pulse' : ''}`}
+                style={pct !== null ? { width: `${pct}%` } : undefined}
+              />
+            </div>
+            <span className="shrink-0 whitespace-nowrap text-neutral-500">
+              {pct !== null
+                ? `${pct}% (${t.done.toLocaleString()}/${t.total.toLocaleString()})`
+                : `${t.done.toLocaleString()} found`}
+            </span>
+            {/* An indeterminate row has no percentage/ETA to show (total is
+                unknowable), so elapsed running time fills that space instead --
+                e.g. katana's crawl, where "how many hits so far" alone doesn't
+                say whether it's about to finish or still has minutes to go. */}
+            {pct === null && elapsedSeconds !== null && (
+              <span className="shrink-0 whitespace-nowrap text-neutral-600">{formatDuration(elapsedSeconds)}</span>
+            )}
+            {t.etaSeconds !== null && <span className="shrink-0 whitespace-nowrap text-neutral-600">{formatEta(t.etaSeconds)}</span>}
+          </div>
+        ) : (
+          <span className="whitespace-nowrap text-neutral-600">{STATUS_META[t.status].label.toLowerCase()}</span>
+        )}
+      </div>
+    {inspecting && t.runId && t.nodeId && (
+      <RequestLogModal runId={t.runId} nodeId={t.nodeId} target={t.target} onClose={() => setInspecting(false)} />
+    )}
+    </>
   )
 }

@@ -1,6 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
 import { api } from '../api'
-import type { ActiveCallbackServer, CollaboratorConfigResponse, CollaboratorInteraction } from '../types'
+import type {
+  ActiveCallbackServer,
+  CollabTLSStatus,
+  CollaboratorAddresses,
+  CollaboratorConfigResponse,
+  CollaboratorInteraction,
+} from '../types'
 import { CopyButton } from './CopyButton'
 import { inputBase } from '../formStyles'
 import { showToast } from '../toast'
@@ -43,6 +49,10 @@ export function Collaborator() {
   const [domain, setDomain] = useState('')
   const [answerIp, setAnswerIp] = useState('')
   const [dnsAddr, setDnsAddr] = useState('')
+  const [callbackBase, setCallbackBase] = useState('')
+  const [addresses, setAddresses] = useState<CollaboratorAddresses | null>(null)
+  const [tls, setTls] = useState<CollabTLSStatus | null>(null)
+  const [tlsBusy, setTlsBusy] = useState(false)
   const [savingConfig, setSavingConfig] = useState(false)
 
   const [provider, setProvider] = useState<Provider>('aperture')
@@ -64,8 +74,39 @@ export function Collaborator() {
       setDomain(cfg.domain)
       setAnswerIp(cfg.answerIp)
       setDnsAddr(cfg.dnsAddr)
+      setCallbackBase(cfg.callbackBase)
     })
+    // Detected addresses are informational: a failed lookup just leaves the
+    // suggestion buttons out, and the manual field still works.
+    api.getCollaboratorAddresses().then(setAddresses).catch(() => setAddresses(null))
+    api.getCollabTLS().then(setTls).catch(() => setTls(null))
   }, [])
+
+  // toggleTLS turns the callback listener's HTTPS side on or off. Turning it on
+  // generates a certificate on first use (server side).
+  const toggleTLS = async (enabled: boolean) => {
+    setTlsBusy(true)
+    try {
+      setTls(await api.setCollabTLS(enabled))
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : String(err), 'error')
+    } finally {
+      setTlsBusy(false)
+    }
+  }
+
+  // regenerateTLS replaces the certificate, which changes its fingerprint.
+  const regenerateTLS = async () => {
+    setTlsBusy(true)
+    try {
+      setTls(await api.regenerateCollabTLS())
+      showToast('Certificate regenerated', 'success')
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : String(err), 'error')
+    } finally {
+      setTlsBusy(false)
+    }
+  }
 
   const watch = (s: ActiveCallbackServer) => {
     setWatching(s)
@@ -116,11 +157,23 @@ export function Collaborator() {
     }
   }, [])
 
-  const saveConfig = async () => {
+  // saveConfig persists the whole config. An optional callbackOverride saves a
+  // different callback base without waiting for the field to update, so the
+  // Use buttons take effect in one click.
+  const saveConfig = async (callbackOverride?: string) => {
+    const base = (callbackOverride ?? callbackBase).trim()
     setSavingConfig(true)
     try {
-      const cfg = await api.setCollaboratorConfig({ domain: domain.trim(), answerIp: answerIp.trim(), dnsAddr: dnsAddr.trim() })
+      // Send every field: the server overwrites all of them on PUT, so
+      // omitting callbackBase here would silently clear it.
+      const cfg = await api.setCollaboratorConfig({
+        domain: domain.trim(),
+        answerIp: answerIp.trim(),
+        dnsAddr: dnsAddr.trim(),
+        callbackBase: base,
+      })
       setConfig(cfg)
+      setCallbackBase(cfg.callbackBase)
       showToast(cfg.dnsActive ? 'Saved -- DNS listener active' : 'Saved', cfg.dnsActive ? 'success' : 'info')
     } catch (err) {
       showToast(err instanceof Error ? err.message : String(err), 'error')
@@ -182,6 +235,98 @@ export function Collaborator() {
         </div>
 
         <div className="space-y-3 rounded-lg border border-neutral-800 bg-neutral-900 p-4">
+          <div className="flex items-center justify-between">
+            <h2 className="text-sm font-medium text-neutral-100">HTTPS (self-signed)</h2>
+            {tls && (
+              <label className="flex items-center gap-2 text-xs text-neutral-300">
+                <input
+                  type="checkbox"
+                  checked={tls.enabled}
+                  disabled={tlsBusy}
+                  onChange={(e) => toggleTLS(e.target.checked)}
+                  className="accent-sky-500"
+                />
+                {tls.enabled ? 'On' : 'Off'}
+              </label>
+            )}
+          </div>
+          <p className="text-[11px] text-neutral-600">
+            Serves HTTPS on the same callback port, so an https:// callback reaches the listener. The certificate is
+            self-signed, so the calling side has to skip certificate verification (curl -k, verify=False). It's stored in
+            Aperture's database, and turning HTTPS off keeps it so the fingerprint stays the same when re-enabled.
+          </p>
+          {tls?.cert && (
+            <div className="space-y-1 text-[11px] text-neutral-500">
+              <div>
+                Fingerprint (SHA-256): <code className="break-all text-neutral-300">{tls.cert.fingerprint}</code>
+              </div>
+              <div>
+                Valid until: <span className="text-neutral-300">{new Date(tls.cert.notAfter).toLocaleDateString()}</span>
+              </div>
+              <div>
+                Names: <span className="text-neutral-300">{tls.cert.subjects.join(', ')}</span>
+              </div>
+            </div>
+          )}
+          {tls?.hasCert && (
+            <button
+              onClick={regenerateTLS}
+              disabled={tlsBusy}
+              className="rounded border border-neutral-700 px-3 py-1.5 text-xs text-neutral-200 hover:bg-neutral-800 disabled:opacity-50"
+            >
+              Regenerate certificate
+            </button>
+          )}
+        </div>
+
+        <div className="space-y-3 rounded-lg border border-neutral-800 bg-neutral-900 p-4">
+          <h2 className="text-sm font-medium text-neutral-100">Callback address</h2>
+          <label className="block">
+            <span className="text-xs font-medium text-neutral-300">Callback base URL</span>
+            <span className="mt-0.5 block text-[11px] text-neutral-600">
+              The address targets call back to -- your LAN IP or public IP with the forwarded port, e.g. http://192.168.1.20:8338
+              or http://203.0.113.7:8338. The callback listener binds on -collab-addr (0.0.0.0:8338 by default). Leave empty to
+              use the address this UI was opened on, which only works for targets that can reach it.
+            </span>
+            <input
+              value={callbackBase}
+              onChange={(e) => setCallbackBase(e.target.value)}
+              placeholder="http://203.0.113.7:8338"
+              className={`mt-1 ${inputBase}`}
+            />
+          </label>
+          {addresses && (
+            <div className="space-y-1.5 text-[11px]">
+              {addresses.localBase ? (
+                <div className="flex items-center gap-2">
+                  <span className="text-neutral-500">Local (LAN):</span>
+                  <code className="text-neutral-300">{addresses.localBase}</code>
+                  <button onClick={() => saveConfig(addresses.localBase!)} disabled={savingConfig} className="text-sky-400 hover:text-sky-300 disabled:opacity-50">
+                    Use &amp; save
+                  </button>
+                </div>
+              ) : (
+                <p className="text-neutral-600">No LAN IPv4 address detected.</p>
+              )}
+              {addresses.publicBase ? (
+                <div className="flex items-center gap-2">
+                  <span className="text-neutral-500">Public:</span>
+                  <code className="text-neutral-300">{addresses.publicBase}</code>
+                  <button onClick={() => saveConfig(addresses.publicBase!)} disabled={savingConfig} className="text-sky-400 hover:text-sky-300 disabled:opacity-50">
+                    Use &amp; save
+                  </button>
+                </div>
+              ) : (
+                <p className="text-neutral-600">Public IP not detected{addresses.publicError ? ` (${addresses.publicError})` : ''}.</p>
+              )}
+              <p className="text-neutral-600">
+                Public needs the router to forward port {addresses.collabPort} to this machine.
+              </p>
+            </div>
+          )}
+        </div>
+
+        <div className="space-y-3 rounded-lg border border-neutral-800 bg-neutral-900 p-4">
           <h2 className="text-sm font-medium text-neutral-100">DNS listener configuration</h2>
           <label className="block">
             <span className="text-xs font-medium text-neutral-300">Domain</span>
@@ -208,7 +353,7 @@ export function Collaborator() {
           </label>
           <div className="flex items-center gap-2 pt-1">
             <button
-              onClick={saveConfig}
+              onClick={() => saveConfig()}
               disabled={savingConfig}
               className="rounded bg-sky-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-sky-500 disabled:opacity-50"
             >
@@ -284,7 +429,13 @@ export function Collaborator() {
           <div className="space-y-3 rounded-lg border border-neutral-800 bg-neutral-900 p-4">
             <h2 className="text-sm font-medium text-neutral-100">Watching: {watching.label}</h2>
             <div className="space-y-2">
-              <CallbackRow label="HTTP callback" value={watching.httpCallback} />
+              {watching.links?.localhost && <CallbackRow label="Localhost" value={watching.links.localhost} />}
+              {watching.links?.private && <CallbackRow label="Private (LAN)" value={watching.links.private} />}
+              {watching.links?.public && <CallbackRow label="Public" value={watching.links.public} />}
+              {watching.links?.localhostTls && <CallbackRow label="Localhost (HTTPS)" value={watching.links.localhostTls} />}
+              {watching.links?.privateTls && <CallbackRow label="Private (HTTPS)" value={watching.links.privateTls} />}
+              {watching.links?.publicTls && <CallbackRow label="Public (HTTPS)" value={watching.links.publicTls} />}
+              {!watching.links && <CallbackRow label="HTTP callback" value={watching.httpCallback} />}
               {watching.viewUrl ? (
                 <a href={watching.viewUrl} target="_blank" rel="noreferrer" className="block text-[11px] text-sky-400 hover:text-sky-300">
                   Open on webhook.site →

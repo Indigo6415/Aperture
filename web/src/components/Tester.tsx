@@ -9,12 +9,17 @@ import { CopyButton } from './CopyButton'
 import { useAutoCollapseOnce, useCollapsible } from '../collapsible'
 import { inputBase } from '../formStyles'
 import { toAbsoluteUrl } from '../url'
-import { loadCaseScans, type RestoredScan } from '../scanHistory'
+import { loadCaseScansPage, type RestoredScan } from '../scanHistory'
 import { buildCurl } from '../curl'
 
 type HeaderRow = { name: string; value: string }
 
 const METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']
+
+// HISTORY_PAGE_SIZE is how many past sends the History panel fetches by
+// default. Each one costs its own request to load, so a case with hundreds
+// of sends would otherwise fire hundreds of GETs on every Send.
+const HISTORY_PAGE_SIZE = 20
 
 // TesterScanRecord mirrors internal/api's testerScan -- the request
 // alongside the response, exactly what's persisted to a case's scan
@@ -153,15 +158,37 @@ export function Tester({
   // history is this case's past sends, persisted like any other scan tool's
   // history (see store.CaseScan, tool "tester") -- fetched fresh whenever
   // the case changes, and re-fetched after every send so a just-sent
-  // request shows up without a manual refresh.
+  // request shows up without a manual refresh. Only the newest
+  // HISTORY_PAGE_SIZE sends are fetched in full unless historyAll is set
+  // by the "Load full history" button.
   const [history, setHistory] = useState<RestoredScan<TesterScanRecord>[]>([])
+  const [historyTotal, setHistoryTotal] = useState(0)
+  const [historyAll, setHistoryAll] = useState(false)
   const [historyOpen, setHistoryOpen] = useState(false)
 
-  const refreshHistory = () => {
+  // refreshHistory reloads the panel at the current page size. It is passed
+  // an explicit "all" flag by the load-full button so the state update and
+  // the fetch agree even before React re-renders.
+  const refreshHistory = (all = historyAll) => {
     if (!caseId) return
-    loadCaseScans<TesterScanRecord>(caseId, 'tester').then(setHistory).catch(() => {})
+    loadCaseScansPage<TesterScanRecord>(caseId, 'tester', all ? undefined : HISTORY_PAGE_SIZE)
+      .then((page) => {
+        setHistory(page.items)
+        setHistoryTotal(page.total)
+      })
+      .catch(() => {})
   }
-  useEffect(refreshHistory, [caseId])
+  useEffect(() => {
+    // A different case starts back at the default page size.
+    setHistoryAll(false)
+    refreshHistory(false)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [caseId])
+
+  const loadFullHistory = () => {
+    setHistoryAll(true)
+    refreshHistory(true)
+  }
 
   // loadEntry replays a past request's method/URL/headers/body into the
   // form without sending it -- an explicit second click (Send) still
@@ -366,7 +393,7 @@ export function Tester({
             onClick={() => setHistoryOpen((v) => !v)}
             className="flex w-full items-center justify-between px-3 py-2 text-left text-[10px] font-semibold uppercase tracking-wide text-neutral-500 hover:text-neutral-300"
           >
-            <span>History ({history.length})</span>
+            <span>History ({historyTotal})</span>
             <span>{historyOpen ? '−' : '+'}</span>
           </button>
           {historyOpen && (
@@ -383,6 +410,16 @@ export function Tester({
                   <span className="min-w-0 flex-1 truncate text-neutral-400">{r.data.url}</span>
                 </button>
               ))}
+              {/* Only offered while some sends are still unloaded; after it's
+                  clicked, historyAll keeps every later refresh at full size. */}
+              {!historyAll && historyTotal > history.length && (
+                <button
+                  onClick={loadFullHistory}
+                  className="w-full px-3 py-2 text-center text-xs text-sky-400 hover:bg-neutral-900/60 hover:text-sky-300"
+                >
+                  Load full history ({historyTotal - history.length} more)
+                </button>
+              )}
             </div>
           )}
         </div>

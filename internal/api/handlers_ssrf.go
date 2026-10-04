@@ -19,11 +19,13 @@ import (
 // ssrf.Request field-for-field plus the credential/case wiring every other
 // tool's request carries (see pwResetRequest).
 type ssrfRequest struct {
-	URL          string            `json:"url"`
-	Params       []string          `json:"params,omitempty"`
-	CredentialID string            `json:"credentialId,omitempty"`
-	Headers      map[string]string `json:"headers,omitempty"`
-	CaseID       string            `json:"caseId,omitempty"`
+	// RequestsPerSecond is the scan speed the Slow/Normal/Fast/Custom control sends; zero means scanRate's default.
+	RequestsPerSecond float64           `json:"requestsPerSecond,omitempty"`
+	URL               string            `json:"url"`
+	Params            []string          `json:"params,omitempty"`
+	CredentialID      string            `json:"credentialId,omitempty"`
+	Headers           map[string]string `json:"headers,omitempty"`
+	CaseID            string            `json:"caseId,omitempty"`
 	// AutoDiscover/RecursionDepth/MaxPages mirror ssrf.Request's own fields
 	// of the same names -- see that type's doc comments.
 	AutoDiscover   bool `json:"autoDiscover,omitempty"`
@@ -58,6 +60,11 @@ func (s *Server) handleSSRF(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	rps, err := scanRate(req.RequestsPerSecond)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 	req.URL = strings.TrimSpace(req.URL)
 	if req.URL == "" {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("url is required"))
@@ -81,7 +88,7 @@ func (s *Server) handleSSRF(w http.ResponseWriter, r *http.Request) {
 	cfg := s.loadCollaboratorConfig()
 	oob := ssrf.OOBConfig{
 		Registry:        s.collab,
-		CallbackBaseURL: fmt.Sprintf("%s://%s", schemeOf(r), r.Host),
+		CallbackBaseURL: s.collabCallbackBase(r),
 		DNSDomain:       cfg.Domain,
 	}
 	if req.Callback != nil {
@@ -90,6 +97,7 @@ func (s *Server) handleSSRF(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.queueScan(w, streamedScan{
+		rps:     rps,
 		caseID:  req.CaseID,
 		target:  req.URL,
 		tool:    "ssrf",

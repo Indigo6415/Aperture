@@ -140,9 +140,11 @@ func (s *Server) handleBreachCheck(w http.ResponseWriter, r *http.Request) {
 // /api/breach/crawl-emails -- same shape as secretScanRequest, since this
 // runs the very same crawl (see breach.CrawlForEmails' doc comment).
 type breachCrawlEmailsRequest struct {
-	URL            string            `json:"url"`
-	RecursionDepth int               `json:"recursionDepth,omitempty"`
-	Headers        map[string]string `json:"headers,omitempty"`
+	// RequestsPerSecond is the scan speed the Slow/Normal/Fast/Custom control sends; zero means scanRate's default.
+	RequestsPerSecond float64           `json:"requestsPerSecond,omitempty"`
+	URL               string            `json:"url"`
+	RecursionDepth    int               `json:"recursionDepth,omitempty"`
+	Headers           map[string]string `json:"headers,omitempty"`
 	// CredentialID optionally names a saved case credential (see
 	// handlers_credentials.go) merged into Headers.
 	CredentialID string `json:"credentialId,omitempty"`
@@ -184,6 +186,12 @@ func (s *Server) handleBreachCrawlEmails(w http.ResponseWriter, r *http.Request)
 	if req.RecursionDepth > maxCrawlEmailsRecursionDepth {
 		req.RecursionDepth = maxCrawlEmailsRecursionDepth
 	}
+	// Rejects an out-of-range rate before any credential lookup or queueing.
+	rps, err := scanRate(req.RequestsPerSecond)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 
 	if req.CredentialID != "" {
 		cred, err := s.store.GetCredential(req.CredentialID)
@@ -200,6 +208,7 @@ func (s *Server) handleBreachCrawlEmails(w http.ResponseWriter, r *http.Request)
 	req.Headers = s.applyDomainCookie(req.CaseID, req.URL, req.Headers)
 
 	s.queueScan(w, streamedScan{
+		rps:    rps,
 		caseID: req.CaseID,
 		target: req.URL,
 		// Saved under its own tool name ("breach-crawl") rather than "breach" --

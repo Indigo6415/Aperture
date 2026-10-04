@@ -36,7 +36,9 @@ export function ScanHistoryPanel<T, S>({
     setLoading(true)
     loadCaseScans<T>(caseId, tool).then((list: RestoredScan<T>[]) => {
       if (cancelled) return
-      setEntries(list.map((r) => [historyLabel(r.scan), toState(r.data)]))
+      // A saved scan's ID is the ID its requests were logged under, so a
+      // restored row gets the same Inspect requests menu as a live one.
+      setEntries(list.map((r) => [historyLabel(r.scan), { ...toState(r.data), scanId: r.scan.id }]))
       setLoading(false)
     })
     return () => {

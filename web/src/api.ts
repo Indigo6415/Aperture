@@ -11,6 +11,8 @@ import type {
   CaseSummary,
   Check,
   CollaboratorConfig,
+  CollaboratorAddresses,
+  CollabTLSStatus,
   CollaboratorConfigResponse,
   CollaboratorInteraction,
   CollaboratorNewTokenResponse,
@@ -33,6 +35,8 @@ import type {
   ProbeScanRequest,
   ProbeScanStartResult,
   PwResetRequest,
+  NodeRequestLog,
+  RequestRecord,
   Run,
   RunEvent,
   ScanStartResult,
@@ -42,6 +46,8 @@ import type {
   SettingsInfo,
   SsrfRequest,
   SstiScanRequest,
+  PathTraversalRequest,
+  XxeRequest,
   Target,
   TargetList,
   TargetListKind,
@@ -106,6 +112,14 @@ export const api = {
   listTools: () => req<ToolInfo[]>('/api/tools'),
 
   getRun: (runId: string) => req<Run>(`/api/runs/${runId}`),
+  // q narrows the log to requests whose method, URL, status, or raw request or
+  // response contains it; without q the whole log comes back.
+  listNodeRequests: (runId: string, nodeId: string, q?: string) =>
+    req<NodeRequestLog>(
+      `/api/runs/${runId}/nodes/${encodeURIComponent(nodeId)}/requests${q ? `?q=${encodeURIComponent(q)}` : ''}`,
+    ),
+  getNodeRequest: (runId: string, nodeId: string, requestId: number) =>
+    req<RequestRecord>(`/api/runs/${runId}/nodes/${encodeURIComponent(nodeId)}/requests/${requestId}`),
   listFindings: (runId: string, nodeId?: string) =>
     req<Finding[]>(`/api/runs/${runId}/findings${nodeId ? `?nodeId=${encodeURIComponent(nodeId)}` : ''}`),
   updateFindingTriage: (id: string, status: TriageStatus, note?: string) =>
@@ -203,6 +217,10 @@ export const api = {
     }),
   getJob: (jobId: string) => req<Job>(`/api/jobs/${jobId}`),
   cancelJob: (jobId: string) => req<void>(`/api/jobs/${jobId}/cancel`, { method: 'POST' }),
+  // cancelScan stops one streamed scan (any scanner started by a POST that
+  // returned a scanId). Like cancelJob, stopping a scan that already finished
+  // is a harmless no-op.
+  cancelScan: (scanId: string) => req<void>(`/api/scans/${scanId}/cancel`, { method: 'POST' }),
 
   listScreenshots: (caseId: string) => req<ScreenshotMeta[]>(`/api/cases/${caseId}/screenshots`),
   screenshotUrl: (caseId: string, target: string) => `/api/cases/${caseId}/screenshots/${encodeURIComponent(target)}`,
@@ -266,11 +284,19 @@ export const api = {
 
   sstiScan: (scanReq: SstiScanRequest) => req<ScanStartResult>('/api/sstiscan/scan', { method: 'POST', body: JSON.stringify(scanReq) }),
 
+  pathTraversalScan: (scanReq: PathTraversalRequest) => req<ScanStartResult>('/api/pathtraversal/scan', { method: 'POST', body: JSON.stringify(scanReq) }),
+  xxeScan: (scanReq: XxeRequest) => req<ScanStartResult>('/api/xxe/scan', { method: 'POST', body: JSON.stringify(scanReq) }),
+
   xssScan: (scanReq: XssRequest) => req<ScanStartResult>('/api/xss/scan', { method: 'POST', body: JSON.stringify(scanReq) }),
 
   testerSend: (sendReq: TesterRequest) => req<TesterResponse>('/api/tester/send', { method: 'POST', body: JSON.stringify(sendReq) }),
 
   getCollaboratorConfig: () => req<CollaboratorConfigResponse>('/api/collaborator/config'),
+  getCollaboratorAddresses: () => req<CollaboratorAddresses>('/api/collaborator/addresses'),
+  getCollabTLS: () => req<CollabTLSStatus>('/api/collaborator/tls'),
+  setCollabTLS: (enabled: boolean) =>
+    req<CollabTLSStatus>('/api/collaborator/tls', { method: 'PUT', body: JSON.stringify({ enabled }) }),
+  regenerateCollabTLS: () => req<CollabTLSStatus>('/api/collaborator/tls/regenerate', { method: 'POST' }),
   setCollaboratorConfig: (cfg: CollaboratorConfig) =>
     req<CollaboratorConfigResponse>('/api/collaborator/config', { method: 'PUT', body: JSON.stringify(cfg) }),
   newCollaboratorToken: () => req<CollaboratorNewTokenResponse>('/api/collaborator/new', { method: 'POST' }),

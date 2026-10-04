@@ -19,11 +19,13 @@ import (
 // mirrors openredirect.Request field-for-field plus the credential/case
 // wiring every other tool's request carries (see pwResetRequest).
 type openRedirectRequest struct {
-	URL          string            `json:"url"`
-	Params       []string          `json:"params,omitempty"`
-	CredentialID string            `json:"credentialId,omitempty"`
-	Headers      map[string]string `json:"headers,omitempty"`
-	CaseID       string            `json:"caseId,omitempty"`
+	// RequestsPerSecond is the scan speed the Slow/Normal/Fast/Custom control sends; zero means scanRate's default.
+	RequestsPerSecond float64           `json:"requestsPerSecond,omitempty"`
+	URL               string            `json:"url"`
+	Params            []string          `json:"params,omitempty"`
+	CredentialID      string            `json:"credentialId,omitempty"`
+	Headers           map[string]string `json:"headers,omitempty"`
+	CaseID            string            `json:"caseId,omitempty"`
 	// Callback optionally names a long-lived callback server the operator
 	// picked from their own Callback picker (see collaborator.Ref) instead of
 	// the fresh throwaway token handleOpenRedirect mints by default -- lets a
@@ -38,6 +40,15 @@ type openRedirectRequest struct {
 	FollowRedirects *bool `json:"followRedirects,omitempty"`
 }
 
+// collabCallbackHost strips the scheme from a scheme://host[:port] base (as
+// collabCallbackBase returns it), leaving the bare host[:port] that
+// openredirect.Request.CallbackBase expects. Anything without a known scheme
+// is returned unchanged.
+func collabCallbackHost(base string) string {
+	base = strings.TrimPrefix(base, "https://")
+	return strings.TrimPrefix(base, "http://")
+}
+
 // openRedirectTimeout bounds a full run: every module's probes (about a dozen
 // payload shapes per candidate parameter, roughly 30 parameters by default,
 // plus path-segment, Referer, and header probes) share one concurrency limit,
@@ -50,6 +61,11 @@ const openRedirectTimeout = 3 * time.Minute
 func (s *Server) handleOpenRedirect(w http.ResponseWriter, r *http.Request) {
 	var req openRedirectRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	rps, err := scanRate(req.RequestsPerSecond)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -94,11 +110,16 @@ func (s *Server) handleOpenRedirect(w http.ResponseWriter, r *http.Request) {
 	// server of their own, this mints a fresh throwaway token against
 	// Aperture's own collaborator registry instead -- the operator never has
 	// to open the Callback picker just to get a confirmed result.
+	// The Aperture listener's base comes from collabCallbackBase, not r.Host:
+	// r.Host is the login-protected UI port (e.g. 127.0.0.1:8337), which doesn't
+	// serve /collab/ at all, so every confirmation request 404'd and no hit was
+	// ever recorded. The base carries a scheme, which CallbackBase must not, so
+	// it is stripped here.
 	if req.Callback != nil {
 		if req.Callback.Provider == "webhooksite" {
 			orReq.CallbackBase = strings.TrimPrefix(collaborator.WebhookSiteCallbackURL(req.Callback.Token), "https://")
 		} else {
-			orReq.CallbackBase = fmt.Sprintf("%s/collab/%s", r.Host, req.Callback.Token)
+			orReq.CallbackBase = collabCallbackHost(s.collabCallbackBase(r)) + "/collab/" + req.Callback.Token
 		}
 		orReq.CallbackPoll = openredirect.CallbackPollConfig{
 			Registry: s.collab,
@@ -107,11 +128,12 @@ func (s *Server) handleOpenRedirect(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		token := s.collab.NewToken()
-		orReq.CallbackBase = fmt.Sprintf("%s/collab/%s", r.Host, token)
+		orReq.CallbackBase = collabCallbackHost(s.collabCallbackBase(r)) + "/collab/" + token
 		orReq.CallbackPoll = openredirect.CallbackPollConfig{Registry: s.collab, Token: token, Provider: "aperture"}
 	}
 
 	s.queueScan(w, streamedScan{
+		rps:     rps,
 		caseID:  req.CaseID,
 		target:  req.URL,
 		tool:    "openredirect",

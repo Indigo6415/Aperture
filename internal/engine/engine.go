@@ -7,7 +7,13 @@ import (
 
 	"github.com/Indigo6415/Aperture/internal/adapters"
 	"github.com/Indigo6415/Aperture/internal/model"
+	"github.com/Indigo6415/Aperture/internal/netgov"
 )
+
+// MaxRecordedExchangesPerNode caps how many HTTP exchanges one source node
+// keeps in its request log. A large fuzz run can make hundreds of thousands
+// of requests, and storing every one would dwarf the findings themselves.
+const MaxRecordedExchangesPerNode = 5000
 
 // ResultFunc is called for every Finding a node produces, as it happens.
 type ResultFunc func(nodeID string, f model.Finding)
@@ -29,12 +35,33 @@ type ProgressFunc func(nodeID string, done, total int)
 // concurrent headless-Chrome captures.
 const maxConcurrentSourceNodes = 4
 
+// ExchangeSink receives every HTTP exchange a source node makes, tagged with
+// the run and node that made it. It is called from request goroutines, so it
+// must be safe for concurrent use.
+type ExchangeSink func(runID, nodeID string, ex netgov.Exchange)
+
 // Engine executes Flows.
 type Engine struct {
 	sourceSem chan struct{}
+	// exchangeSink is nil until SetExchangeSink is called; with no sink, no
+	// request log is kept and source nodes run exactly as before.
+	exchangeSink ExchangeSink
 }
 
 func New() *Engine { return &Engine{sourceSem: make(chan struct{}, maxConcurrentSourceNodes)} }
+
+// SetExchangeSink enables per-node request logging by routing each node's
+// HTTP exchanges to fn. Call it before the engine starts executing flows.
+func (e *Engine) SetExchangeSink(fn ExchangeSink) { e.exchangeSink = fn }
+
+// withExchangeRecorder returns a context that reports the node's HTTP
+// exchanges to the engine's sink, stopping once MaxRecordedExchangesPerNode
+// have been kept so a noisy node cannot flood storage.
+func (e *Engine) withExchangeRecorder(ctx context.Context, runID, nodeID string) context.Context {
+	return netgov.WithRecorder(ctx, netgov.LimitRecorder(netgov.RecorderFunc(func(ex netgov.Exchange) {
+		e.exchangeSink(runID, nodeID, ex)
+	}), MaxRecordedExchangesPerNode))
+}
 
 // Execute runs every node in flow concurrently, wiring edges as buffered
 // channels so results stream downstream as soon as they're produced
@@ -177,7 +204,14 @@ func (e *Engine) runNode(ctx context.Context, n Node, runID string, in []Edge, e
 		// before this select, so the UI can distinguish "waiting for a
 		// free slot" from "actively scanning."
 		onStatus(StatusRunning, "")
-		return adapter.Run(ctx, n.Config, adapters.RunMeta{RunID: runID, NodeID: n.ID}, func(f model.Finding) {
+		// Native adapters make their HTTP requests on this context, so the
+		// recorder reaches them. External-binary adapters never touch netgov,
+		// so for them the recorder is simply never called.
+		nodeCtx := ctx
+		if e.exchangeSink != nil {
+			nodeCtx = e.withExchangeRecorder(ctx, runID, n.ID)
+		}
+		return adapter.Run(nodeCtx, n.Config, adapters.RunMeta{RunID: runID, NodeID: n.ID}, func(f model.Finding) {
 			_ = sendAndEmit(ctx, out, f, emit)
 		}, adapters.Progress(progress))
 	}

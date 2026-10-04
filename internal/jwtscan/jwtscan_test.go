@@ -1,6 +1,7 @@
 package jwtscan
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
@@ -63,7 +64,7 @@ func TestWeakSecretRecoveredOfflineWithoutRequests(t *testing.T) {
 	srv := verifyingServer(t, "secret", &requests)
 	defer srv.Close()
 
-	resp, err := RunScan(ScanRequest{URL: srv.URL + "/account", Token: token}, OOBConfig{})
+	resp, err := RunScan(context.Background(), ScanRequest{URL: srv.URL + "/account", Token: token}, OOBConfig{})
 	if err != nil {
 		t.Fatalf("RunScan: %v", err)
 	}
@@ -99,7 +100,7 @@ func TestAcceptAllServerIsNotReportedAsAccepting(t *testing.T) {
 	defer srv.Close()
 
 	token := signHS256(t, map[string]any{"sub": "alice", "exp": 4102444800}, "secret")
-	resp, err := RunScan(ScanRequest{URL: srv.URL + "/", Token: token}, OOBConfig{})
+	resp, err := RunScan(context.Background(), ScanRequest{URL: srv.URL + "/", Token: token}, OOBConfig{})
 	if err != nil {
 		t.Fatalf("RunScan: %v", err)
 	}
@@ -181,7 +182,7 @@ func TestForgedIdentityChangeIsDetected(t *testing.T) {
 	defer srv.Close()
 
 	token := signHS256(t, map[string]any{"sub": "alice", "exp": 4102444800}, "secret")
-	resp, err := RunScan(ScanRequest{URL: srv.URL + "/me", Token: token}, OOBConfig{})
+	resp, err := RunScan(context.Background(), ScanRequest{URL: srv.URL + "/me", Token: token}, OOBConfig{})
 	if err != nil {
 		t.Fatalf("RunScan: %v", err)
 	}

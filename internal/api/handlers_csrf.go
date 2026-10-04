@@ -21,12 +21,14 @@ import (
 // only reaches a login form, never the actual state-changing forms this
 // scan exists to check.
 type csrfScanRequest struct {
-	URL            string            `json:"url"`
-	RecursionDepth int               `json:"recursionDepth,omitempty"`
-	MaxPages       int               `json:"maxPages,omitempty"`
-	CredentialID   string            `json:"credentialId,omitempty"`
-	Headers        map[string]string `json:"headers,omitempty"`
-	CaseID         string            `json:"caseId,omitempty"`
+	// RequestsPerSecond is the scan speed the Slow/Normal/Fast/Custom control sends; zero means scanRate's default.
+	RequestsPerSecond float64           `json:"requestsPerSecond,omitempty"`
+	URL               string            `json:"url"`
+	RecursionDepth    int               `json:"recursionDepth,omitempty"`
+	MaxPages          int               `json:"maxPages,omitempty"`
+	CredentialID      string            `json:"credentialId,omitempty"`
+	Headers           map[string]string `json:"headers,omitempty"`
+	CaseID            string            `json:"caseId,omitempty"`
 
 	// APIURL/APIMethod/APIBody optionally request the one active check this
 	// scanner has -- see csrf.Request's own doc comment.
@@ -46,6 +48,11 @@ const csrfScanTimeout = 120 * time.Second
 func (s *Server) handleCSRF(w http.ResponseWriter, r *http.Request) {
 	var req csrfScanRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	rps, err := scanRate(req.RequestsPerSecond)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -71,6 +78,7 @@ func (s *Server) handleCSRF(w http.ResponseWriter, r *http.Request) {
 	req.Headers = s.applyDomainCookie(req.CaseID, req.URL, req.Headers)
 
 	s.queueScan(w, streamedScan{
+		rps:     rps,
 		caseID:  req.CaseID,
 		target:  req.URL,
 		tool:    "csrf",

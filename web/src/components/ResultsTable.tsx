@@ -297,9 +297,9 @@ export function ResultsTable({
                       openMenu(e, [
                         { label: 'Copy URL', onSelect: () => copyToClipboard(f.url, 'Copied URL') },
                         { label: 'Open in new tab', onSelect: () => window.open(f.url, '_blank', 'noopener,noreferrer') },
-                        { label: 'Send to JWT Scanner', onSelect: () => sendToJwtScanner(f.url) },
+                        { label: 'Send to JWT', onSelect: () => sendToJwtScanner(f.url) },
                         { label: 'Send to Probe', onSelect: () => sendToProbe(f.url) },
-                        { label: 'Send to Secret Scanner', onSelect: () => sendToSecretScan(f.url) },
+                        { label: 'Send to Secrets', onSelect: () => sendToSecretScan(f.url) },
                         { label: 'Send to 403 Bypass', onSelect: () => sendToBypass403(f.url) },
                         { label: 'Send to Tester', onSelect: () => sendToTester(f.url, f.method || 'GET', f.headers) },
                         'separator',

@@ -62,7 +62,9 @@ var apiEndpointsModule = moduleDef{
 			if err == nil && r.StatusCode == 200 && containsCase("__schema")(r) {
 				findings = append(findings, Finding{
 					Label: "GraphQL introspection enabled at " + url, URL: url, Method: "POST", StatusCode: r.StatusCode,
-					Detail: "POSTed a `{ __schema { queryType { name } } }` introspection query; the response's body echoed back schema data instead of rejecting it",
+					Detail:  "POSTed a `{ __schema { queryType { name } } }` introspection query; the response's body echoed back schema data instead of rejecting it",
+					Headers: map[string]string{"Content-Type": "application/json"},
+					Body:    string(introspection),
 				})
 			}
 		}

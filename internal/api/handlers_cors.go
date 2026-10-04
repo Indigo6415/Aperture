@@ -18,11 +18,13 @@ import (
 // corsscan.Request field-for-field plus the credential/case wiring every
 // other tool's request carries (see pwResetRequest).
 type corsScanRequest struct {
-	URL          string            `json:"url"`
-	Method       string            `json:"method,omitempty"`
-	CredentialID string            `json:"credentialId,omitempty"`
-	Headers      map[string]string `json:"headers,omitempty"`
-	CaseID       string            `json:"caseId,omitempty"`
+	// RequestsPerSecond is the scan speed the Slow/Normal/Fast/Custom control sends; zero means scanRate's default.
+	RequestsPerSecond float64           `json:"requestsPerSecond,omitempty"`
+	URL               string            `json:"url"`
+	Method            string            `json:"method,omitempty"`
+	CredentialID      string            `json:"credentialId,omitempty"`
+	Headers           map[string]string `json:"headers,omitempty"`
+	CaseID            string            `json:"caseId,omitempty"`
 }
 
 // corsScanTimeout bounds a full run: seven modules, all but one firing a
@@ -36,6 +38,11 @@ const corsScanTimeout = 45 * time.Second
 func (s *Server) handleCORSScan(w http.ResponseWriter, r *http.Request) {
 	var req corsScanRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	rps, err := scanRate(req.RequestsPerSecond)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -60,6 +67,7 @@ func (s *Server) handleCORSScan(w http.ResponseWriter, r *http.Request) {
 	req.Headers = s.applyDomainCookie(req.CaseID, req.URL, req.Headers)
 
 	s.queueScan(w, streamedScan{
+		rps:     rps,
 		caseID:  req.CaseID,
 		target:  req.URL,
 		tool:    "corsscan",

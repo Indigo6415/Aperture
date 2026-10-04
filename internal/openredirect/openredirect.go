@@ -27,8 +27,8 @@ import (
 	"fmt"
 	"net/url"
 	"sort"
-	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/Indigo6415/Aperture/internal/collaborator"
 	"github.com/Indigo6415/Aperture/internal/scanprogress"
@@ -47,6 +47,35 @@ type Finding struct {
 	// CapturedRequest in client.go) -- lets the frontend's "Send to Tester"
 	// action replay precisely what triggered the finding.
 	Request *CapturedRequest `json:"request,omitempty"`
+	// Chain is every request made from the probe to the callback, in order:
+	// the probe itself, each redirect followed along the way, and the
+	// confirming request to the callback address. See ChainHop.
+	Chain []ChainHop `json:"chain,omitempty"`
+}
+
+// ChainHop is one request on the path from a probe to the callback. Kind is
+// "probe" (the payload request), "redirect" (a followed Location hop short of
+// the callback), or "callback" (the request that confirmed the hit). OffsetMs
+// is when the request went out, measured from the probe's first request, and
+// DurationMs is how long it took on the wire -- a slot wait behind other
+// probes is excluded, so a slow number reflects the target, not the scanner's
+// own concurrency limit.
+type ChainHop struct {
+	Step       int               `json:"step"`
+	Kind       string            `json:"kind"`
+	Method     string            `json:"method"`
+	URL        string            `json:"url"`
+	StatusCode int               `json:"statusCode,omitempty"`
+	Location   string            `json:"location,omitempty"`
+	OffsetMs   float64           `json:"offsetMs"`
+	DurationMs float64           `json:"durationMs"`
+	Headers    map[string]string `json:"headers,omitempty"`
+	// Error is set when the request failed (timeout, connection refused, ...);
+	// such a hop has no status code.
+	Error string `json:"error,omitempty"`
+	// started is when the request actually went out, kept so finalizeChain can
+	// compute OffsetMs from it. Not part of the JSON shape.
+	started time.Time
 }
 
 // ModuleResult is one vector family's outcome for this run.
@@ -112,6 +141,9 @@ type Baseline struct {
 	URL        string `json:"url"`
 	StatusCode int    `json:"statusCode"`
 	Location   string `json:"location,omitempty"`
+	// Error is set when every baseline attempt failed. The run still goes ahead
+	// with its probes, and StatusCode and Location are left empty.
+	Error string `json:"error,omitempty"`
 }
 
 // Result is one full run's outcome.
@@ -125,6 +157,11 @@ type Result struct {
 	// ProbesSent is how many distinct requests the run fired across every
 	// module (baseline excluded), so coverage is visible at a glance.
 	ProbesSent int `json:"probesSent"`
+	// Requests is every request the run sent (baseline attempts, probes and
+	// callback confirmations), and TimedOut is how many of them ran out of their
+	// time budget. Together they show how responsive the host was.
+	Requests int `json:"requests"`
+	TimedOut int `json:"timedOut"`
 	// FollowRedirects reports whether the run walked redirect chains, so a
 	// result can be read knowing how deep confirmation looked.
 	FollowRedirects bool `json:"followRedirects"`
@@ -139,6 +176,47 @@ type Result struct {
 // real signal.
 const maxConcurrentRequests = 16
 
+// moduleConcurrency is how many modules run at once. Probes from every module
+// still share maxConcurrentRequests and the scan's rate limit, so this only
+// sets the order modules start and finish in: a small number keeps the rest
+// visibly queued while the first ones run, and the probe pipe stays full.
+const moduleConcurrency = 2
+
+// confirmModule waits for the callback listener to record hits for cands and
+// returns one Finding per candidate whose own identifier was seen. A module
+// with no candidates skips the wait entirely.
+func confirmModule(ctx context.Context, rep scanprogress.Reporter, cb CallbackPollConfig, cands []candidate) []Finding {
+	findings := []Finding{}
+	if len(cands) == 0 {
+		return findings
+	}
+	// Identifiers this module's own candidates were sent with. Hits recorded
+	// for other modules are ignored here, since those modules confirm their own.
+	mine := make(map[string]bool, len(cands))
+	for _, c := range cands {
+		mine[c.spec.identifier] = true
+	}
+	rep.Phase("Waiting for callbacks to confirm redirects")
+	polled, _ := collaborator.WaitForCallbacks(ctx, func(context.Context) ([]collaborator.Interaction, error) {
+		return pollCallback(cb), nil
+	}, collaborator.DefaultPollInterval, collaborator.DefaultQuietPeriod, collaborator.DefaultMaxWait)
+	byIdentifier := map[string][]collaborator.Interaction{}
+	for _, h := range polled {
+		if mine[h.Identifier] {
+			byIdentifier[h.Identifier] = append(byIdentifier[h.Identifier], h)
+		}
+	}
+	// Only a candidate whose own identifier was actually polled counts.
+	for _, c := range cands {
+		hits := byIdentifier[c.spec.identifier]
+		if len(hits) == 0 {
+			continue
+		}
+		findings = append(findings, findingFor(c, hits))
+	}
+	return findings
+}
+
 // Run resolves req.URL, takes a plain baseline request (no payload), then
 // runs every module concurrently, confirms candidate hits against the
 // callback listener, and assembles one ModuleResult per vector family.
@@ -150,28 +228,31 @@ func Run(ctx context.Context, req Request) (*Result, error) {
 		return nil, err
 	}
 
-	baselineRes, err := send(ctx, nil, withParam(target, "aperture-openredirect-baseline", "1"), req.Headers)
+	// The baseline is informational only: probes and callback confirmation do
+	// not depend on it, so a failure is recorded on the result and the run
+	// carries on rather than aborting.
+	stats := &runStats{}
+	baseline := Baseline{URL: req.URL}
+	baselineRes, err := baselineRequest(ctx, withParam(target, "aperture-openredirect-baseline", "1"), req.Headers, stats)
 	if err != nil {
-		return nil, fmt.Errorf("openredirect: baseline request failed: %w", err)
+		baseline.Error = fmt.Sprintf("baseline request failed, continuing without it: %v", err)
+	} else {
+		baseline.StatusCode = baselineRes.StatusCode
+		baseline.Location = baselineRes.Location
 	}
-	baseline := Baseline{URL: req.URL, StatusCode: baselineRes.StatusCode, Location: baselineRes.Location}
 
 	params := candidateParams(target, req.Params)
 	origin := target.Scheme + "://" + target.Host
-	deps := runDeps{target: target, req: req, params: params, origin: origin, sem: make(chan struct{}, maxConcurrentRequests), nonce: newRunNonce()}
+	deps := runDeps{target: target, req: req, params: params, origin: origin, sem: make(chan struct{}, maxConcurrentRequests), nonce: newRunNonce(), stats: stats}
 
 	mods := openRedirectModules
 	results := make([]ModuleResult, len(mods))
-	// One progress check per module -- each is a battery of its own probes.
-	checks := make([]scanprogress.Check, len(mods))
-	for i, m := range mods {
-		checks[i] = scanprogress.Check{ID: m.id, Label: m.name}
-	}
-	rep.Plan(checks...)
 	// Without a callback server nothing can be confirmed, so every module
 	// reports the same notice and no probes are sent.
 	if req.CallbackBase == "" {
+		// One progress check per module, each reported finished straight away.
 		for i, m := range mods {
+			rep.Plan(scanprogress.Check{ID: m.id, Label: m.name})
 			rep.Start(m.id)
 			rep.Done(m.id, 0, nil)
 			results[i] = ModuleResult{ID: m.id, Name: m.name, Severity: m.severity, Findings: []Finding{{
@@ -180,60 +261,28 @@ func Run(ctx context.Context, req Request) (*Result, error) {
 			}}}
 		}
 		sort.Slice(results, func(i, j int) bool { return results[i].Name < results[j].Name })
-		return &Result{Baseline: baseline, Modules: results, ParamsTested: params, FollowRedirects: req.FollowRedirects}, nil
+		return &Result{Baseline: baseline, Modules: results, ParamsTested: params, FollowRedirects: req.FollowRedirects, Requests: int(stats.requests.Load()), TimedOut: int(stats.timedOut.Load())}, nil
 	}
 
 	// sent is shared by every module goroutine, so it has to be atomic.
 	var sent atomic.Int64
-	candidates := make([][]candidate, len(mods))
-	var wg sync.WaitGroup
-	for i, m := range mods {
-		wg.Add(1)
-		go func(i int, m moduleDef) {
-			defer wg.Done()
-			rep.Start(m.id)
-			candidates[i] = runModule(ctx, deps, m, &sent)
-			// The probes are done, but whether a candidate really redirected to
-			// the callback is only decided after the listener wait below, so the
-			// finding count here is candidates -- confirmation may still drop some.
-			rep.Done(m.id, len(candidates[i]), nil)
-		}(i, m)
+	// Every module is its own progress check. Each plans them all up front and
+	// only marks a module running once it holds one of moduleConcurrency slots,
+	// so modules still waiting read as queued (grey) instead of all turning
+	// orange at once. A module is reported done as soon as its own probes and
+	// callback confirmation finish, rather than when the whole run ends.
+	idx := make([]int, len(mods))
+	for i := range idx {
+		idx[i] = i
 	}
-	wg.Wait()
-
-	// Only wait on the callback listener when something actually redirected
-	// toward it -- nothing to confirm otherwise.
-	anyCandidate := false
-	for _, c := range candidates {
-		if len(c) > 0 {
-			anyCandidate = true
-			break
-		}
-	}
-	byIdentifier := map[string][]collaborator.Interaction{}
-	if anyCandidate {
-		rep.Phase("Waiting for callbacks to confirm redirects")
-		polled, _ := collaborator.WaitForCallbacks(ctx, func(context.Context) ([]collaborator.Interaction, error) {
-			return pollCallback(req.CallbackPoll), nil
-		}, collaborator.DefaultPollInterval, collaborator.DefaultQuietPeriod, collaborator.DefaultMaxWait)
-		for _, h := range polled {
-			byIdentifier[h.Identifier] = append(byIdentifier[h.Identifier], h)
-		}
-	}
-
-	cbHost := hostOnly(req.CallbackBase)
-	for i, m := range mods {
-		findings := []Finding{}
-		// Only a candidate whose own identifier was actually polled counts.
-		for _, c := range candidates[i] {
-			hits := byIdentifier[c.spec.identifier]
-			if len(hits) == 0 {
-				continue
-			}
-			findings = append(findings, findingFor(c, hits, cbHost))
-		}
-		results[i] = ModuleResult{ID: m.id, Name: m.name, Severity: m.severity, Findings: findings}
-	}
+	scanprogress.Each(rep, moduleConcurrency, idx, func(i int) scanprogress.Check {
+		return scanprogress.Check{ID: mods[i].id, Label: mods[i].name}
+	}, func(i int) (int, error) {
+		cands := runModule(ctx, deps, mods[i], &sent)
+		findings := confirmModule(ctx, rep, req.CallbackPoll, cands)
+		results[i] = ModuleResult{ID: mods[i].id, Name: mods[i].name, Severity: mods[i].severity, Findings: findings}
+		return len(findings), nil
+	})
 
 	sort.Slice(results, func(i, j int) bool { return results[i].Name < results[j].Name })
 	return &Result{
@@ -242,6 +291,8 @@ func Run(ctx context.Context, req Request) (*Result, error) {
 		ParamsTested:    params,
 		ProbesSent:      int(sent.Load()),
 		FollowRedirects: req.FollowRedirects,
+		Requests:        int(stats.requests.Load()),
+		TimedOut:        int(stats.timedOut.Load()),
 	}, nil
 }
 

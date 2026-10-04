@@ -1,8 +1,10 @@
 import { useMemo, useState } from 'react'
-import type { CapturedRequest, ProbeSeverity } from '../types'
+import type { CapturedRequest, ChainHop, ProbeSeverity } from '../types'
 import { CopyButton } from './CopyButton'
+import { RedirectChain } from './RedirectChain'
 import { SEVERITY_META, SEVERITY_ORDER } from '../severityColor'
 import { sendToTester } from '../testerHandoff'
+import { useContextMenu } from '../contextMenu'
 
 // GenericFinding/GenericModuleResult cover the check-module shape every one
 // of the four scanners added alongside this file (corsscan/openredirect/
@@ -22,6 +24,9 @@ export interface GenericFinding {
   method?: string
   statusCode?: number
   request?: CapturedRequest
+  // chain is the timed request path from a probe to its callback. Only
+  // open-redirect findings carry one; other scanners leave it unset.
+  chain?: ChainHop[]
 }
 
 export interface GenericModuleResult {
@@ -128,7 +133,8 @@ function ModuleCard({ module }: { module: GenericModuleResult }) {
 
 function FindingRow({ finding }: { finding: GenericFinding }) {
   const [expanded, setExpanded] = useState(false)
-  const hasExpandable = Boolean(finding.evidence || finding.method || finding.statusCode !== undefined || finding.request)
+  const { openMenu } = useContextMenu()
+  const hasExpandable = Boolean(finding.evidence || finding.method || finding.statusCode !== undefined || finding.request || finding.chain?.length)
 
   return (
     <li className="py-2 text-xs">
@@ -162,8 +168,17 @@ function FindingRow({ finding }: { finding: GenericFinding }) {
               {finding.statusCode}
             </p>
           )}
+          {finding.chain && finding.chain.length > 0 && <RedirectChain chain={finding.chain} />}
           {finding.request && (
-            <div onClick={(e) => e.stopPropagation()}>
+            // Right-click on the request offers Send to Tester too. stopPropagation
+            // keeps the provider's root fallback menu from replacing this one.
+            <div
+              onClick={(e) => e.stopPropagation()}
+              onContextMenu={(e) => {
+                e.stopPropagation()
+                openMenu(e, [{ label: 'Send to Tester', onSelect: () => sendToTester(finding.request!.url, finding.request!.method || 'GET', finding.request!.headers, finding.request!.body) }])
+              }}
+            >
               <button
                 onClick={() => sendToTester(finding.request!.url, finding.request!.method || 'GET', finding.request!.headers, finding.request!.body)}
                 className="rounded border border-neutral-700 px-2 py-0.5 text-[11px] text-neutral-300 hover:border-sky-500 hover:text-sky-300"

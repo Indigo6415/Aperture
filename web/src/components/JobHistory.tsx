@@ -42,13 +42,32 @@ export function JobHistory({
             {running.length} running
           </span>
         )}
-        {running.length === 1 && (
-          <button
-            onClick={() => onCancel(running[0])}
-            className="ml-auto shrink-0 rounded border border-red-900 px-2 py-0.5 text-red-400 hover:border-red-500 hover:text-red-300"
-          >
-            Stop
-          </button>
+        {/* Every running job gets a Stop here, so none needs the history expanded
+            to be reachable. With several, each one names its first target so the
+            buttons can be told apart. */}
+        {running.length > 0 && (
+          <div className="ml-auto flex min-w-0 items-center gap-1.5">
+            {running.length > 1 && (
+              <button
+                onClick={() => running.forEach((job) => onCancel(job))}
+                title="Stop every running job"
+                className="flex shrink-0 items-center rounded border border-red-900 px-2 py-0.5 text-red-400 hover:border-red-500 hover:text-red-300"
+              >
+                Stop all ({running.length})
+              </button>
+            )}
+            {running.map((job) => (
+              <button
+                key={job.id}
+                onClick={() => onCancel(job)}
+                title={`Stop ${job.targets.join(', ')}`}
+                className="flex min-w-0 shrink items-center gap-1 rounded border border-red-900 px-2 py-0.5 text-red-400 hover:border-red-500 hover:text-red-300"
+              >
+                Stop
+                {running.length > 1 && <span className="min-w-0 truncate font-mono text-[11px] text-red-300/80">{job.targets[0]}</span>}
+              </button>
+            ))}
+          </div>
         )}
       </div>
       {open && (

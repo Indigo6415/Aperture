@@ -112,7 +112,7 @@ func (s *Server) handleTesterSend(w http.ResponseWriter, r *http.Request) {
 		}
 		scan := testerScan{Method: method, URL: req.URL, Headers: req.Headers, Body: req.Body, Response: resp}
 		if data, err := json.Marshal(scan); err == nil {
-			s.saveCaseScan(req.CaseID, req.URL, "tester", severity, summary, data)
+			s.saveCaseScan(newID(), req.CaseID, req.URL, "tester", severity, summary, data)
 		}
 	}
 

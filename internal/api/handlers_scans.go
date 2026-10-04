@@ -1,6 +1,7 @@
 package api
 
 import (
+	"log"
 	"net/http"
 
 	"github.com/Indigo6415/Aperture/internal/store"
@@ -66,12 +67,20 @@ func (s *Server) handleGetCaseScan(w http.ResponseWriter, r *http.Request) {
 // already succeeded and has already been returned to them, so a failure to
 // persist it for the case is logged nowhere but never turns into an error
 // response for a request that's already done its job.
-func (s *Server) saveCaseScan(caseID, target, tool, severity, summary string, data []byte) {
+// id is the scan's own ID. Reusing it keeps the saved row and the request log
+// (see withScanRecorder) under one identity, so a restored past scan can open
+// its requests the same way a live one does.
+func (s *Server) saveCaseScan(id, caseID, target, tool, severity, summary string, data []byte) {
+	// Hits are recorded before the case check: a scan with no case still has a
+	// request log, and its findings should still mark the requests behind them.
+	if err := s.store.RecordHits(id, directScanNodeID, scanResultHits(data)); err != nil {
+		log.Printf("api: record scan hits: %v", err)
+	}
 	if caseID == "" {
 		return
 	}
 	cs := store.CaseScan{
-		ID: newID(), CaseID: caseID, Target: target, Tool: tool,
+		ID: id, CaseID: caseID, Target: target, Tool: tool,
 		Severity: severity, Summary: summary, Data: string(data),
 	}
 	if err := s.store.SaveCaseScan(cs); err != nil {

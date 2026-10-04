@@ -22,14 +22,16 @@ import (
 // (see internal/wordlists) to draw candidate secrets from, ExtraSecrets is
 // a newline-delimited list pasted directly into the form.
 type jwtScanRequest struct {
-	URL          string            `json:"url"`
-	Token        string            `json:"token"`
-	Method       string            `json:"method,omitempty"`
-	Cookie       string            `json:"cookie,omitempty"`
-	Headers      map[string]string `json:"headers,omitempty"`
-	PubKeyPEM    string            `json:"pubKeyPem,omitempty"`
-	Wordlist     string            `json:"wordlist,omitempty"`
-	ExtraSecrets string            `json:"extraSecrets,omitempty"`
+	// RequestsPerSecond is the scan speed the Slow/Normal/Fast/Custom control sends; zero means scanRate's default.
+	RequestsPerSecond float64           `json:"requestsPerSecond,omitempty"`
+	URL               string            `json:"url"`
+	Token             string            `json:"token"`
+	Method            string            `json:"method,omitempty"`
+	Cookie            string            `json:"cookie,omitempty"`
+	Headers           map[string]string `json:"headers,omitempty"`
+	PubKeyPEM         string            `json:"pubKeyPem,omitempty"`
+	Wordlist          string            `json:"wordlist,omitempty"`
+	ExtraSecrets      string            `json:"extraSecrets,omitempty"`
 	// CredentialID optionally names a saved case credential (see
 	// handlers_credentials.go): its headers are merged into Headers, and
 	// its cookie fills Cookie when that's left empty.
@@ -56,6 +58,11 @@ const jwtScanTimeout = 2 * time.Minute
 func (s *Server) handleJWTScan(w http.ResponseWriter, r *http.Request) {
 	var req jwtScanRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	rps, err := scanRate(req.RequestsPerSecond)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -111,13 +118,15 @@ func (s *Server) handleJWTScan(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.queueScan(w, streamedScan{
+		rps:     rps,
 		caseID:  req.CaseID,
 		target:  req.URL,
 		tool:    "jwt",
 		timeout: jwtScanTimeout,
 		run: func(ctx context.Context, rep scanprogress.Reporter) (scanOutcome, error) {
-			resp, err := jwtscan.RunScan(jwtscan.ScanRequest{
+			resp, err := jwtscan.RunScan(ctx, jwtscan.ScanRequest{
 				URL: req.URL, Token: req.Token, Method: req.Method, Cookie: req.Cookie,
+				MaxRPS:       rps,
 				ExtraHeaders: req.Headers, PubKeyPEM: req.PubKeyPEM, ExtraSecrets: extraSecrets,
 				Progress: rep,
 			}, oob)

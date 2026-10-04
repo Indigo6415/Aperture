@@ -52,6 +52,9 @@ type Match struct {
 	// Request.SecretFinderEngine). Entropy matches are always "core", since
 	// SecretFinderPatterns has no entropy detector of its own.
 	Engine string `json:"engine"`
+	// Headers are the headers the page was fetched with (a saved credential's,
+	// the domain cookie's), kept so Send to Tester can replay it authenticated.
+	Headers map[string]string `json:"headers,omitempty"`
 }
 
 // Request is one secret-scan crawl's parameters.
@@ -312,8 +315,26 @@ func Run(ctx context.Context, req Request) (*Response, error) {
 	return &Response{
 		PagesScanned:   pagesScanned,
 		ScriptsScanned: scriptsScanned,
-		Matches:        dedupMatches(matches),
+		Matches:        withHeaders(dedupMatches(matches), req.Headers),
 	}, nil
+}
+
+// withHeaders stamps the headers every page in a crawl was fetched with onto
+// each match, so a match carries the request that produced it. It copies the
+// map per match so no two matches share one backing map.
+func withHeaders(matches []Match, headers map[string]string) []Match {
+	// Nothing to stamp when the crawl ran without headers, so return early.
+	if len(headers) == 0 {
+		return matches
+	}
+	// Each match gets its own copy so later edits to one can't leak into the others.
+	for i := range matches {
+		matches[i].Headers = make(map[string]string, len(headers))
+		for k, v := range headers {
+			matches[i].Headers[k] = v
+		}
+	}
+	return matches
 }
 
 // dedupMatches keeps one match per distinct secret per location. Keying on the

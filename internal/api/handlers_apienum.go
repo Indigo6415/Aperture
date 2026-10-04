@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/Indigo6415/Aperture/internal/apienum"
 	"github.com/Indigo6415/Aperture/internal/engine"
+	"github.com/Indigo6415/Aperture/internal/netgov"
 	"github.com/Indigo6415/Aperture/internal/store"
 )
 
@@ -25,27 +27,15 @@ const (
 	apiEnumMaxPages      = 50
 )
 
-// apiEnumDefaultRateLimit is the enumerator's own floor on requests/sec
-// when the launch preset doesn't already set one (the "custom"/unset
-// preset's Threads/RateLimit are literally 0 -- see engine.ScanOptions'
-// doc comment on what a preset's zero value means) -- this run fires
-// meaningfully more requests per route than a probe scan does (OPTIONS,
-// a method swap, an auth probe, content-type negotiation), on top of a
-// crawl, JS mining, and a wordlist brute force, so it gets a safety
-// default even when the operator hasn't picked "stealth" -- see the
-// apienum package doc's rate-limiting guardrail goal. A named preset
-// (aggressive/normal/stealth) is still honored exactly as given, including
-// "normal"/"aggressive" leaving RateLimit at its own deliberate 0
-// (unlimited).
-const apiEnumDefaultRateLimit = 15
-
 // apiEnumScanRequest is the request body for POST /api/apienum/scan.
 type apiEnumScanRequest struct {
-	Target       string `json:"target"`
-	Preset       string `json:"preset,omitempty"`
-	CredentialID string `json:"credentialId,omitempty"`
-	CrawlDepth   int    `json:"crawlDepth,omitempty"`
-	MaxPages     int    `json:"maxPages,omitempty"`
+	Target string `json:"target"`
+	// RequestsPerSecond is the scan speed the Slow/Normal/Fast/Custom control
+	// sends; zero means scanRate's default.
+	RequestsPerSecond float64 `json:"requestsPerSecond,omitempty"`
+	CredentialID      string  `json:"credentialId,omitempty"`
+	CrawlDepth        int     `json:"crawlDepth,omitempty"`
+	MaxPages          int     `json:"maxPages,omitempty"`
 	// ExtraWordlist adds caller-supplied path segments to the bundled
 	// default wordlist the brute-force phase draws from -- see
 	// apienum.Options.ExtraWordlist.
@@ -61,6 +51,7 @@ type pendingApiEnumScan struct {
 	Target string
 	Opts   apienum.Options
 	CaseID string
+	RPS    float64
 }
 
 // apiEnumScanStartResult is the immediate response to starting an API
@@ -83,6 +74,11 @@ func (s *Server) handleApiEnumScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Target = strings.TrimSpace(req.Target)
+	rps, err := scanRate(req.RequestsPerSecond)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 	if req.Target == "" {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("target is required"))
 		return
@@ -100,14 +96,11 @@ func (s *Server) handleApiEnumScan(w http.ResponseWriter, r *http.Request) {
 		req.MaxPages = apiEnumMaxPages
 	}
 
-	resolved := engine.ScanOptions{Preset: req.Preset}.Resolved()
-	rateLimit := resolved.RateLimit
-	if (req.Preset == "" || req.Preset == engine.PresetCustom) && rateLimit <= 0 {
-		rateLimit = apiEnumDefaultRateLimit
-	}
-
+	// RateLimit is an int where 0 means unlimited, so a fractional rate rounds
+	// up to at least 1 rather than silently disabling the limit.
+	resolved := engine.ScanOptions{}.Resolved()
 	opts := apienum.Options{
-		Concurrency: resolved.Threads, RateLimit: rateLimit,
+		Concurrency: resolved.Threads, RateLimit: int(math.Ceil(rps)),
 		CrawlDepth: req.CrawlDepth, MaxPages: req.MaxPages, ExtraWordlist: req.ExtraWordlist,
 	}
 	if req.CredentialID != "" {
@@ -126,7 +119,7 @@ func (s *Server) handleApiEnumScan(w http.ResponseWriter, r *http.Request) {
 
 	scanID := newID()
 	s.apiEnumMu.Lock()
-	s.pendingApiEnumScans[scanID] = pendingApiEnumScan{Target: req.Target, Opts: opts, CaseID: req.CaseID}
+	s.pendingApiEnumScans[scanID] = pendingApiEnumScan{Target: req.Target, Opts: opts, CaseID: req.CaseID, RPS: rps}
 	s.apiEnumMu.Unlock()
 	time.AfterFunc(apiEnumScanClaimTimeout, func() {
 		s.apiEnumMu.Lock()
@@ -168,7 +161,11 @@ func (s *Server) handleWatchApiEnumScan(w http.ResponseWriter, r *http.Request) 
 func (s *Server) runApiEnumScan(scanID string, pending pendingApiEnumScan) {
 	opts := pending.Opts
 	opts.Progress = hubReporter{hub: s.hub, scanID: scanID}
-	resp, err := apienum.RunScanStreaming(context.Background(), pending.Target, opts,
+	ctx, cancel := context.WithCancel(s.withScanRecorder(netgov.WithPolicy(context.Background(), netgov.Policy{MaxRPS: pending.RPS}), scanID))
+	s.trackScanCancel(scanID, cancel)
+	defer s.untrackScanCancel(scanID)
+	defer cancel()
+	resp, err := apienum.RunScanStreaming(ctx, pending.Target, opts,
 		func(p apienum.PhaseEvent) {
 			phase := p
 			s.hub.publish(scanID, RunEvent{Type: "apiEnumPhase", ApiEnumPhase: &phase})
@@ -178,6 +175,12 @@ func (s *Server) runApiEnumScan(scanID string, pending pendingApiEnumScan) {
 			s.hub.publish(scanID, RunEvent{Type: "apiEnumRoute", ApiEnumRoute: &rt})
 		},
 	)
+	// A stopped scan is reported as stopped and never saved, even if the run
+	// returned partial output without an error.
+	if ctx.Err() == context.Canceled {
+		publishScanStopped(s.hub, scanID)
+		return
+	}
 	if err != nil {
 		s.hub.publish(scanID, RunEvent{Type: "done", Status: engine.StatusFailed, Message: err.Error()})
 		return
@@ -196,7 +199,7 @@ func (s *Server) runApiEnumScan(scanID string, pending pendingApiEnumScan) {
 		}
 		summary := fmt.Sprintf("%d route(s) found (%d confirmed) · %d injection point(s) staged", stats.RoutesFound, stats.ConfirmedRoutes, stats.InjectionPoints)
 		if data, err := json.Marshal(resp); err == nil {
-			s.saveCaseScan(pending.CaseID, pending.Target, "apienum", severity, summary, data)
+			s.saveCaseScan(scanID, pending.CaseID, pending.Target, "apienum", severity, summary, data)
 		}
 	}
 }

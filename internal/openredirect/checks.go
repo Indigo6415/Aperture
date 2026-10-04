@@ -89,12 +89,12 @@ type probeSpec struct {
 	// headers are added on top of the operator's own headers for this
 	// probe only.
 	headers map[string]string
-	// hostOnly marks a probe whose injected value carries nothing but a
-	// host (a Host or X-Forwarded-Host header can't hold a path), so the
-	// identifier can't travel in the redirect's own URL. The confirmation
-	// request is instead sent to the callback host under this probe's
-	// identifier path -- see confirmURL.
-	hostOnly bool
+	// schemeless marks a probe whose injected value has no scheme: either a
+	// bare host (the Host header) or host plus the callback path with the
+	// identifier in it (the forwarded-host headers). The scheme is the only
+	// part a header can't carry. If the app's redirect drops the identifier
+	// path, confirmURL rebuilds the callback URL under it instead.
+	schemeless bool
 }
 
 // candidate is a probe whose response redirected toward the callback host.
@@ -104,6 +104,13 @@ type candidate struct {
 	spec probeSpec
 	res  *orResult
 	how  string
+	// rebuilt is set when the confirming callback URL was built by the
+	// scanner rather than taken from the target's redirect, because the
+	// redirect didn't keep the probe's identifier.
+	rebuilt bool
+	// chain is every request made from the probe to the callback, in order,
+	// carried onto the Finding if the callback poll confirms this candidate.
+	chain []ChainHop
 }
 
 // runDeps is what every module's expand and every probe needs for one run.
@@ -118,6 +125,8 @@ type runDeps struct {
 	// nonce is this run's random identifier suffix (see
 	// openRedirectIdentifierFor).
 	nonce string
+	// stats counts this run's requests and timeouts (see runStats).
+	stats *runStats
 }
 
 // poison is the callback address one probe should reach: the run's
@@ -212,7 +221,7 @@ var hostHeaderModule = moduleDef{
 			identifier: identifier,
 			rawURL:     d.target.String(),
 			headers:    map[string]string{"Host": cbHost},
-			hostOnly:   true,
+			schemeless: true,
 		}}
 	},
 }
@@ -223,32 +232,37 @@ var hostHeaderModule = moduleDef{
 var forwardedHostModule = moduleDef{
 	id: "forwarded-host", name: "Forwarded-host header redirect", severity: "medium",
 	expand: func(d runDeps) []probeSpec {
-		cbHost := hostOnly(d.req.CallbackBase)
 		specs := make([]probeSpec, 0, len(forwardedHostHeaders)+1)
 		// One probe per header so a redirect can be pinned to the exact
 		// header the app trusted.
 		for _, h := range forwardedHostHeaders {
 			identifier := openRedirectIdentifierFor("forwarded-host", h, d.nonce)
+			// The value is the callback host plus this probe's identifier
+			// path, with no scheme. A proxy-supplied host can carry a path,
+			// so an app that echoes the whole value into its redirect
+			// sends visitors to the identifier path itself.
+			value := d.poison(identifier)
 			specs = append(specs, probeSpec{
 				label:      fmt.Sprintf("Header %q", h),
-				sent:       h + ": " + cbHost,
+				sent:       h + ": " + value,
 				identifier: identifier,
 				rawURL:     d.target.String(),
-				headers:    map[string]string{h: cbHost},
-				hostOnly:   true,
+				headers:    map[string]string{h: value},
+				schemeless: true,
 			})
 		}
 		// The RFC 7239 Forwarded header quotes its host value; the quotes
-		// are required once a port is present.
+		// are required once a port is present, and they also let the path
+		// through.
 		identifier := openRedirectIdentifierFor("forwarded-host", "Forwarded", d.nonce)
-		fwd := `host="` + cbHost + `"`
+		fwd := `host="` + d.poison(identifier) + `"`
 		specs = append(specs, probeSpec{
 			label:      `Header "Forwarded"`,
 			sent:       "Forwarded: " + fwd,
 			identifier: identifier,
 			rawURL:     d.target.String(),
 			headers:    map[string]string{"Forwarded": fwd},
-			hostOnly:   true,
+			schemeless: true,
 		})
 		return specs
 	},
@@ -411,9 +425,11 @@ func runModule(ctx context.Context, d runDeps, m moduleDef, sent *atomic.Int64) 
 // its response (following the chain when the operator asked for that), and
 // if it finds one, requests the callback address itself so the listener
 // records the hit. It returns ok=false when the probe never pointed at the
-// callback host, so the probe can't be a candidate.
+// callback host, so the probe can't be a candidate. The candidate carries a
+// timed hop for every request made along the way, so a Finding can show the
+// whole path from the target to the callback.
 func runProbe(ctx context.Context, d runDeps, ps probeSpec) (candidate, bool) {
-	res, err := send(ctx, d.sem, ps.rawURL, mergeHeaders(d.req.Headers, ps.headers))
+	res, probeHop, err := d.timedSend(ctx, "probe", ps.rawURL, mergeHeaders(d.req.Headers, ps.headers))
 	if err != nil {
 		return candidate{}, false
 	}
@@ -422,16 +438,23 @@ func runProbe(ctx context.Context, d runDeps, ps probeSpec) (candidate, bool) {
 		return candidate{}, false
 	}
 
-	confirm, how, ok := d.findCallbackHop(ctx, res, base, ps)
+	followed, confirm, how, rebuilt, ok := d.findCallbackHop(ctx, res, base, ps)
 	if !ok {
 		return candidate{}, false
 	}
 	// The confirming request goes to the external callback host with no
 	// operator headers: those credentials belong to the target, and
 	// sending them to a third-party listener would leak them. Errors are
-	// discarded -- a failed hit just means this probe isn't confirmed.
-	_, _ = send(ctx, d.sem, confirm, nil)
-	return candidate{spec: ps, res: res, how: how}, true
+	// discarded -- a failed hit just means this probe isn't confirmed. The
+	// hop is still recorded (with its error, if any) so the chain shows it.
+	// Sent without a concurrency slot: confirmations are few, and queueing them
+	// behind probes hanging on the target would delay the hit by the probe timeout.
+	_, confirmHop, _ := d.timedRequest(ctx, ChainHop{Kind: "callback", Method: http.MethodGet, URL: confirm}, confirm, nil)
+
+	chain := append([]ChainHop{probeHop}, followed...)
+	chain = append(chain, confirmHop)
+	finalizeChain(chain)
+	return candidate{spec: ps, res: res, how: how, rebuilt: rebuilt, chain: chain}, true
 }
 
 // findCallbackHop walks the redirect chain starting at res, looking for a
@@ -440,16 +463,20 @@ func runProbe(ctx context.Context, d runDeps, ps probeSpec) (candidate, bool) {
 // so a redirect that reaches the callback through an intermediate page
 // (login, normalization, "return to") still counts.
 //
-// It returns the URL to confirm against, a short description of how the
-// redirect was detected, and whether one was found. If the response has no
-// Location at all, the body is checked for a client-side redirect instead.
-func (d runDeps) findCallbackHop(ctx context.Context, res *orResult, base *url.URL, ps probeSpec) (string, string, bool) {
+// It returns the intermediate hops it requested while walking (not including
+// res itself, which the caller already holds), the URL to confirm against, a
+// short description of how the redirect was detected, whether that confirm
+// URL was rebuilt by the scanner rather than taken from the redirect, and
+// whether one was found. If the response has no Location at all, the body is
+// checked for a client-side redirect instead.
+func (d runDeps) findCallbackHop(ctx context.Context, res *orResult, base *url.URL, ps probeSpec) ([]ChainHop, string, string, bool, bool) {
 	cbHost := hostOnly(d.req.CallbackBase)
 	maxHops := 1
 	if d.req.FollowRedirects {
 		maxHops = maxRedirectHops
 	}
 
+	var followed []ChainHop
 	hop, cur := res, base
 	// Walk one hop at a time; each iteration checks the current hop's
 	// Location, then (if following) requests it to find the next one.
@@ -459,14 +486,20 @@ func (d runDeps) findCallbackHop(ctx context.Context, res *orResult, base *url.U
 			break
 		}
 		if strings.EqualFold(loc.Host, cbHost) {
-			return d.confirmURL(loc, ps), "redirected (Location header)", true
+			confirm, rebuilt := d.confirmURL(loc, ps)
+			how := "redirected (Location header)"
+			if rebuilt {
+				how = "redirected (Location header, callback path rebuilt by scanner)"
+			}
+			return followed, confirm, how, rebuilt, true
 		}
 		// Last permitted hop reached without finding the callback -- stop
 		// rather than issuing one more request nobody will inspect.
 		if i+1 == maxHops {
 			break
 		}
-		next, err := send(ctx, d.sem, loc.String(), d.chainHeaders(loc))
+		next, nextHop, err := d.timedSend(ctx, "redirect", loc.String(), d.chainHeaders(loc))
+		followed = append(followed, nextHop)
 		if err != nil {
 			break
 		}
@@ -478,20 +511,93 @@ func (d runDeps) findCallbackHop(ctx context.Context, res *orResult, base *url.U
 	// behavior worth confirming.
 	if !isRedirect(res) && strings.Contains(strings.ToLower(res.Body), strings.ToLower(cbHost)) &&
 		(metaRefreshRe.MatchString(res.Body) || jsRedirectRe.MatchString(res.Body)) {
-		return "https://" + d.poison(ps.identifier) + "/", "rendered a client-side redirect", true
+		return followed, "https://" + d.poison(ps.identifier) + "/", "rendered a client-side redirect", true, true
 	}
-	return "", "", false
+	return followed, "", "", false, false
 }
 
-// confirmURL is the request that actually confirms a hit. For hostOnly
-// probes the redirect's own URL doesn't carry this probe's identifier, so
-// the callback is requested under the identifier path instead -- the
-// redirect has already proven the server sends visitors to that host.
-func (d runDeps) confirmURL(loc *url.URL, ps probeSpec) string {
-	if ps.hostOnly {
-		return loc.Scheme + "://" + d.poison(ps.identifier) + "/"
+// timedSend is send for a request that becomes a hop in a finding's chain.
+// It takes a concurrency slot itself and starts the clock only once the slot
+// is held, so time spent queued behind other probes isn't counted as the
+// target's latency. The returned hop records the outcome whether or not the
+// request succeeded.
+func (d runDeps) timedSend(ctx context.Context, kind, rawURL string, headers map[string]string) (*orResult, ChainHop, error) {
+	hop := ChainHop{Kind: kind, Method: http.MethodGet, URL: rawURL}
+	// Holding the slot for the whole request is what bounds in-flight
+	// requests; send itself is called unthrottled below so it isn't taken twice.
+	if d.sem != nil {
+		select {
+		case d.sem <- struct{}{}:
+		case <-ctx.Done():
+			hop.started = time.Now()
+			hop.Error = ctx.Err().Error()
+			return nil, hop, ctx.Err()
+		}
+		defer func() { <-d.sem }()
 	}
-	return loc.String()
+
+	return d.timedRequest(ctx, hop, rawURL, headers)
+}
+
+// timedRequest sends one request and records its timing on hop, without
+// touching the concurrency slot. timedSend calls it while holding a slot; the
+// callback confirmation calls it directly so it never waits behind probes
+// that are hanging on the target.
+func (d runDeps) timedRequest(ctx context.Context, hop ChainHop, rawURL string, headers map[string]string) (*orResult, ChainHop, error) {
+	hop.started = time.Now()
+	res, err := send(ctx, nil, rawURL, headers)
+	d.stats.record(ctx, err)
+	hop.DurationMs = float64(time.Since(hop.started)) / float64(time.Millisecond)
+	if err != nil {
+		hop.Error = err.Error()
+		return nil, hop, err
+	}
+	hop.Method = res.Request.Method
+	hop.StatusCode = res.StatusCode
+	hop.Location = res.Location
+	hop.Headers = res.Request.Headers
+	return res, hop, nil
+}
+
+// finalizeChain numbers a chain's hops from 1 and sets each hop's OffsetMs
+// relative to the first request, so the timeline reads from the moment the
+// probe went out.
+func finalizeChain(chain []ChainHop) {
+	if len(chain) == 0 {
+		return
+	}
+	origin := chain[0].started
+	for i := range chain {
+		chain[i].Step = i + 1
+		chain[i].OffsetMs = float64(chain[i].started.Sub(origin)) / float64(time.Millisecond)
+	}
+}
+
+// confirmURL is the request that confirms a hit for a redirect that reached
+// the callback host at loc. When the redirect's own URL carries this probe's
+// identifier, that URL is the confirmation -- it is the hop the target sent.
+// A schemeless probe whose redirect dropped the identifier has no such URL,
+// so the callback is requested under the identifier path instead, and
+// rebuilt reports that the scanner built it.
+func (d runDeps) confirmURL(loc *url.URL, ps probeSpec) (confirm string, rebuilt bool) {
+	// Non-schemeless probes always carry the identifier in the payload, so
+	// their redirect is confirmed as-is.
+	if !ps.schemeless || pathCarries(loc, ps.identifier) {
+		return loc.String(), false
+	}
+	return loc.Scheme + "://" + d.poison(ps.identifier) + "/", true
+}
+
+// pathCarries reports whether one of loc's path segments is exactly id. It is
+// how a redirect is shown to have kept a probe's identifier.
+func pathCarries(loc *url.URL, id string) bool {
+	// Compare whole segments, so an identifier can't match part of another path.
+	for _, seg := range strings.Split(loc.Path, "/") {
+		if seg == id {
+			return true
+		}
+	}
+	return false
 }
 
 // chainHeaders returns what a followed hop should carry. Only hops that stay
@@ -571,14 +677,21 @@ func overridden(key string, extra map[string]string) bool {
 
 // findingFor turns one confirmed candidate and the callback hits recorded
 // against its identifier into the Finding shown to the operator.
-func findingFor(c candidate, hits []collaborator.Interaction, cbHost string) Finding {
+func findingFor(c candidate, hits []collaborator.Interaction) Finding {
 	h := hits[0]
+	// The confirmation sentence depends on who built the confirming URL: the
+	// target's own redirect, or the scanner after the redirect dropped the
+	// identifier.
+	confirmed := "Confirmed: the redirect was followed to the callback server, not just offered in a response that mentioned it."
+	if c.rebuilt {
+		confirmed = "Confirmed: the target's redirect pointed at the callback host, and the scanner then requested the callback itself under the probe's identifier, which the listener recorded."
+	}
 	detail := fmt.Sprintf(
-		"Sent %s and the redirect reached the callback address (%s) -- %d inbound %s interaction(s) recorded, the first from %s. Confirmed: the redirect was followed to the callback server, not just offered in a response that mentioned it.",
-		c.spec.sent, c.how, len(hits), h.Protocol, h.RemoteAddr,
+		"Sent %s and the redirect reached the callback address (%s) -- %d inbound %s interaction(s) recorded, the first from %s. %s",
+		c.spec.sent, c.how, len(hits), h.Protocol, h.RemoteAddr, confirmed,
 	)
-	if c.spec.hostOnly {
-		detail += fmt.Sprintf(" The injected value carries only a host, so the callback was requested under this probe's own path (%s/%s/) -- the Host value itself can't hold the identifier.", cbHost, c.spec.identifier)
+	if c.rebuilt {
+		detail += " The redirect did not keep this probe's identifier path, so the hit was requested by the scanner, not followed from the redirect."
 	}
 	return Finding{
 		Label:      fmt.Sprintf("%s redirects to an attacker-controlled host (confirmed via callback)", c.spec.label),
@@ -586,8 +699,30 @@ func findingFor(c candidate, hits []collaborator.Interaction, cbHost string) Fin
 		Evidence:   fmt.Sprintf("%s callback from %s at %s", h.Protocol, h.RemoteAddr, h.Timestamp.Format(time.RFC3339)),
 		Method:     http.MethodGet,
 		StatusCode: c.res.StatusCode,
-		Request:    &c.res.Request,
+		Request:    testerRequest(c),
+		Chain:      c.chain,
 	}
+}
+
+// testerRequest is the request a finding hands to "Send to Tester". It carries
+// every header the probe sent. For a schemeless probe the URL is the callback
+// address that confirmed the hit, not the target the header was injected into.
+// The probe itself stays in Chain.
+func testerRequest(c candidate) *CapturedRequest {
+	req := c.res.Request
+	// Only schemeless probes need the URL swapped: for every other probe the
+	// request URL already carries the callback inside its redirect value.
+	if !c.spec.schemeless {
+		return &req
+	}
+	// The confirming hop is the last one marked "callback" in the chain.
+	for i := len(c.chain) - 1; i >= 0; i-- {
+		if c.chain[i].Kind == "callback" {
+			req.URL = c.chain[i].URL
+			break
+		}
+	}
+	return &req
 }
 
 // pollCallback fetches whatever's been recorded against cb's token so far,

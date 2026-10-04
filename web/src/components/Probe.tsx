@@ -1,20 +1,20 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api, ApiError, watchProbeScan } from '../api'
 import type { ProbeRequest } from '../probeHandoff'
-import type { Credential, JobOptionsPreset, ProbeFinding, ProbeModuleResult, ProbeScanResponse, ProbeSeverity, Target } from '../types'
-import { applyScanEvent, emptyProgress, finishProgress, type ScanProgress } from '../scanProgress'
+import type { Credential, ProbeFinding, ProbeModuleResult, ProbeScanResponse, ProbeSeverity, Target } from '../types'
+import { applyScanEvent, emptyProgress, finishProgress, type ScanProgress, runBatch, stopTrackedScan, useScanBatch, stopAllScans } from '../scanProgress'
 import { CollapsibleFormPanel } from './CollapsibleFormPanel'
 import { TargetPicker } from './TargetPicker'
 import { CredentialPicker } from './CredentialPicker'
-import { BatchResultsPanel, type BatchResultSummary } from './BatchResultsPanel'
+import { BatchResultsPanel, stoppedSummary, type BatchResultSummary } from './BatchResultsPanel'
 import { ScanHistoryPanel } from './ScanHistoryPanel'
 import { ScanWindowTabs } from './ScanWindowTabs'
 import { latestByTarget, loadCaseScans } from '../scanHistory'
 import { useAutoCollapseOnce, useCollapsible } from '../collapsible'
 import { inputBase } from '../formStyles'
 import { SEVERITY_META, SEVERITY_ORDER } from '../severityColor'
-import { JOB_PRESETS } from '../presets'
 import { CopyButton } from './CopyButton'
+import { SendToTesterButton } from './SendToTesterButton'
 import { copyToClipboard, useContextMenu } from '../contextMenu'
 import { sendToBypass403 } from '../bypass403Handoff'
 import { sendToTester } from '../testerHandoff'
@@ -23,9 +23,13 @@ import { sendToTester } from '../testerHandoff'
 // run: its own test-progress map and, once finished, its own result --
 // independent of every other target running alongside it.
 import { ScanErrorNotice } from './ScanErrorNotice'
+import { useScanSpeed } from './scanSpeed'
 
 interface TargetScanState {
-  status: 'running' | 'done' | 'error'
+  status: 'running' | 'done' | 'error' | 'cancelled'
+  // scanId is set once the scan has started, so its card's Stop button can
+  // cancel it (see stopTrackedScan).
+  scanId?: string
   // progress is the run's live per-module state (see scanProgress.ts), shown
   // as a grid of squares on the target's card.
   progress?: ScanProgress
@@ -47,7 +51,7 @@ export function Probe({
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [manualTarget, setManualTarget] = useState('')
   const [scans, setScans] = useState<Record<string, TargetScanState>>({})
-  const [preset, setPreset] = useState<JobOptionsPreset>('custom')
+  const batch = useScanBatch()
   const [credentialId, setCredentialId] = useState<string | undefined>()
   const [view, setView] = useState<'scan' | 'history'>('scan')
 
@@ -70,7 +74,7 @@ export function Probe({
       if (restored.length === 0) return
       setScans((prev) => {
         const next = { ...prev }
-        for (const r of restored) if (!next[r.scan.target]) next[r.scan.target] = { status: 'done', result: r.data }
+        for (const r of restored) if (!next[r.scan.target]) next[r.scan.target] = { status: 'done', result: r.data, scanId: r.scan.id }
         return next
       })
     })
@@ -95,7 +99,8 @@ export function Probe({
   const runTargets = useMemo(() => [...new Set([...selected, ...manualTargets])], [selected, manualTargets])
 
   const running = Object.values(scans).some((s) => s.status === 'running')
-  const canRun = runTargets.length > 0 && !running
+  const speed = useScanSpeed()
+  const canRun = runTargets.length > 0 && !running && speed.rps !== null
 
   // runScan kicks off one independent scan per target in runTargets --
   // each streams its own progress and finishes on its own schedule, so a
@@ -104,13 +109,22 @@ export function Probe({
     if (!canRun) return
     const list = runTargets
     setScans(Object.fromEntries(list.map((t) => [t, { status: 'running' as const, progress: emptyProgress() }])))
-    for (const t of list) runOneScan(t)
+    // One signal covers the whole batch, so Stop all reaches targets not yet started.
+    const signal = batch.begin()
+    runBatch(list, (t) => runOneScan(t, signal))
+  }
+
+  // retryScan restarts one failed target's scan in place: its card goes back to
+  // running and the scan runs again, while the other targets keep going.
+  const retryScan = (targetValue: string) => {
+    setScans((prev) => ({ ...prev, [targetValue]: { status: 'running' as const, progress: emptyProgress() } }))
+    void runOneScan(targetValue, batch.current())
   }
 
   // runOneScan streams this target's probe run into its card: each module's
   // start and finish arrive as progress events, and the full result is built
   // from the module events once the terminal "done" lands.
-  const runOneScan = async (targetValue: string) => {
+  const runOneScan = async (targetValue: string, signal?: AbortSignal) => {
     // Modules finish in whatever order their HTTP checks happen to
     // complete, streamed one at a time over this target's probe scan
     // WebSocket (see runProbeScan in internal/api) -- collected here and
@@ -121,18 +135,25 @@ export function Probe({
       setScans((prev) => (prev[targetValue] ? { ...prev, [targetValue]: fn(prev[targetValue]) } : prev))
     let stopWatch: () => void = () => {}
     try {
-      const { scanId } = await api.probeScan({
+      const { scanId } = await api.probeScan({ requestsPerSecond: speed.rps ?? undefined,
         target: targetValue,
-        preset: preset === 'custom' ? undefined : preset,
         credentialId,
         caseId,
       })
+      patch((cur) => ({ ...cur, scanId }))
+      if (signal?.aborted) {
+        stopTrackedScan({ scanId })
+        return
+      }
       await new Promise<void>((resolve, reject) => {
         stopWatch = watchProbeScan(scanId, (ev) => {
           if (ev.type === 'module' && ev.module) {
             collected.push(ev.module)
           } else if (ev.type === 'done') {
-            if (ev.status === 'failed') {
+            if (ev.status === 'cancelled') {
+              patch((cur) => ({ ...cur, status: 'cancelled', progress: finishProgress(cur.progress ?? emptyProgress()) }))
+              resolve()
+            } else if (ev.status === 'failed') {
               reject(new Error(ev.message || 'Probe scan failed'))
             } else if (ev.probeTarget && ev.probeHealth) {
               const result: ProbeScanResponse = { target: ev.probeTarget, health: ev.probeHealth, modules: collected }
@@ -152,6 +173,17 @@ export function Probe({
     } finally {
       stopWatch()
     }
+  }
+
+  // stopScan stops one target's running scan. Its card settles itself once the
+  // server's terminal event arrives.
+  const stopScan = (t: string) => stopTrackedScan(scans[t])
+
+  // stopAll ends the whole batch: targets not yet started are skipped, and
+  // every running target is cancelled.
+  const stopAll = () => {
+    batch.stop()
+    setScans((prev) => stopAllScans(prev))
   }
 
   const runLabel = runTargets.length > 1 ? `Run Probe (${runTargets.length})` : 'Run Probe'
@@ -198,22 +230,7 @@ export function Probe({
           />
         </label>
 
-        <div className="flex flex-wrap items-center gap-2">
-          <span className="text-xs font-medium text-neutral-300">Intensity</span>
-          {JOB_PRESETS.map((p) => (
-            <button
-              key={p.id}
-              type="button"
-              title={p.description}
-              onClick={() => setPreset(p.id)}
-              className={`rounded border px-2 py-0.5 text-xs ${
-                preset === p.id ? 'border-sky-500 bg-sky-950/40 text-sky-300' : 'border-neutral-700 bg-neutral-900 text-neutral-400 hover:border-sky-600'
-              }`}
-            >
-              {p.label}
-            </button>
-          ))}
-        </div>
+        {speed.control}
         <CredentialPicker credentials={credentials} selected={credentialId} onSelect={setCredentialId} />
 
         <button
@@ -241,6 +258,7 @@ export function Probe({
                 entries={Object.entries(scans)}
                 getSummary={probeScanSummary}
                 getProgress={(scan) => scan.progress}
+                onRetry={retryScan} onStop={stopScan} onStopAll={stopAll}
                 renderCard={(t, scan) => <TargetScanCard target={t} scan={scan} />}
               />
             )}
@@ -265,8 +283,9 @@ export function Probe({
 // only lower-severity findings (warn) vs. a clean scan, so a scan against
 // 100s of targets sorts the handful worth looking at to the top.
 function probeScanSummary(scan: TargetScanState): BatchResultSummary {
+  if (scan.status === 'cancelled') return stoppedSummary
   if (scan.status === 'running') return { label: 'Running…', tone: 'neutral', running: true }
-  if (scan.status === 'error') return { label: 'Error', tone: 'danger' }
+  if (scan.status === 'error') return { label: 'Error', tone: 'danger', failed: true }
   const modules = scan.result?.modules ?? []
   const total = modules.reduce((n, m) => n + m.findings.length, 0)
   if (total === 0) return { label: 'Clean', tone: 'clean' }
@@ -340,6 +359,7 @@ const SCAN_STATUS_STYLES: Record<TargetScanState['status'], { label: string; cls
   running: { label: 'Running…', cls: 'border-amber-700 bg-amber-950/40 text-amber-300' },
   done: { label: 'Done', cls: 'border-emerald-700 bg-emerald-950/40 text-emerald-300' },
   error: { label: 'Failed', cls: 'border-red-700 bg-red-950/40 text-red-300' },
+  cancelled: { label: 'Stopped', cls: 'border-neutral-700 bg-neutral-900 text-neutral-400' },
 }
 
 function ScanStatusBadge({ status }: { status: TargetScanState['status'] }) {
@@ -444,7 +464,7 @@ function FindingRow({ finding }: { finding: ProbeFinding }) {
         openMenu(e, [
           { label: 'Copy URL', onSelect: () => copyToClipboard(finding.url!, 'Copied URL') },
           { label: 'Send to 403 Bypass', onSelect: () => sendToBypass403(finding.url!) },
-          { label: 'Send to Tester', onSelect: () => sendToTester(finding.url!, finding.method || 'GET') },
+          { label: 'Send to Tester', onSelect: () => sendToTester(finding.url!, finding.method || 'GET', finding.headers, finding.body) },
         ])
       }}
       className="py-2 text-xs"
@@ -490,6 +510,7 @@ function FindingRow({ finding }: { finding: ProbeFinding }) {
               {finding.url}
             </p>
           )}
+          {finding.url && <SendToTesterButton url={finding.url} method={finding.method} headers={finding.headers} body={finding.body} />}
         </div>
       )}
     </li>

@@ -81,6 +81,34 @@ func Modules() []ModuleInfo {
 	return out
 }
 
+// withRequestHeaders gives every finding that names a URL the headers its
+// request was actually sent with: the scan's own headers (a saved
+// credential's Authorization/Cookie, the domain cookie) overlaid by the
+// finding's headers (such as a POST's Content-Type), so the finding can be
+// replayed authenticated. Findings without a URL have no request to replay.
+func withRequestHeaders(findings []Finding, scanHeaders map[string]string) []Finding {
+	// Visit each finding once and stamp its request headers onto it.
+	for i := range findings {
+		// No URL means no request to attach headers to, so leave the finding alone.
+		if findings[i].URL == "" {
+			continue
+		}
+		merged := make(map[string]string, len(scanHeaders)+len(findings[i].Headers))
+		for k, v := range scanHeaders {
+			merged[k] = v
+		}
+		// The finding's own headers win over the scan's, since they describe its exact request.
+		for k, v := range findings[i].Headers {
+			merged[k] = v
+		}
+		// An empty merge would serialize as an empty object, so keep the field nil instead.
+		if len(merged) > 0 {
+			findings[i].Headers = merged
+		}
+	}
+	return findings
+}
+
 // RunScan resolves rawTarget, runs a quick reachability check, then runs
 // every registered module concurrently against it, returning one aggregated
 // response. Modeled on jwtscan.RunScan's shape: an error here means the
@@ -127,7 +155,7 @@ func RunScanStreaming(ctx context.Context, rawTarget string, opts Options, onMod
 		go func(i int, m moduleDef) {
 			defer wg.Done()
 			rep.Start(m.id)
-			findings := m.run(ctx, t, client)
+			findings := withRequestHeaders(m.run(ctx, t, client), opts.Headers)
 			if findings == nil {
 				// A nil slice would otherwise serialize to JSON `null`
 				// instead of `[]`, which the frontend treats as an

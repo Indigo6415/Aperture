@@ -11,20 +11,18 @@ import type {
   ApiRoute,
   ApiSchemaInfo,
   Credential,
-  JobOptionsPreset,
   Target,
 } from '../types'
 import { CollapsibleFormPanel } from './CollapsibleFormPanel'
 import { TargetPicker } from './TargetPicker'
 import { CredentialPicker } from './CredentialPicker'
-import { BatchResultsPanel, type BatchResultSummary } from './BatchResultsPanel'
+import { BatchResultsPanel, stoppedSummary, type BatchResultSummary } from './BatchResultsPanel'
 import { ScanHistoryPanel } from './ScanHistoryPanel'
-import { applyScanEvent, emptyProgress, finishProgress, type ScanProgress } from '../scanProgress'
+import { applyScanEvent, emptyProgress, finishProgress, type ScanProgress, runBatch, stopTrackedScan, useScanBatch, stopAllScans } from '../scanProgress'
 import { ScanWindowTabs } from './ScanWindowTabs'
 import { latestByTarget, loadCaseScans } from '../scanHistory'
 import { useAutoCollapseOnce, useCollapsible } from '../collapsible'
 import { inputBase } from '../formStyles'
-import { JOB_PRESETS } from '../presets'
 import { CopyButton } from './CopyButton'
 import { copyToClipboard, useContextMenu } from '../contextMenu'
 import { sendToTester } from '../testerHandoff'
@@ -35,6 +33,7 @@ import { showToast } from '../toast'
 // as a small local type so the component doesn't have to import the
 // RunEvent-nested shape directly everywhere it's read.
 import { ScanErrorNotice } from './ScanErrorNotice'
+import { useScanSpeed } from './scanSpeed'
 
 interface ApiEnumPhaseState {
   phase: string
@@ -47,7 +46,10 @@ interface ApiEnumPhaseState {
 // accumulate live from streamed "apiEnumRoute" events (same pattern Probe
 // uses for ProbeModuleResult) rather than arriving all at once.
 interface TargetScanState {
-  status: 'running' | 'done' | 'error'
+  status: 'running' | 'done' | 'error' | 'cancelled'
+  // scanId is set once the scan has started, so its card's Stop button can
+  // cancel it (see stopTrackedScan).
+  scanId?: string
   // progress is the run's live per-route state (see scanProgress.ts), shown as
   // a grid of squares on the target's card.
   progress?: ScanProgress
@@ -94,7 +96,7 @@ export function ApiEnum({
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [manualTarget, setManualTarget] = useState('')
   const [scans, setScans] = useState<Record<string, TargetScanState>>({})
-  const [preset, setPreset] = useState<JobOptionsPreset>('custom')
+  const batch = useScanBatch()
   const [credentialId, setCredentialId] = useState<string | undefined>()
   const [crawlDepth, setCrawlDepth] = useState('')
   const [maxPages, setMaxPages] = useState('')
@@ -122,6 +124,8 @@ export function ApiEnum({
           next[r.scan.target] = {
             status: 'done', routes: r.data.routes, target: r.data.target, schema: r.data.schema,
             graphql: r.data.graphql, injectionPoints: r.data.injectionPoints, stats: r.data.stats,
+            // The saved scan's ID, so a restored card keeps its Inspect requests menu.
+            scanId: r.scan.id,
           }
         }
         return next
@@ -137,28 +141,42 @@ export function ApiEnum({
   const extraWordlistEntries = useMemo(() => extraWordlist.split(/[,\n]+/).map((s) => s.trim()).filter(Boolean), [extraWordlist])
 
   const running = Object.values(scans).some((s) => s.status === 'running')
-  const canRun = runTargets.length > 0 && !running
+  const speed = useScanSpeed()
+  const canRun = runTargets.length > 0 && !running && speed.rps !== null
 
   const runScan = () => {
     if (!canRun) return
     const list = runTargets
     setScans(Object.fromEntries(list.map((t) => [t, { status: 'running' as const, routes: [], progress: emptyProgress() }])))
-    for (const t of list) runOneScan(t)
+    // One signal covers the whole batch, so Stop all reaches targets not yet started.
+    const signal = batch.begin()
+    runBatch(list, (t) => runOneScan(t, signal))
   }
 
-  const runOneScan = async (targetValue: string) => {
+  // retryScan restarts one failed target's scan in place: its card goes back to
+  // running and the scan runs again, while the other targets keep going.
+  const retryScan = (targetValue: string) => {
+    setScans((prev) => ({ ...prev, [targetValue]: { status: 'running' as const, routes: [], progress: emptyProgress() } }))
+    void runOneScan(targetValue, batch.current())
+  }
+
+  const runOneScan = async (targetValue: string, signal?: AbortSignal) => {
     const collected: ApiRoute[] = []
     let stopWatch: () => void = () => {}
     try {
-      const { scanId } = await api.apiEnumScan({
+      const { scanId } = await api.apiEnumScan({ requestsPerSecond: speed.rps ?? undefined,
         target: targetValue,
-        preset: preset === 'custom' ? undefined : preset,
         credentialId,
         crawlDepth: crawlDepth ? Number(crawlDepth) : undefined,
         maxPages: maxPages ? Number(maxPages) : undefined,
         extraWordlist: extraWordlistEntries.length > 0 ? extraWordlistEntries : undefined,
         caseId,
       })
+      setScans((prev) => (prev[targetValue] ? { ...prev, [targetValue]: { ...prev[targetValue], scanId } } : prev))
+      if (signal?.aborted) {
+        stopTrackedScan({ scanId })
+        return
+      }
       await new Promise<void>((resolve, reject) => {
         stopWatch = watchApiEnumScan(scanId, (ev) => {
           // Every event also feeds the per-route progress grid; the branches
@@ -185,7 +203,13 @@ export function ApiEnum({
               return { ...prev, [targetValue]: { ...cur, routes: [...collected] } }
             })
           } else if (ev.type === 'done') {
-            if (ev.status === 'failed') {
+            if (ev.status === 'cancelled') {
+              setScans((prev) => ({
+                ...prev,
+                [targetValue]: { ...prev[targetValue], status: 'cancelled', progress: finishProgress(prev[targetValue]?.progress ?? emptyProgress()) },
+              }))
+              resolve()
+            } else if (ev.status === 'failed') {
               reject(new Error(ev.message || 'API enumeration failed'))
             } else if (ev.apiEnumTarget) {
               setScans((prev) => ({
@@ -209,6 +233,17 @@ export function ApiEnum({
     } finally {
       stopWatch()
     }
+  }
+
+  // stopScan stops one target's running scan. Its card settles itself once the
+  // server's terminal event arrives.
+  const stopScan = (t: string) => stopTrackedScan(scans[t])
+
+  // stopAll ends the whole batch: targets not yet started are skipped, and
+  // every running target is cancelled.
+  const stopAll = () => {
+    batch.stop()
+    setScans((prev) => stopAllScans(prev))
   }
 
   const runLabel = runTargets.length > 1 ? `Enumerate (${runTargets.length})` : 'Enumerate'
@@ -256,23 +291,7 @@ export function ApiEnum({
           />
         </label>
 
-        <div className="flex flex-wrap items-center gap-2">
-          <span className="text-xs font-medium text-neutral-300">Intensity</span>
-          {JOB_PRESETS.map((p) => (
-            <button
-              key={p.id}
-              type="button"
-              title={p.description}
-              onClick={() => setPreset(p.id)}
-              className={`rounded border px-2 py-0.5 text-xs ${
-                preset === p.id ? 'border-sky-500 bg-sky-950/40 text-sky-300' : 'border-neutral-700 bg-neutral-900 text-neutral-400 hover:border-sky-600'
-              }`}
-            >
-              {p.label}
-            </button>
-          ))}
-          <span className="text-[11px] text-neutral-600">Also paces the enumeration itself -- see "stealth" for the most conservative request rate.</span>
-        </div>
+        {speed.control}
 
         <CredentialPicker credentials={credentials} selected={credentialId} onSelect={setCredentialId} />
 
@@ -327,6 +346,7 @@ export function ApiEnum({
             {hasScans && (
               <BatchResultsPanel
                 getProgress={(scan) => scan.progress}
+                onRetry={retryScan} onStop={stopScan} onStopAll={stopAll}
                 entries={Object.entries(scans)}
                 getSummary={apiEnumSummary}
                 renderCard={(t, scan) => (
@@ -355,8 +375,9 @@ export function ApiEnum({
 }
 
 function apiEnumSummary(scan: TargetScanState): BatchResultSummary {
+  if (scan.status === 'cancelled') return stoppedSummary
   if (scan.status === 'running') return { label: scan.phase ? PHASE_LABELS[scan.phase.phase] ?? 'Running…' : 'Running…', tone: 'neutral', running: true }
-  if (scan.status === 'error') return { label: 'Error', tone: 'danger' }
+  if (scan.status === 'error') return { label: 'Error', tone: 'danger', failed: true }
   const points = scan.injectionPoints?.length ?? 0
   const routes = scan.stats?.routesFound ?? scan.routes.length
   if (routes === 0) return { label: 'No routes found', tone: 'neutral' }
@@ -368,6 +389,7 @@ const SCAN_STATUS_STYLES: Record<TargetScanState['status'], { label: string; cls
   running: { label: 'Running…', cls: 'border-amber-700 bg-amber-950/40 text-amber-300' },
   done: { label: 'Done', cls: 'border-emerald-700 bg-emerald-950/40 text-emerald-300' },
   error: { label: 'Failed', cls: 'border-red-700 bg-red-950/40 text-red-300' },
+  cancelled: { label: 'Stopped', cls: 'border-neutral-700 bg-neutral-900 text-neutral-400' },
 }
 
 function ScanStatusBadge({ status }: { status: TargetScanState['status'] }) {

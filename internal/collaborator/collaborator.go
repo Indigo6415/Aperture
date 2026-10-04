@@ -106,13 +106,30 @@ type stagedResponse struct {
 // exists purely so other parts of the UI can discover "which servers are
 // currently being watched" without re-minting one of their own.
 type Session struct {
-	Token        string    `json:"token"`
-	Provider     string    `json:"provider"` // "aperture" | "webhooksite"
-	Label        string    `json:"label"`
-	HTTPCallback string    `json:"httpCallback"`
-	DNSHostname  string    `json:"dnsHostname,omitempty"`
-	ViewURL      string    `json:"viewUrl,omitempty"`
-	CreatedAt    time.Time `json:"createdAt"`
+	Token        string `json:"token"`
+	Provider     string `json:"provider"` // "aperture" | "webhooksite"
+	Label        string `json:"label"`
+	HTTPCallback string `json:"httpCallback"`
+	DNSHostname  string `json:"dnsHostname,omitempty"`
+	ViewURL      string `json:"viewUrl,omitempty"`
+	// Links holds the same callback under each network path (localhost, LAN,
+	// public), so the operator can pick the one a given target can reach.
+	// Empty for webhook.site sessions and for paths that couldn't be detected.
+	Links     Links     `json:"links"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+// Links is one Aperture callback URL per network path. Fields are omitted
+// when that path isn't available (e.g. no LAN IP, or public lookup failed).
+type Links struct {
+	Localhost string `json:"localhost,omitempty"`
+	Private   string `json:"private,omitempty"`
+	Public    string `json:"public,omitempty"`
+	// HTTPS variants of the three paths above, set only while the callback
+	// listener's TLS side is enabled.
+	LocalhostTLS string `json:"localhostTls,omitempty"`
+	PrivateTLS   string `json:"privateTls,omitempty"`
+	PublicTLS    string `json:"publicTls,omitempty"`
 }
 
 // Ref is which callback server a scan request opted into -- decoded

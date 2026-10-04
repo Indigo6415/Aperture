@@ -18,13 +18,15 @@ import (
 // xss.Request field-for-field plus the credential/case wiring every other
 // tool's request carries (see pwResetRequest/sstiScanRequest).
 type xssScanRequest struct {
-	URL            string            `json:"url"`
-	Params         []string          `json:"params,omitempty"`
-	CredentialID   string            `json:"credentialId,omitempty"`
-	Headers        map[string]string `json:"headers,omitempty"`
-	CaseID         string            `json:"caseId,omitempty"`
-	RecursionDepth int               `json:"recursionDepth,omitempty"`
-	MaxPages       int               `json:"maxPages,omitempty"`
+	// RequestsPerSecond is the scan speed the Slow/Normal/Fast/Custom control sends; zero means scanRate's default.
+	RequestsPerSecond float64           `json:"requestsPerSecond,omitempty"`
+	URL               string            `json:"url"`
+	Params            []string          `json:"params,omitempty"`
+	CredentialID      string            `json:"credentialId,omitempty"`
+	Headers           map[string]string `json:"headers,omitempty"`
+	CaseID            string            `json:"caseId,omitempty"`
+	RecursionDepth    int               `json:"recursionDepth,omitempty"`
+	MaxPages          int               `json:"maxPages,omitempty"`
 }
 
 // xssScanTimeout mirrors sstiScanTimeout's own reasoning: the crawl itself
@@ -38,6 +40,11 @@ const xssScanTimeout = 150 * time.Second
 func (s *Server) handleXSSScan(w http.ResponseWriter, r *http.Request) {
 	var req xssScanRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	rps, err := scanRate(req.RequestsPerSecond)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -62,6 +69,7 @@ func (s *Server) handleXSSScan(w http.ResponseWriter, r *http.Request) {
 	req.Headers = s.applyDomainCookie(req.CaseID, req.URL, req.Headers)
 
 	s.queueScan(w, streamedScan{
+		rps:     rps,
 		caseID:  req.CaseID,
 		target:  req.URL,
 		tool:    "xss",

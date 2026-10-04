@@ -424,6 +424,8 @@ export interface JwtScanResponse {
 }
 
 export interface JwtScanRequest {
+  // requestsPerSecond is the scan speed (Slow/Normal/Fast/Custom); omitted means the server default.
+  requestsPerSecond?: number
   url: string
   token: string
   method?: string
@@ -471,6 +473,10 @@ export interface ProbeFinding {
   method?: string
   statusCode?: number
   confidence?: Confidence
+  // headers/body are the request that triggered the finding -- set only by
+  // checks that send a body (a POST), so Send to Tester can replay it exactly.
+  headers?: Record<string, string>
+  body?: string
 }
 
 export type ProbeSeverity = 'info' | 'low' | 'medium' | 'high' | 'critical'
@@ -489,8 +495,9 @@ export interface ProbeScanResponse {
 }
 
 export interface ProbeScanRequest {
+  // requestsPerSecond is the scan speed (Slow/Normal/Fast/Custom); omitted means the server default.
+  requestsPerSecond?: number
   target: string
-  preset?: JobOptionsPreset
   credentialId?: string
   // caseId -- see JwtScanRequest.caseId's doc comment.
   caseId?: string
@@ -552,6 +559,8 @@ export interface DomainScanResponse {
 }
 
 export interface DomainScanRequest {
+  // requestsPerSecond is the scan speed (Slow/Normal/Fast/Custom); omitted means the server default.
+  requestsPerSecond?: number
   target: string
   credentialId?: string
   crawlDepth?: number
@@ -587,9 +596,14 @@ export interface SecretMatch {
   value: string
   location: string
   engine: SecretMatchEngine
+  // headers are the headers the page was fetched with, so Send to Tester can
+  // replay the request authenticated.
+  headers?: Record<string, string>
 }
 
 export interface SecretScanRequest {
+  // requestsPerSecond is the scan speed (Slow/Normal/Fast/Custom); omitted means the server default.
+  requestsPerSecond?: number
   url: string
   recursionDepth?: number
   entropy?: boolean
@@ -681,6 +695,8 @@ export type ScanTool =
   | 'ssrf'
   | 'csrf'
   | 'sstiscan'
+  | 'pathtraversal'
+  | 'xxe'
   | 'xss'
   | 'tester'
   | 'apienum'
@@ -767,6 +783,8 @@ export interface BreachCheckResponse {
 // -- the crawl-for-emails endpoint runs the very same crawl (see
 // internal/breach.CrawlForEmails), one target per request.
 export interface BreachCrawlRequest {
+  // requestsPerSecond is the scan speed (Slow/Normal/Fast/Custom); omitted means the server default.
+  requestsPerSecond?: number
   url: string
   recursionDepth?: number
   headers?: Record<string, string>
@@ -784,6 +802,8 @@ export interface BreachCrawlResponse {
 // --- 403 bypass engine (mirrors internal/bypass403) ---
 
 export interface Bypass403Request {
+  // requestsPerSecond is the scan speed (Slow/Normal/Fast/Custom); omitted means the server default.
+  requestsPerSecond?: number
   url: string
   headers?: Record<string, string>
   credentialId?: string
@@ -821,6 +841,8 @@ export interface Bypass403Response {
 // --- Forgot-password scanner (mirrors internal/pwreset) ---
 
 export interface PwResetRequest {
+  // requestsPerSecond is the scan speed (Slow/Normal/Fast/Custom); omitted means the server default.
+  requestsPerSecond?: number
   url: string
   method?: 'POST' | 'GET'
   contentType?: 'form' | 'json'
@@ -882,6 +904,8 @@ export interface PwResetResponse {
 // --- GraphQL enumeration scanner (mirrors internal/graphqlenum) ---
 
 export interface GraphqlEnumRequest {
+  // requestsPerSecond is the scan speed (Slow/Normal/Fast/Custom); omitted means the server default.
+  requestsPerSecond?: number
   url: string
   credentialId?: string
   headers?: Record<string, string>
@@ -1052,8 +1076,9 @@ export interface ApiEnumResponse {
 }
 
 export interface ApiEnumRequest {
+  // requestsPerSecond is the scan speed (Slow/Normal/Fast/Custom); omitted means the server default.
+  requestsPerSecond?: number
   target: string
-  preset?: JobOptionsPreset
   credentialId?: string
   crawlDepth?: number
   maxPages?: number
@@ -1080,6 +1105,8 @@ export interface ApiEnumStartResult {
 // --- CORS misconfiguration scanner (mirrors internal/corsscan) ---
 
 export interface CorsScanRequest {
+  // requestsPerSecond is the scan speed (Slow/Normal/Fast/Custom); omitted means the server default.
+  requestsPerSecond?: number
   url: string
   method?: string
   credentialId?: string
@@ -1122,6 +1149,8 @@ export interface CorsScanResponse {
 // --- Open redirect scanner (mirrors internal/openredirect) ---
 
 export interface OpenRedirectRequest {
+  // requestsPerSecond is the scan speed (Slow/Normal/Fast/Custom); omitted means the server default.
+  requestsPerSecond?: number
   url: string
   params?: string[]
   credentialId?: string
@@ -1141,6 +1170,25 @@ export interface OpenRedirectBaseline {
   url: string
   statusCode: number
   location?: string
+  // error is set when every baseline attempt failed; the run still went on.
+  error?: string
+}
+
+// ChainHop is one request on the path from an open-redirect probe to its
+// callback (mirrors openredirect.ChainHop). kind is "probe", "redirect" or
+// "callback"; offsetMs is when the request went out relative to the probe's
+// first request, and durationMs is how long it took on the wire.
+export interface ChainHop {
+  step: number
+  kind: 'probe' | 'redirect' | 'callback'
+  method: string
+  url: string
+  statusCode?: number
+  location?: string
+  offsetMs: number
+  durationMs: number
+  headers?: Record<string, string>
+  error?: string
 }
 
 export interface OpenRedirectFinding {
@@ -1150,6 +1198,9 @@ export interface OpenRedirectFinding {
   method?: string
   statusCode?: number
   request?: CapturedRequest
+  // chain is every request from the probe to the callback. Absent on scans
+  // saved before it was recorded.
+  chain?: ChainHop[]
 }
 
 export interface OpenRedirectModuleResult {
@@ -1166,12 +1217,19 @@ export interface OpenRedirectResponse {
   // probesSent is every distinct request the run fired (baseline excluded).
   // Optional: scans saved before this field existed won't have it.
   probesSent?: number
+  // requests is every request the run sent (baseline attempts, probes and
+  // callback confirmations); timedOut is how many ran out of their time
+  // budget. Together they show how responsive the host was.
+  requests?: number
+  timedOut?: number
   followRedirects?: boolean
 }
 
 // --- SSRF scanner (mirrors internal/ssrf) ---
 
 export interface SsrfRequest {
+  // requestsPerSecond is the scan speed (Slow/Normal/Fast/Custom); omitted means the server default.
+  requestsPerSecond?: number
   url: string
   params?: string[]
   credentialId?: string
@@ -1214,9 +1272,80 @@ export interface SsrfResponse {
   paramsTested: string[]
 }
 
+// --- XXE scanner (mirrors internal/xxe) ---
+
+export interface XxeRequest {
+  // requestsPerSecond is the scan speed (Slow/Normal/Fast/Custom); omitted means the server default.
+  requestsPerSecond?: number
+  url: string
+  // method is POST or PUT; omitted means POST.
+  method?: 'POST' | 'PUT'
+  // body is an optional XML part supplied by the operator. Every text value in
+  // it is tested. Omitted means a built-in probe document is used.
+  body?: string
+  contentType?: string
+  headers?: Record<string, string>
+  credentialId?: string
+  caseId?: string
+  autoDiscover?: boolean
+  recursionDepth?: number
+  maxPages?: number
+  // callback optionally names a shared callback server picked from the Callback picker; omitted means the
+  // scanner mints its own per-point tokens.
+  callback?: CallbackSelection
+}
+
+export interface XxeBaseline {
+  url: string
+  statusCode: number
+}
+
+// confirmed: the parser's behavior was proven (a file's contents came back, or an
+// out-of-band callback arrived). likely: a parser error named the path it tried
+// to open, which proves resolution but not a read.
+export type XxeConfidence = 'confirmed' | 'likely'
+
+export interface XxeFinding {
+  label: string
+  detail?: string
+  evidence?: string
+  method?: string
+  statusCode?: number
+  confidence?: XxeConfidence
+  request?: CapturedRequest
+}
+
+export interface XxeModuleResult {
+  id: string
+  name: string
+  severity: ProbeSeverity
+  findings: XxeFinding[]
+}
+
+export interface XxeEndpoint {
+  url: string
+  method: string
+  // source is where the endpoint came from: seed, form action, script reference, or common path.
+  source: string
+  // evidence says why an auto-discovered endpoint counts as XML-capable. Empty for a manual seed.
+  evidence?: string
+  pointsTested: number
+}
+
+export interface XxeResponse {
+  baseline: XxeBaseline
+  modules: XxeModuleResult[]
+  endpoints: XxeEndpoint[]
+  pointsTested: number
+  // oobEnabled is false when no callback listener is configured, so the blind module ran nothing.
+  oobEnabled: boolean
+}
+
 // --- XSS scanner (mirrors internal/xss) ---
 
 export interface XssRequest {
+  // requestsPerSecond is the scan speed (Slow/Normal/Fast/Custom); omitted means the server default.
+  requestsPerSecond?: number
   url: string
   params?: string[]
   credentialId?: string
@@ -1257,6 +1386,8 @@ export interface XssResponse {
 // --- CSRF sweep (mirrors internal/csrf) ---
 
 export interface CsrfScanRequest {
+  // requestsPerSecond is the scan speed (Slow/Normal/Fast/Custom); omitted means the server default.
+  requestsPerSecond?: number
   url: string
   recursionDepth?: number
   maxPages?: number
@@ -1304,6 +1435,8 @@ export interface CsrfScanResponse {
 // --- SSTI scanner (mirrors internal/sstiscan) ---
 
 export interface SstiScanRequest {
+  // requestsPerSecond is the scan speed (Slow/Normal/Fast/Custom); omitted means the server default.
+  requestsPerSecond?: number
   url: string
   params?: string[]
   credentialId?: string
@@ -1347,6 +1480,59 @@ export interface SstiScanResponse {
   pointsTested: number
 }
 
+// --- Path traversal scanner (mirrors internal/pathtraversal) ---
+
+export interface PathTraversalRequest {
+  // requestsPerSecond is the scan speed (Slow/Normal/Fast/Custom); omitted means the server default.
+  requestsPerSecond?: number
+  url: string
+  // method is GET or POST; omitted means POST when a body is set, GET otherwise.
+  method?: string
+  // body is an optional request body, tested per JSON string or per form field.
+  body?: string
+  contentType?: string
+  params?: string[]
+  credentialId?: string
+  headers?: Record<string, string>
+  caseId?: string
+  recursionDepth?: number
+  maxPages?: number
+  // callback optionally names a shared callback server picked from the Callback picker; omitted means the
+  // scanner mints its own per-point tokens.
+  callback?: CallbackSelection
+}
+
+export interface PathTraversalBaseline {
+  url: string
+  statusCode: number
+}
+
+export interface PathTraversalFinding {
+  label: string
+  detail?: string
+  evidence?: string
+  payload?: string
+  method?: string
+  statusCode?: number
+  // confidence is "confirmed" (strong file signature) or "likely" (weak signature).
+  confidence?: 'confirmed' | 'likely'
+  request?: CapturedRequest
+}
+
+export interface PathTraversalModuleResult {
+  id: string
+  name: string
+  severity: ProbeSeverity
+  findings: PathTraversalFinding[]
+}
+
+export interface PathTraversalResponse {
+  baseline: PathTraversalBaseline
+  modules: PathTraversalModuleResult[]
+  pagesScanned: string[]
+  pointsTested: number
+}
+
 // --- Out-of-band collaborator listener (mirrors internal/collaborator +
 // internal/api/handlers_collaborator.go) ---
 
@@ -1354,11 +1540,25 @@ export interface CollaboratorConfig {
   domain: string
   answerIp: string
   dnsAddr: string
+  // Externally reachable base URL callbacks are sent to (e.g. http://203.0.113.7:8338).
+  // Empty falls back to the address the Aperture UI was opened on.
+  callbackBase: string
 }
 
 export interface CollaboratorConfigResponse extends CollaboratorConfig {
   dnsActive: boolean
   dnsError?: string
+}
+
+// Callback addresses detected by the server (LAN from network interfaces,
+// public from an external lookup service). Empty fields mean not detected.
+export interface CollaboratorAddresses {
+  localIp?: string
+  localBase?: string
+  publicIp?: string
+  publicBase?: string
+  collabPort: string
+  publicError?: string
 }
 
 export interface CollaboratorInteraction {
@@ -1407,7 +1607,32 @@ export interface ActiveCallbackServer {
   httpCallback: string
   dnsHostname?: string
   viewUrl?: string
+  // One callback URL per network path; each field is absent when that path
+  // wasn't detected (see collaborator.Links).
+  links?: CallbackLinks
   createdAt: string
+}
+
+export interface CallbackLinks {
+  localhost?: string
+  private?: string
+  public?: string
+  localhostTls?: string
+  privateTls?: string
+  publicTls?: string
+}
+
+// CollabTLSStatus is the callback listener's HTTPS side: whether it accepts
+// TLS, and the stored self-signed certificate's details when one exists.
+export interface CollabTLSStatus {
+  enabled: boolean
+  hasCert: boolean
+  cert?: {
+    fingerprint: string
+    notBefore: string
+    notAfter: string
+    subjects: string[]
+  }
 }
 
 // CallbackSelection mirrors collaborator.Ref -- which ActiveCallbackServer a
@@ -1416,4 +1641,54 @@ export interface ActiveCallbackServer {
 export interface CallbackSelection {
   provider: 'aperture' | 'webhooksite'
   token: string
+}
+
+// RequestRecord mirrors internal/store.RequestRecord: one HTTP exchange a
+// native scanner made during a node. The list endpoint leaves requestRaw and
+// responseRaw empty; the detail endpoint fills them in.
+export interface RequestRecord {
+  id: number
+  method: string
+  url: string
+  host: string
+  statusCode: number
+  size: number
+  ttfbMs: number
+  error?: string
+  requestRaw?: string
+  responseRaw?: string
+  timestamp: string
+  // ref names this exchange; fromRef names the 3xx exchange whose redirect led
+  // to it. Empty for a request that wasn't reached by a redirect.
+  ref?: string
+  fromRef?: string
+  // hit is true when a finding the scan reported captured this request.
+  hit?: boolean
+  // location is the Location header of a 3xx response.
+  location?: string
+  // callbackCount is how many collaborator hits this redirect's Location led to.
+  // It is set on list rows.
+  callbackCount?: number
+  // callbacks lists those hits in full. It is set on the detail record only.
+  callbacks?: CallbackHit[]
+}
+
+// CallbackHit is one interaction the collaborator recorded on a token that a
+// redirect's Location named.
+export interface CallbackHit {
+  id: string
+  protocol: string
+  timestamp: string
+  remoteAddr: string
+  method?: string
+  path?: string
+  query?: string
+  identifier?: string
+}
+
+// NodeRequestLog mirrors api.requestLogResponse: one node's request log plus
+// the cap that log is held to (see engine.MaxRecordedExchangesPerNode).
+export interface NodeRequestLog {
+  requests: RequestRecord[]
+  limit: number
 }

@@ -4,17 +4,18 @@ import type { CsrfScanResponse, Credential, Target } from '../types'
 import { CollapsibleFormPanel } from './CollapsibleFormPanel'
 import { TargetPicker } from './TargetPicker'
 import { CredentialPicker } from './CredentialPicker'
-import { BatchResultsPanel, type BatchResultSummary } from './BatchResultsPanel'
+import { BatchResultsPanel, stoppedSummary, type BatchResultSummary } from './BatchResultsPanel'
 import { ScanHistoryPanel } from './ScanHistoryPanel'
 import { ScanWindowTabs } from './ScanWindowTabs'
 import { latestByTarget, loadCaseScans } from '../scanHistory'
 import { useAutoCollapseOnce, useCollapsible } from '../collapsible'
 import { inputBase } from '../formStyles'
 import { toAbsoluteUrl } from '../url'
-import { emptyProgress, runTrackedScan, type TrackedScan } from '../scanProgress'
+import { emptyProgress, runTrackedScan, type TrackedScan, runBatch, stopTrackedScan, useScanBatch, stopAllScans } from '../scanProgress'
 import { SeverityTiles, ModuleResultsList, totalFindingsOf, hasSevereFindings } from './ScanModuleResults'
 
 import { ScanErrorNotice } from './ScanErrorNotice'
+import { useScanSpeed } from './scanSpeed'
 
 type TargetScanState = TrackedScan<CsrfScanResponse>
 
@@ -32,6 +33,7 @@ export function Csrf({ caseId, targets, credentials }: { caseId: string; targets
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [manualTarget, setManualTarget] = useState('')
   const [scans, setScans] = useState<Record<string, TargetScanState>>({})
+  const batch = useScanBatch()
   const [credentialId, setCredentialId] = useState<string | undefined>()
   const [recursionDepth, setRecursionDepth] = useState(1)
   const [maxPages, setMaxPages] = useState(25)
@@ -52,7 +54,7 @@ export function Csrf({ caseId, targets, credentials }: { caseId: string; targets
       if (restored.length === 0) return
       setScans((prev) => {
         const next = { ...prev }
-        for (const r of restored) if (!next[r.scan.target]) next[r.scan.target] = { status: 'done', result: r.data }
+        for (const r of restored) if (!next[r.scan.target]) next[r.scan.target] = { status: 'done', result: r.data, scanId: r.scan.id }
         return next
       })
     })
@@ -65,20 +67,33 @@ export function Csrf({ caseId, targets, credentials }: { caseId: string; targets
   const runTargets = useMemo(() => [...new Set([...selected, ...manualTargets])], [selected, manualTargets])
 
   const running = Object.values(scans).some((s) => s.status === 'running')
-  const canRun = runTargets.length > 0 && !running
+  // stopScan stops one target's running scan. Its card settles itself once the
+  // server's terminal event arrives.
+  const stopScan = (t: string) => stopTrackedScan(scans[t])
+  const speed = useScanSpeed()
+  const canRun = runTargets.length > 0 && !running && speed.rps !== null
 
   const runScan = () => {
     if (!canRun) return
     const list = runTargets
     setScans(Object.fromEntries(list.map((t) => [t, { status: 'running' as const, progress: emptyProgress() }])))
-    for (const t of list) runOneScan(t)
+    // One signal covers the whole batch, so Stop all reaches targets not yet started.
+    const signal = batch.begin()
+    runBatch(list, (t) => runOneScan(t, signal))
+  }
+
+  // retryScan restarts one failed target's scan in place: its card goes back to
+  // running and the scan runs again, while the other targets keep going.
+  const retryScan = (targetValue: string) => {
+    setScans((prev) => ({ ...prev, [targetValue]: { status: 'running' as const, progress: emptyProgress() } }))
+    void runOneScan(targetValue, batch.current())
   }
 
   // runOneScan streams this target's run into its card, and lands the full
   // result once it finishes.
-  const runOneScan = (targetValue: string) =>
+  const runOneScan = (targetValue: string, signal?: AbortSignal) =>
     runTrackedScan<CsrfScanResponse>(
-      () => api.csrfScan({
+      () => api.csrfScan({ requestsPerSecond: speed.rps ?? undefined,
         url: toAbsoluteUrl(targetValue),
         recursionDepth,
         maxPages,
@@ -89,7 +104,15 @@ export function Csrf({ caseId, targets, credentials }: { caseId: string; targets
         apiBody: apiUrl.trim() ? apiBody : undefined,
       }),
       (update) => setScans((prev) => (prev[targetValue] ? { ...prev, [targetValue]: update(prev[targetValue]) } : prev)),
+      signal,
     )
+
+  // stopAll ends the whole batch: targets not yet started are skipped, and
+  // every running target is cancelled.
+  const stopAll = () => {
+    batch.stop()
+    setScans((prev) => stopAllScans(prev))
+  }
 
   const runLabel = runTargets.length > 1 ? `Run (${runTargets.length})` : 'Run'
 
@@ -160,6 +183,10 @@ export function Csrf({ caseId, targets, credentials }: { caseId: string; targets
             />
           </label>
         </div>
+
+
+        {speed.control}
+
 
         <CredentialPicker credentials={credentials} selected={credentialId} onSelect={setCredentialId} />
 
@@ -240,7 +267,7 @@ export function Csrf({ caseId, targets, credentials }: { caseId: string; targets
               </div>
             )}
             {hasScans && (
-              <BatchResultsPanel entries={Object.entries(scans)} getSummary={csrfSummary} getProgress={(scan) => scan.progress} renderCard={(t, scan) => <TargetScanCard target={t} scan={scan} />} />
+              <BatchResultsPanel entries={Object.entries(scans)} getSummary={csrfSummary} getProgress={(scan) => scan.progress} onRetry={retryScan} onStop={stopScan} onStopAll={stopAll} renderCard={(t, scan) => <TargetScanCard target={t} scan={scan} />} />
             )}
           </>
         )}
@@ -250,8 +277,9 @@ export function Csrf({ caseId, targets, credentials }: { caseId: string; targets
 }
 
 function csrfSummary(scan: TargetScanState): BatchResultSummary {
+  if (scan.status === 'cancelled') return stoppedSummary
   if (scan.status === 'running') return { label: 'Running…', tone: 'neutral', running: true }
-  if (scan.status === 'error') return { label: 'Error', tone: 'danger' }
+  if (scan.status === 'error') return { label: 'Error', tone: 'danger', failed: true }
   const modules = scan.result?.modules ?? []
   const total = totalFindingsOf(modules)
   if (total === 0) return { label: 'Clean', tone: 'clean' }
@@ -262,6 +290,7 @@ const SCAN_STATUS_STYLES: Record<TargetScanState['status'], { label: string; cls
   running: { label: 'Running…', cls: 'border-amber-700 bg-amber-950/40 text-amber-300' },
   done: { label: 'Done', cls: 'border-emerald-700 bg-emerald-950/40 text-emerald-300' },
   error: { label: 'Failed', cls: 'border-red-700 bg-red-950/40 text-red-300' },
+  cancelled: { label: 'Stopped', cls: 'border-neutral-700 bg-neutral-900 text-neutral-400' },
 }
 
 function ScanStatusBadge({ status }: { status: TargetScanState['status'] }) {

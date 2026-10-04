@@ -16,10 +16,29 @@ export interface RestoredScan<T> {
 // "Scans" history tab. Rows whose data fails to parse (or fails to fetch)
 // are skipped rather than failing the whole restore.
 export async function loadCaseScans<T>(caseId: string, tool: ScanTool): Promise<RestoredScan<T>[]> {
-  if (!caseId) return []
+  const page = await loadCaseScansPage<T>(caseId, tool)
+  return page.items
+}
+
+// CaseScansPage is one slice of a case's scan history: the parsed rows that
+// were fetched in full, plus how many rows the case has for that tool in
+// total, so a caller can show "N of total" and offer to load the rest.
+export interface CaseScansPage<T> {
+  items: RestoredScan<T>[]
+  total: number
+}
+
+// loadCaseScansPage is loadCaseScans with an optional limit. The list call
+// is one cheap request that already returns every row's metadata, but each
+// row's full record costs its own GET -- so when limit is set, only the
+// newest `limit` rows get that per-row fetch. Omit limit to fetch them all.
+export async function loadCaseScansPage<T>(caseId: string, tool: ScanTool, limit?: number): Promise<CaseScansPage<T>> {
+  if (!caseId) return { items: [], total: 0 }
   const list = await api.listCaseScans(caseId, tool)
+  // list is most recent first, so slicing keeps the newest rows.
+  const wanted = limit === undefined ? list : list.slice(0, limit)
   const full = await Promise.all(
-    list.map(async (s) => {
+    wanted.map(async (s) => {
       try {
         return await api.getCaseScan(s.id)
       } catch {
@@ -27,16 +46,16 @@ export async function loadCaseScans<T>(caseId: string, tool: ScanTool): Promise<
       }
     }),
   )
-  const out: RestoredScan<T>[] = []
+  const items: RestoredScan<T>[] = []
   for (const f of full) {
     if (!f || !f.data) continue
     try {
-      out.push({ scan: f, data: JSON.parse(f.data) as T })
+      items.push({ scan: f, data: JSON.parse(f.data) as T })
     } catch {
       // skip an unparseable row rather than breaking the whole restore
     }
   }
-  return out
+  return { items, total: list.length }
 }
 
 // latestByTarget keeps only the newest row per distinct target value --

@@ -47,7 +47,9 @@ func newCallbackServer(t *testing.T, reg *collaborator.Registry) *httptest.Serve
 
 // newTargetServer emulates the vulnerable shapes under test, one per route:
 //   - /host: builds its redirect from the Host header (the bfgs.nl case)
-//   - /fwd: builds its redirect from X-Forwarded-Host
+//   - /fwd: builds its redirect from X-Forwarded-Host, keeping the whole value
+//   - /fwdstrip: builds its redirect from X-Forwarded-Host's host alone, dropping
+//     any path the proxy-supplied value carried
 //   - /ref: redirects back to the Referer
 //   - /login?next=: a naive filter that rejects "http(s)://" and "//" but
 //     trusts everything else -- the shape browser normalization bypasses
@@ -67,6 +69,16 @@ func newTargetServer(t *testing.T) *httptest.Server {
 		case r.URL.Path == "/fwd":
 			if xfh := r.Header.Get("X-Forwarded-Host"); xfh != "" {
 				w.Header().Set("Location", "https://"+xfh+"/home")
+				w.WriteHeader(http.StatusFound)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		case r.URL.Path == "/fwdstrip":
+			if xfh := r.Header.Get("X-Forwarded-Host"); xfh != "" {
+				// Keeps only the part before the first "/", as an app that
+				// parses the header as a bare host would.
+				host, _, _ := strings.Cut(xfh, "/")
+				w.Header().Set("Location", "https://"+host+"/home")
 				w.WriteHeader(http.StatusFound)
 				return
 			}
@@ -193,6 +205,68 @@ func TestForwardedHostRedirectConfirmed(t *testing.T) {
 	}
 }
 
+// TestForwardedHostRedirectKeepsIdentifierPath covers an app that echoes the
+// whole X-Forwarded-Host value into its redirect. The redirect itself carries
+// the probe's identifier, so the confirming hop is the redirect the target
+// sent, not a URL the scanner built.
+func TestForwardedHostRedirectKeepsIdentifierPath(t *testing.T) {
+	reg := collaborator.NewRegistry()
+	cb := newCallbackServer(t, reg)
+	target := newTargetServer(t)
+
+	res := runAgainst(t, target.URL+"/fwd", cb, reg, true)
+	got := findingsIn(t, res, "forwarded-host")
+	if len(got) != 1 {
+		t.Fatalf("forwarded-host findings = %d, want 1", len(got))
+	}
+	f := got[0]
+	if strings.Contains(f.Detail, "rebuilt") || strings.Contains(f.Detail, "did not keep") {
+		t.Errorf("detail should not say the scanner rebuilt the callback: %q", f.Detail)
+	}
+	// /fwd redirects to the sent value plus "/home", so the confirming hop must
+	// be exactly that redirect target.
+	want := "https://" + f.Request.Headers["X-Forwarded-Host"] + "/home"
+	if got := callbackHop(t, f); got != want {
+		t.Errorf("callback hop = %q, want the redirect's own target %q", got, want)
+	}
+}
+
+// TestForwardedHostRedirectRebuildsDroppedPath covers an app that keeps only the
+// host of X-Forwarded-Host. The redirect loses the identifier, so the scanner
+// requests the callback under it itself, and the finding says so.
+func TestForwardedHostRedirectRebuildsDroppedPath(t *testing.T) {
+	reg := collaborator.NewRegistry()
+	cb := newCallbackServer(t, reg)
+	target := newTargetServer(t)
+
+	res := runAgainst(t, target.URL+"/fwdstrip", cb, reg, true)
+	got := findingsIn(t, res, "forwarded-host")
+	if len(got) != 1 {
+		t.Fatalf("forwarded-host findings = %d, want 1 (%+v)", len(got), got)
+	}
+	f := got[0]
+	if !strings.Contains(f.Detail, "did not keep this probe's identifier path") {
+		t.Errorf("detail %q should say the redirect dropped the identifier path", f.Detail)
+	}
+	if !strings.Contains(f.Chain[len(f.Chain)-1].URL, "/collab/") {
+		t.Errorf("final hop %q should be the rebuilt callback URL", f.Chain[len(f.Chain)-1].URL)
+	}
+}
+
+// callbackHop returns the URL of the confirming hop in f's chain, failing the
+// test if there isn't one.
+func callbackHop(t *testing.T, f Finding) string {
+	t.Helper()
+	// The confirming hop is the last one marked "callback".
+	for i := len(f.Chain) - 1; i >= 0; i-- {
+		if f.Chain[i].Kind == "callback" {
+			return f.Chain[i].URL
+		}
+	}
+	t.Fatalf("chain has no callback hop: %+v", f.Chain)
+	return ""
+}
+
 // TestRefererRedirectConfirmed checks the Referer-bounce shape.
 func TestRefererRedirectConfirmed(t *testing.T) {
 	reg := collaborator.NewRegistry()
@@ -251,6 +325,59 @@ func TestFollowRedirectsControlsChainConfirmation(t *testing.T) {
 	}
 	if off.FollowRedirects {
 		t.Errorf("result should report FollowRedirects=false")
+	}
+}
+
+// TestFindingCarriesTimedChain checks that a confirmed finding records every
+// request from the probe to the callback: the probe, each followed redirect,
+// and the confirming callback request, in order, with status codes and
+// timings. The /hop -> /landing route is a two-step chain, so the expected
+// shape is probe (302) -> redirect (302) -> callback (200).
+func TestFindingCarriesTimedChain(t *testing.T) {
+	reg := collaborator.NewRegistry()
+	cb := newCallbackServer(t, reg)
+	target := newTargetServer(t)
+
+	res := runAgainst(t, target.URL+"/hop?next=/home", cb, reg, true)
+	findings := findingsIn(t, res, "absolute-url")
+	if len(findings) != 1 {
+		t.Fatalf("want 1 absolute-url finding, got %d", len(findings))
+	}
+	chain := findings[0].Chain
+	if len(chain) != 3 {
+		t.Fatalf("want 3 hops (probe, redirect, callback), got %d: %+v", len(chain), chain)
+	}
+
+	wantKinds := []string{"probe", "redirect", "callback"}
+	wantStatus := []int{http.StatusFound, http.StatusFound, http.StatusOK}
+	for i, h := range chain {
+		if h.Step != i+1 {
+			t.Errorf("hop %d: Step = %d, want %d", i, h.Step, i+1)
+		}
+		if h.Kind != wantKinds[i] {
+			t.Errorf("hop %d: Kind = %q, want %q", i, h.Kind, wantKinds[i])
+		}
+		if h.StatusCode != wantStatus[i] {
+			t.Errorf("hop %d: StatusCode = %d, want %d", i, h.StatusCode, wantStatus[i])
+		}
+		if h.Method != http.MethodGet {
+			t.Errorf("hop %d: Method = %q, want GET", i, h.Method)
+		}
+		if h.DurationMs < 0 {
+			t.Errorf("hop %d: DurationMs = %v, want >= 0", i, h.DurationMs)
+		}
+		if i > 0 && h.OffsetMs < chain[i-1].OffsetMs {
+			t.Errorf("hop %d: OffsetMs %v went backwards from %v", i, h.OffsetMs, chain[i-1].OffsetMs)
+		}
+	}
+	if chain[0].OffsetMs != 0 {
+		t.Errorf("probe hop OffsetMs = %v, want 0", chain[0].OffsetMs)
+	}
+	if chain[1].Location == "" {
+		t.Errorf("redirect hop should record its Location")
+	}
+	if !strings.Contains(chain[2].URL, hostOf(cb)) {
+		t.Errorf("callback hop URL %q should point at the callback host %s", chain[2].URL, hostOf(cb))
 	}
 }
 
@@ -410,5 +537,124 @@ func TestSharedTokenDoesNotLeakEarlierHits(t *testing.T) {
 	}
 	if n := totalFindings(scan(clean.URL + "/")); n != 0 {
 		t.Errorf("second scan inherited %d finding(s) from the first scan's hit, want 0", n)
+	}
+}
+
+// shrinkBaselineTuning makes the baseline's timeout and retry pause short for
+// one test, and restores the production values when the test ends.
+func shrinkBaselineTuning(t *testing.T, timeout time.Duration) {
+	t.Helper()
+	oldTimeout, oldPause := baselineTimeout, baselineRetryPause
+	baselineTimeout, baselineRetryPause = timeout, time.Millisecond
+	t.Cleanup(func() { baselineTimeout, baselineRetryPause = oldTimeout, oldPause })
+}
+
+// TestTesterRequestCarriesCallbackURL checks that a hostOnly finding hands the
+// Tester the callback URL under the probe's identifier, with the probe's full
+// header set, and that the probe's own request is still on the chain.
+func TestTesterRequestCarriesCallbackURL(t *testing.T) {
+	reg := collaborator.NewRegistry()
+	cb := newCallbackServer(t, reg)
+	target := newTargetServer(t)
+
+	res := runAgainst(t, target.URL+"/fwd", cb, reg, true)
+	got := findingsIn(t, res, "forwarded-host")
+	if len(got) != 1 {
+		t.Fatalf("forwarded-host findings = %d, want 1", len(got))
+	}
+	f := got[0]
+	if f.Request == nil {
+		t.Fatal("finding has no Request for Send to Tester")
+	}
+	if f.Request.Headers["X-Forwarded-Host"] == "" {
+		t.Errorf("Tester headers %v should include X-Forwarded-Host", f.Request.Headers)
+	}
+	if f.Request.Headers["User-Agent"] == "" {
+		t.Errorf("Tester headers %v should include the User-Agent the probe sent", f.Request.Headers)
+	}
+
+	// The URL handed to the Tester must be the callback hop that confirmed the
+	// hit, not the target.
+	var callbackURL string
+	for _, h := range f.Chain {
+		if h.Kind == "callback" {
+			callbackURL = h.URL
+		}
+	}
+	if callbackURL == "" {
+		t.Fatalf("chain has no callback hop: %+v", f.Chain)
+	}
+	if f.Request.URL != callbackURL {
+		t.Errorf("Tester URL = %q, want the callback hop URL %q", f.Request.URL, callbackURL)
+	}
+	if !strings.Contains(f.Request.URL, "/collab/") {
+		t.Errorf("Tester URL %q should contain the callback path /collab/", f.Request.URL)
+	}
+}
+
+// TestBaselineRetriesThenSucceeds stalls the first two baseline attempts past
+// the per-attempt timeout and expects the third to succeed.
+func TestBaselineRetriesThenSucceeds(t *testing.T) {
+	shrinkBaselineTuning(t, 200*time.Millisecond)
+
+	var baselineHits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("aperture-openredirect-baseline") != "1" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		// The first two baseline attempts hang until the client gives up.
+		if baselineHits.Add(1) <= 2 {
+			select {
+			case <-r.Context().Done():
+			case <-time.After(5 * time.Second):
+			}
+			return
+		}
+		// Headers must be set before WriteHeader, or the Location is dropped.
+		w.Header().Set("Location", "/home")
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer srv.Close()
+
+	stats := &runStats{}
+	res, err := baselineRequest(context.Background(), srv.URL+"/?aperture-openredirect-baseline=1", nil, stats)
+	if err != nil {
+		t.Fatalf("baselineRequest: %v", err)
+	}
+	if baselineHits.Load() != 3 {
+		t.Errorf("baseline attempts = %d, want 3", baselineHits.Load())
+	}
+	// The two stalled attempts are timeouts, the third succeeded.
+	if stats.requests.Load() != 3 || stats.timedOut.Load() != 2 {
+		t.Errorf("stats = %d requests, %d timed out; want 3 and 2", stats.requests.Load(), stats.timedOut.Load())
+	}
+	if res.StatusCode != http.StatusFound || res.Location != "/home" {
+		t.Errorf("baseline = %d %q, want 302 /home", res.StatusCode, res.Location)
+	}
+}
+
+// TestBaselineFailureDoesNotAbortRun makes every baseline attempt fail and
+// expects the run to still finish, with the failure recorded on the baseline.
+func TestBaselineFailureDoesNotAbortRun(t *testing.T) {
+	shrinkBaselineTuning(t, 200*time.Millisecond)
+
+	// Port 1 refuses connections, so every attempt fails straight away. With no
+	// callback base the run returns right after the baseline, so no probes are
+	// sent at the dead host.
+	res, err := Run(context.Background(), Request{
+		URL: "http://127.0.0.1:1/endpoint",
+	})
+	if err != nil {
+		t.Fatalf("Run returned error, want it to continue: %v", err)
+	}
+	if res.Baseline.Error == "" {
+		t.Error("Baseline.Error should explain the failed baseline")
+	}
+	if res.Baseline.StatusCode != 0 {
+		t.Errorf("Baseline.StatusCode = %d, want 0 when the baseline failed", res.Baseline.StatusCode)
+	}
+	if len(res.Modules) == 0 {
+		t.Error("run should still report its modules after a failed baseline")
 	}
 }

@@ -30,8 +30,9 @@ type Server struct {
 	// cancelMu guards jobCancels, populated while a job (engine-backed or
 	// identify) is in flight so handleCancelJob can stop it on demand --
 	// see cancel.go.
-	cancelMu   sync.Mutex
-	jobCancels map[string]context.CancelFunc
+	cancelMu    sync.Mutex
+	jobCancels  map[string]context.CancelFunc
+	scanCancels map[string]context.CancelFunc
 
 	// screenshotSem bounds how many headless-Chrome screenshot captures run
 	// concurrently across the whole server (see captureScreenshot in
@@ -86,7 +87,14 @@ type Server struct {
 	collab        *collaborator.Registry
 	collabMu      sync.Mutex
 	collabDNSStop func()
+	// collabListenAddr is the -collab-addr the callback listener binds, used
+	// to build callback URLs when no callbackBase is configured.
+	collabListenAddr string
 }
+
+// SetCollabListenAddr records the address the callback-only listener binds
+// (see CallbackHandler), so callback URLs point at its port.
+func (s *Server) SetCollabListenAddr(addr string) { s.collabListenAddr = addr }
 
 // maxConcurrentScreenshots is screenshotSem's capacity.
 const maxConcurrentScreenshots = 4
@@ -107,6 +115,7 @@ func NewServer(st *store.Store, eng *engine.Engine, uiFS fs.FS, wordlistsDir str
 		mux:                 http.NewServeMux(),
 		wordlistsDir:        wordlistsDir,
 		jobCancels:          map[string]context.CancelFunc{},
+		scanCancels:         map[string]context.CancelFunc{},
 		screenshotSem:       make(chan struct{}, maxConcurrentScreenshots),
 		techSem:             make(chan struct{}, maxConcurrentTechLookups),
 		pendingProbeScans:   map[string]pendingProbeScan{},
@@ -115,6 +124,10 @@ func NewServer(st *store.Store, eng *engine.Engine, uiFS fs.FS, wordlistsDir str
 		pendingScans:        map[string]streamedScan{},
 		collab:              collaborator.NewRegistry(),
 	}
+
+	// Every HTTP exchange a source node makes is kept in the request log under
+	// its run and node, so "Inspect requests" can show it after the scan.
+	eng.SetExchangeSink(requestLogSink(st))
 
 	// Resume the DNS listener across a restart if it was previously
 	// configured -- best-effort, same posture as every other background
@@ -154,6 +167,7 @@ func NewServer(st *store.Store, eng *engine.Engine, uiFS fs.FS, wordlistsDir str
 	s.mux.HandleFunc("GET /api/cases/{id}/screenshots/{target}", s.requireAuth(s.handleGetCaseScreenshot))
 	s.mux.HandleFunc("GET /api/cases/{id}/scans", s.requireAuth(s.handleListCaseScans))
 	s.mux.HandleFunc("GET /api/scans/{id}", s.requireAuth(s.handleGetCaseScan))
+	s.mux.HandleFunc("POST /api/scans/{id}/cancel", s.requireAuth(s.handleCancelScan))
 
 	s.mux.HandleFunc("GET /api/cases/{id}/credentials", s.requireAuth(s.handleListCredentials))
 	s.mux.HandleFunc("POST /api/cases/{id}/credentials", s.requireAuth(s.handleAddCredential))
@@ -194,6 +208,8 @@ func NewServer(st *store.Store, eng *engine.Engine, uiFS fs.FS, wordlistsDir str
 	s.mux.HandleFunc("GET /api/runs/{id}", s.requireAuth(s.handleGetRun))
 	s.mux.HandleFunc("GET /api/runs/{id}/findings", s.requireAuth(s.handleListFindings))
 	s.mux.HandleFunc("PATCH /api/findings/{id}/triage", s.requireAuth(s.handleUpdateFindingTriage))
+	s.mux.HandleFunc("GET /api/runs/{id}/nodes/{nodeId}/requests", s.requireAuth(s.handleListNodeRequests))
+	s.mux.HandleFunc("GET /api/runs/{id}/nodes/{nodeId}/requests/{requestId}", s.requireAuth(s.handleGetNodeRequest))
 
 	s.mux.HandleFunc("POST /api/jwt/scan", s.requireAuth(s.handleJWTScan))
 	s.mux.HandleFunc("GET /api/probe/modules", s.requireAuth(s.handleProbeModules))
@@ -224,6 +240,8 @@ func NewServer(st *store.Store, eng *engine.Engine, uiFS fs.FS, wordlistsDir str
 	s.mux.HandleFunc("POST /api/csrf/scan", s.requireAuth(s.handleCSRF))
 	s.mux.HandleFunc("POST /api/xss/scan", s.requireAuth(s.handleXSSScan))
 	s.mux.HandleFunc("POST /api/sstiscan/scan", s.requireAuth(s.handleSSTIScan))
+	s.mux.HandleFunc("POST /api/pathtraversal/scan", s.requireAuth(s.handlePathTraversal))
+	s.mux.HandleFunc("POST /api/xxe/scan", s.requireAuth(s.handleXXE))
 
 	s.mux.HandleFunc("POST /api/tester/send", s.requireAuth(s.handleTesterSend))
 
@@ -231,6 +249,10 @@ func NewServer(st *store.Store, eng *engine.Engine, uiFS fs.FS, wordlistsDir str
 	// (they're Aperture's own UI talking to itself), but the callback route
 	// below deliberately doesn't -- see handleCollaboratorCallback.
 	s.mux.HandleFunc("GET /api/collaborator/config", s.requireAuth(s.handleGetCollaboratorConfig))
+	s.mux.HandleFunc("GET /api/collaborator/addresses", s.requireAuth(s.handleCollaboratorAddresses))
+	s.mux.HandleFunc("GET /api/collaborator/tls", s.requireAuth(s.handleGetCollabTLS))
+	s.mux.HandleFunc("PUT /api/collaborator/tls", s.requireAuth(s.handleSetCollabTLS))
+	s.mux.HandleFunc("POST /api/collaborator/tls/regenerate", s.requireAuth(s.handleRegenerateCollabTLS))
 	s.mux.HandleFunc("PUT /api/collaborator/config", s.requireAuth(s.handleSetCollaboratorConfig))
 	s.mux.HandleFunc("POST /api/collaborator/new", s.requireAuth(s.handleCollaboratorNew))
 	s.mux.HandleFunc("GET /api/collaborator/poll", s.requireAuth(s.handleCollaboratorPoll))
@@ -238,8 +260,6 @@ func NewServer(st *store.Store, eng *engine.Engine, uiFS fs.FS, wordlistsDir str
 	s.mux.HandleFunc("DELETE /api/collaborator/active", s.requireAuth(s.handleRemoveActiveCallbackServer))
 	s.mux.HandleFunc("POST /api/collaborator/webhooksite/new", s.requireAuth(s.handleWebhookSiteNew))
 	s.mux.HandleFunc("GET /api/collaborator/webhooksite/poll", s.requireAuth(s.handleWebhookSitePoll))
-	s.mux.HandleFunc("/collab/{token}", s.handleCollaboratorCallback)
-	s.mux.HandleFunc("/collab/{token}/{path...}", s.handleCollaboratorCallback)
 
 	if uiFS != nil {
 		s.mux.Handle("/", spaHandler(uiFS))
@@ -248,7 +268,41 @@ func NewServer(st *store.Store, eng *engine.Engine, uiFS fs.FS, wordlistsDir str
 	return s
 }
 
-func (s *Server) Handler() http.Handler { return withLogging(s.mux) }
+// maxRequestBody caps how many bytes any request body may send. Every JSON
+// endpoint decodes straight from r.Body, so without a cap one oversized POST
+// could make the server buffer unbounded memory. No endpoint takes uploads
+// (no multipart handling anywhere), so one ceiling covers them all.
+const maxRequestBody = 10 << 20
+
+// Handler returns the full HTTP handler: the route mux, wrapped so every
+// request body is capped at maxRequestBody.
+func (s *Server) Handler() http.Handler {
+	return withLogging(limitBody(s.mux))
+}
+
+// limitBody wraps next so each request body is read through
+// http.MaxBytesReader. Reads past maxRequestBody fail, and the server closes
+// the connection rather than buffering the rest.
+func limitBody(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// CallbackHandler serves only the unauthenticated /collab/{token} routes, on
+// its own mux. main runs it on a separate listener (see -collab-addr) that can
+// bind a LAN/public interface, so targets and the internet can reach callbacks
+// without exposing the login-protected UI and API on that same interface.
+// Everything else 404s.
+func (s *Server) CallbackHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/collab/{token}", s.handleCollaboratorCallback)
+	mux.HandleFunc("/collab/{token}/{path...}", s.handleCollaboratorCallback)
+	return withLogging(mux)
+}
 
 func withLogging(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

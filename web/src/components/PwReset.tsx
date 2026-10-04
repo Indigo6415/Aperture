@@ -4,7 +4,7 @@ import type { Credential, ProbeSeverity, PwResetFinding, PwResetModuleResult, Pw
 import { CollapsibleFormPanel } from './CollapsibleFormPanel'
 import { TargetPicker } from './TargetPicker'
 import { CredentialPicker } from './CredentialPicker'
-import { BatchResultsPanel, type BatchResultSummary } from './BatchResultsPanel'
+import { BatchResultsPanel, stoppedSummary, type BatchResultSummary } from './BatchResultsPanel'
 import { ScanHistoryPanel } from './ScanHistoryPanel'
 import { ScanWindowTabs } from './ScanWindowTabs'
 import { latestByTarget, loadCaseScans } from '../scanHistory'
@@ -12,13 +12,14 @@ import { CopyButton } from './CopyButton'
 import { useAutoCollapseOnce, useCollapsible } from '../collapsible'
 import { inputBase } from '../formStyles'
 import { toAbsoluteUrl } from '../url'
-import { emptyProgress, runTrackedScan, type TrackedScan } from '../scanProgress'
+import { emptyProgress, runTrackedScan, type TrackedScan, runBatch, stopTrackedScan, useScanBatch, stopAllScans } from '../scanProgress'
 import { SEVERITY_META, SEVERITY_ORDER } from '../severityColor'
 import { sendToTester } from '../testerHandoff'
 
 // TargetScanState is one endpoint's place in a (possibly multi-target) run
 // -- same shape/reasoning as Bypass403.tsx's TargetScanState.
 import { ScanErrorNotice } from './ScanErrorNotice'
+import { useScanSpeed } from './scanSpeed'
 
 type TargetScanState = TrackedScan<PwResetResponse>
 
@@ -45,6 +46,7 @@ export function PwReset({
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [manualTarget, setManualTarget] = useState('')
   const [scans, setScans] = useState<Record<string, TargetScanState>>({})
+  const batch = useScanBatch()
   const [credentialId, setCredentialId] = useState<string | undefined>()
 
   const [method, setMethod] = useState<'POST' | 'GET'>('POST')
@@ -73,7 +75,7 @@ export function PwReset({
       if (restored.length === 0) return
       setScans((prev) => {
         const next = { ...prev }
-        for (const r of restored) if (!next[r.scan.target]) next[r.scan.target] = { status: 'done', result: r.data }
+        for (const r of restored) if (!next[r.scan.target]) next[r.scan.target] = { status: 'done', result: r.data, scanId: r.scan.id }
         return next
       })
     })
@@ -86,7 +88,11 @@ export function PwReset({
   const runTargets = useMemo(() => [...new Set([...selected, ...manualTargets])], [selected, manualTargets])
 
   const running = Object.values(scans).some((s) => s.status === 'running')
-  const canRun = runTargets.length > 0 && !running
+  // stopScan stops one target's running scan. Its card settles itself once the
+  // server's terminal event arrives.
+  const stopScan = (t: string) => stopTrackedScan(scans[t])
+  const speed = useScanSpeed()
+  const canRun = runTargets.length > 0 && !running && speed.rps !== null
 
   const addExtraFieldRow = () => setExtraFieldRows((rows) => [...rows, { name: '', value: '' }])
   const updateExtraFieldRow = (i: number, patch: Partial<ExtraFieldRow>) =>
@@ -97,17 +103,26 @@ export function PwReset({
     if (!canRun) return
     const list = runTargets
     setScans(Object.fromEntries(list.map((t) => [t, { status: 'running' as const, progress: emptyProgress() }])))
-    for (const t of list) runOneScan(t)
+    // One signal covers the whole batch, so Stop all reaches targets not yet started.
+    const signal = batch.begin()
+    runBatch(list, (t) => runOneScan(t, signal))
+  }
+
+  // retryScan restarts one failed target's scan in place: its card goes back to
+  // running and the scan runs again, while the other targets keep going.
+  const retryScan = (targetValue: string) => {
+    setScans((prev) => ({ ...prev, [targetValue]: { status: 'running' as const, progress: emptyProgress() } }))
+    void runOneScan(targetValue, batch.current())
   }
 
   // runOneScan streams this target's run into its card, and lands the full
   // result once it finishes.
-  const runOneScan = (targetValue: string) => {
+  const runOneScan = (targetValue: string, signal?: AbortSignal) => {
     // Extra form fields are only sent when a row has a name, so a half-filled
     // row doesn't submit an empty field name.
     const extraFields = Object.fromEntries(extraFieldRows.filter((r) => r.name.trim()).map((r) => [r.name.trim(), r.value]))
     return runTrackedScan<PwResetResponse>(
-      () => api.pwReset({
+      () => api.pwReset({ requestsPerSecond: speed.rps ?? undefined,
         // A target picked from the case list (or typed bare) has no scheme
         // -- pwreset.Run rejects that outright, same normalization as
         // Bypass403.tsx/SecretScan.tsx.
@@ -123,7 +138,15 @@ export function PwReset({
         caseId,
       }),
       (update) => setScans((prev) => (prev[targetValue] ? { ...prev, [targetValue]: update(prev[targetValue]) } : prev)),
+      signal,
     )
+  }
+
+  // stopAll ends the whole batch: targets not yet started are skipped, and
+  // every running target is cancelled.
+  const stopAll = () => {
+    batch.stop()
+    setScans((prev) => stopAllScans(prev))
   }
 
   const runLabel = runTargets.length > 1 ? `Run (${runTargets.length})` : 'Run'
@@ -131,7 +154,7 @@ export function PwReset({
   return (
     <div className="flex h-full flex-col gap-4 overflow-y-auto p-6">
       <CollapsibleFormPanel
-        title="Password Reset Scanner"
+        title="Password Reset"
         open={formOpen}
         onToggle={() => setFormOpen(!formOpen)}
         summary={runTargets.length > 0 ? `${runTargets.length} target${runTargets.length === 1 ? '' : 's'} queued` : 'No targets selected'}
@@ -141,7 +164,7 @@ export function PwReset({
         runLabel={runLabel}
       >
         <div>
-          <h1 className="text-sm font-semibold uppercase tracking-wide text-neutral-400">Password Reset Scanner</h1>
+          <h1 className="text-sm font-semibold uppercase tracking-wide text-neutral-400">Password Reset</h1>
           <p className="mt-1 text-xs text-neutral-500">
             Submits a "forgot password" endpoint's own request-reset form, then checks it for Host-header reset-link
             poisoning, a reset token/link leaked straight into the response, missing rate limiting, and -- when a known
@@ -218,6 +241,10 @@ export function PwReset({
             className={`mt-1 ${inputBase}`}
           />
         </label>
+
+
+        {speed.control}
+
 
         <CredentialPicker credentials={credentials} selected={credentialId} onSelect={setCredentialId} />
 
@@ -329,6 +356,7 @@ export function PwReset({
                 entries={Object.entries(scans)}
                 getSummary={pwResetSummary}
                 getProgress={(scan) => scan.progress}
+                onRetry={retryScan} onStop={stopScan} onStopAll={stopAll}
                 renderCard={(t, scan) => <TargetScanCard target={t} scan={scan} />}
               />
             )}
@@ -343,8 +371,9 @@ export function PwReset({
 // covers more than BatchResultsPanel's threshold -- mirrors Probe.tsx's
 // probeScanSummary.
 function pwResetSummary(scan: TargetScanState): BatchResultSummary {
+  if (scan.status === 'cancelled') return stoppedSummary
   if (scan.status === 'running') return { label: 'Running…', tone: 'neutral', running: true }
-  if (scan.status === 'error') return { label: 'Error', tone: 'danger' }
+  if (scan.status === 'error') return { label: 'Error', tone: 'danger', failed: true }
   const modules = scan.result?.modules ?? []
   const total = modules.reduce((n, m) => n + m.findings.length, 0)
   if (total === 0) return { label: 'Clean', tone: 'clean' }
@@ -356,6 +385,7 @@ const SCAN_STATUS_STYLES: Record<TargetScanState['status'], { label: string; cls
   running: { label: 'Running…', cls: 'border-amber-700 bg-amber-950/40 text-amber-300' },
   done: { label: 'Done', cls: 'border-emerald-700 bg-emerald-950/40 text-emerald-300' },
   error: { label: 'Failed', cls: 'border-red-700 bg-red-950/40 text-red-300' },
+  cancelled: { label: 'Stopped', cls: 'border-neutral-700 bg-neutral-900 text-neutral-400' },
 }
 
 function ScanStatusBadge({ status }: { status: TargetScanState['status'] }) {

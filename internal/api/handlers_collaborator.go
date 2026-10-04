@@ -1,10 +1,13 @@
 package api
 
 import (
+	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -16,9 +19,10 @@ import (
 // store.GetSetting/SetSetting mechanism as the DNSDumpster/NVD/HIBP API
 // keys in settings.go, just three plain (non-secret) strings instead of one.
 const (
-	settingCollabDomain   = "collaborator_domain"
-	settingCollabAnswerIP = "collaborator_answer_ip"
-	settingCollabDNSAddr  = "collaborator_dns_addr"
+	settingCollabDomain       = "collaborator_domain"
+	settingCollabAnswerIP     = "collaborator_answer_ip"
+	settingCollabDNSAddr      = "collaborator_dns_addr"
+	settingCollabCallbackBase = "collaborator_callback_base"
 )
 
 // collabCallbackBodyLimit caps how much of an inbound callback's body this
@@ -36,9 +40,10 @@ const collabCallbackBodyLimit = 8 << 10 // 8 KiB
 var collabHeaderAllowlist = []string{"User-Agent", "Content-Type", "Content-Length", "Accept", "X-Forwarded-For"}
 
 type collaboratorConfig struct {
-	Domain   string `json:"domain"`
-	AnswerIP string `json:"answerIp"`
-	DNSAddr  string `json:"dnsAddr"`
+	Domain       string `json:"domain"`
+	AnswerIP     string `json:"answerIp"`
+	DNSAddr      string `json:"dnsAddr"`
+	CallbackBase string `json:"callbackBase"`
 }
 
 func (s *Server) loadCollaboratorConfig() collaboratorConfig {
@@ -46,7 +51,81 @@ func (s *Server) loadCollaboratorConfig() collaboratorConfig {
 	cfg.Domain, _, _ = s.store.GetSetting(settingCollabDomain)
 	cfg.AnswerIP, _, _ = s.store.GetSetting(settingCollabAnswerIP)
 	cfg.DNSAddr, _, _ = s.store.GetSetting(settingCollabDNSAddr)
+	cfg.CallbackBase, _, _ = s.store.GetSetting(settingCollabCallbackBase)
 	return cfg
+}
+
+// collabCallbackBase returns the base URL (scheme://host[:port], no trailing
+// slash) that outbound payloads should call back to. An operator-configured
+// callbackBase wins, since it's the only address a target on another network
+// can actually reach (a LAN IP or public IP:port behind a port-forward). With
+// none set, it uses the detected LAN IP and the callback listener's port (see
+// SetCollabListenAddr), since callbacks aren't served on the UI port. If no
+// LAN IP can be detected, it uses the UI request's host with the callback port.
+// If the callback port is unknown, it falls back to the request's own host:port.
+func (s *Server) collabCallbackBase(r *http.Request) string {
+	if base := s.loadCollaboratorConfig().CallbackBase; base != "" {
+		return strings.TrimRight(base, "/")
+	}
+	port := portOf(s.collabListenAddr)
+	if port == "" {
+		return fmt.Sprintf("%s://%s", schemeOf(r), r.Host)
+	}
+	host := ""
+	if lan, err := collaborator.LocalIPv4(); err == nil {
+		host = lan
+	} else if h, _, err := net.SplitHostPort(r.Host); err == nil {
+		host = h
+	} else {
+		host = r.Host
+	}
+	return fmt.Sprintf("%s://%s", schemeOf(r), net.JoinHostPort(host, port))
+}
+
+// collabAddressesResponse lists the callback addresses Aperture can detect
+// automatically, so the operator can pick one instead of typing it.
+type collabAddressesResponse struct {
+	LocalIP     string `json:"localIp"`
+	LocalBase   string `json:"localBase"`
+	PublicIP    string `json:"publicIp"`
+	PublicBase  string `json:"publicBase"`
+	CollabPort  string `json:"collabPort"`
+	PublicError string `json:"publicError,omitempty"`
+}
+
+// handleCollaboratorAddresses detects this host's LAN IP (from its network
+// interfaces) and public IP (from an external lookup service, cached), and
+// returns ready-to-use callback base URLs for each. A failed public lookup is
+// reported in publicError rather than as an HTTP error, since the LAN address
+// is still useful on its own.
+func (s *Server) handleCollaboratorAddresses(w http.ResponseWriter, r *http.Request) {
+	port := portOf(s.collabListenAddr)
+	resp := collabAddressesResponse{CollabPort: port}
+
+	if lan, err := collaborator.LocalIPv4(); err == nil {
+		resp.LocalIP = lan
+		resp.LocalBase = fmt.Sprintf("%s://%s", schemeOf(r), net.JoinHostPort(lan, port))
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+	defer cancel()
+	if pub, err := collaborator.PublicIPv4(ctx); err == nil {
+		resp.PublicIP = pub
+		resp.PublicBase = fmt.Sprintf("%s://%s", schemeOf(r), net.JoinHostPort(pub, port))
+	} else {
+		resp.PublicError = err.Error()
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// portOf returns the port part of a host:port listen address, or "" if it
+// can't be parsed.
+func portOf(addr string) string {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return ""
+	}
+	return port
 }
 
 // startCollabDNSLocked (re)starts the DNS half of the collaborator listener
@@ -110,6 +189,7 @@ func (s *Server) handleSetCollaboratorConfig(w http.ResponseWriter, r *http.Requ
 	cfg.Domain = strings.TrimSpace(cfg.Domain)
 	cfg.AnswerIP = strings.TrimSpace(cfg.AnswerIP)
 	cfg.DNSAddr = strings.TrimSpace(cfg.DNSAddr)
+	cfg.CallbackBase = strings.TrimRight(strings.TrimSpace(cfg.CallbackBase), "/")
 
 	if err := s.store.SetSetting(settingCollabDomain, cfg.Domain); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -120,6 +200,10 @@ func (s *Server) handleSetCollaboratorConfig(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	if err := s.store.SetSetting(settingCollabDNSAddr, cfg.DNSAddr); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := s.store.SetSetting(settingCollabCallbackBase, cfg.CallbackBase); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -146,10 +230,57 @@ func (s *Server) handleSetCollaboratorConfig(w http.ResponseWriter, r *http.Requ
 // whether a domain has actually been configured for the DNS side yet (see
 // handleSetCollaboratorConfig).
 type collabNewTokenResponse struct {
-	Token        string `json:"token"`
-	HTTPCallback string `json:"httpCallback"`
-	DNSHostname  string `json:"dnsHostname,omitempty"`
-	DNSAvailable bool   `json:"dnsAvailable"`
+	Token        string             `json:"token"`
+	HTTPCallback string             `json:"httpCallback"`
+	Links        collaborator.Links `json:"links"`
+	DNSHostname  string             `json:"dnsHostname,omitempty"`
+	DNSAvailable bool               `json:"dnsAvailable"`
+}
+
+// collabLinksFor builds the callback URL for token on each network path:
+// localhost (the listener is on 0.0.0.0, so 127.0.0.1 reaches it), the detected
+// LAN IP, and the detected public IP. Paths that can't be detected are left
+// empty. The public lookup is bounded by a short timeout so minting a token
+// never waits long on an external service.
+func (s *Server) collabLinksFor(ctx context.Context, token string) collaborator.Links {
+	port := portOf(s.collabListenAddr)
+	if port == "" {
+		return collaborator.Links{}
+	}
+	// Build http://<host>:<port>/collab/<token>, and the https:// form too when TLS is on.
+	url := func(scheme, host string) string {
+		return fmt.Sprintf("%s://%s/collab/%s", scheme, net.JoinHostPort(host, port), token)
+	}
+	tlsOn := s.collabTLSEnabled()
+	links := collaborator.Links{Localhost: url("http", "127.0.0.1")}
+	if tlsOn {
+		links.LocalhostTLS = url("https", "127.0.0.1")
+	}
+	if lan, err := collaborator.LocalIPv4(); err == nil {
+		links.Private = url("http", lan)
+		if tlsOn {
+			links.PrivateTLS = url("https", lan)
+		}
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if pub, err := collaborator.PublicIPv4(lookupCtx); err == nil {
+		links.Public = url("http", pub)
+		if tlsOn {
+			links.PublicTLS = url("https", pub)
+		}
+	}
+	return links
+}
+
+// CallbackTLSEnabled reports whether the callback listener should accept TLS.
+// Passed to collaborator.Serve so the HTTPS side can be toggled at runtime.
+func (s *Server) CallbackTLSEnabled() bool { return s.collabTLSEnabled() }
+
+// CallbackTLSConfig returns the TLS config for the callback listener. It reads
+// the stored certificate per handshake, so regenerating it takes effect at once.
+func (s *Server) CallbackTLSConfig() *tls.Config {
+	return &tls.Config{GetCertificate: s.collabGetCertificate}
 }
 
 // handleCollaboratorNew mints a fresh OOB token and returns every callback
@@ -163,13 +294,11 @@ func (s *Server) handleCollaboratorNew(w http.ResponseWriter, r *http.Request) {
 	token := s.collab.NewToken()
 	cfg := s.loadCollaboratorConfig()
 
+	links := s.collabLinksFor(r.Context(), token)
 	resp := collabNewTokenResponse{
-		Token: token,
-		// r.Host is this request's own view of where Aperture is reachable
-		// -- correct whether that's a bare IP:port during local testing or a
-		// real hostname once deployed behind one, without needing its own
-		// separate "public address" setting.
-		HTTPCallback: fmt.Sprintf("%s://%s/collab/%s", schemeOf(r), r.Host, token),
+		Token:        token,
+		HTTPCallback: s.collabCallbackBase(r) + "/collab/" + token,
+		Links:        links,
 	}
 	if cfg.Domain != "" {
 		resp.DNSHostname = token + "." + cfg.Domain
@@ -182,6 +311,7 @@ func (s *Server) handleCollaboratorNew(w http.ResponseWriter, r *http.Request) {
 		Label:        "Aperture " + token[:6],
 		HTTPCallback: resp.HTTPCallback,
 		DNSHostname:  resp.DNSHostname,
+		Links:        links,
 		CreatedAt:    time.Now(),
 	})
 
@@ -276,14 +406,22 @@ func (s *Server) handleCollaboratorCallback(w http.ResponseWriter, r *http.Reque
 
 	log.Printf("collaborator: %s hit by %s %s from %s", token, r.Method, r.URL.Path, r.RemoteAddr)
 
+	// A staged document for this path wins, so checks that need the target to
+	// fetch a specific file (jku/x5u) still get it.
 	if contentType, staged, ok := s.collab.Staged(token, strings.TrimPrefix(path, "/")); ok {
 		w.Header().Set("Content-Type", contentType)
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(staged)
 		return
 	}
+	// Every other hit gets the same fixed greeting, as plain text.
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, collabGreeting)
 }
+
+// collabGreeting is the fixed body returned for a plain callback hit.
+const collabGreeting = "HELL YEA BABY!\nHELL YEA BABY!\nHELL YEA BABY!\n"
 
 // splitIdentifier splits a "/collab/{token}/..." route's remaining path
 // (rawPath, without its leading "/") into its leading identifier segment and

@@ -1,18 +1,45 @@
 package api
 
 import (
+	"net"
 	"net/http"
+	"net/url"
 
 	"github.com/gorilla/websocket"
 )
 
-// upgrader allows any origin: the frontend dev server runs on a different
-// port than the backend, so a same-origin check would break local
-// development. Access itself is still gated -- handleWatchJob sits behind
-// requireAuth in server.go, same as every other /api and /ws route, so an
-// upgrade request without a valid session cookie never reaches here.
+// upgrader accepts only same-origin upgrades, or ones from a loopback origin.
+// The loopback case keeps the Vite dev server (a different port than the
+// backend, proxying /ws through) working. Rejecting every other origin stops a
+// page on some other site from opening a socket that rides on the operator's
+// session cookie (cross-site WebSocket hijacking). Access is still gated by
+// requireAuth in server.go, so this is defense in depth.
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
+	CheckOrigin: checkWSOrigin,
+}
+
+// checkWSOrigin reports whether a WebSocket upgrade's Origin header is allowed.
+// A request with no Origin (a non-browser client such as curl) is allowed,
+// since cookies still have to match. Otherwise the origin must name the same
+// host as the request or a loopback address.
+func checkWSOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	if u.Host == r.Host {
+		return true
+	}
+	host := u.Hostname()
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // handleWatchJob streams RunEvents for one job (whatever its tool) to a

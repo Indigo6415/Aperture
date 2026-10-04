@@ -33,6 +33,10 @@ type Finding struct {
 	Method     string `json:"method,omitempty"`
 	StatusCode int    `json:"statusCode,omitempty"`
 	Confidence string `json:"confidence,omitempty"`
+	// Headers and Body are the request headers and body that triggered the
+	// finding, set only by checks that send one (a POST). GET checks leave both empty.
+	Headers map[string]string `json:"headers,omitempty"`
+	Body    string            `json:"body,omitempty"`
 }
 
 // ModuleResult is one check category's outcome, shaped for direct rendering

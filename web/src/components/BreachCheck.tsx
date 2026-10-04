@@ -8,12 +8,13 @@ import { CredentialPicker } from './CredentialPicker'
 import { useAutoCollapseOnce, useCollapsible } from '../collapsible'
 import { inputBase } from '../formStyles'
 import { CopyButton } from './CopyButton'
-import { BatchResultsPanel, type BatchResultSummary } from './BatchResultsPanel'
+import { BatchResultsPanel, stoppedSummary, type BatchResultSummary } from './BatchResultsPanel'
 import { ScanTargetCard } from './ScanTargetCard'
-import { emptyProgress, runTrackedScan, type TrackedScan } from '../scanProgress'
+import { emptyProgress, runTrackedScan, stopAllScans, stopTrackedScan, useScanBatch, type TrackedScan } from '../scanProgress'
 import { ScanHistoryPanel } from './ScanHistoryPanel'
 import { ScanWindowTabs } from './ScanWindowTabs'
 import { latestByTarget, loadCaseScans } from '../scanHistory'
+import { useScanSpeed } from './scanSpeed'
 
 // CrawlTargetState is one target's place in a (possibly multi-target) email
 // crawl -- same shape/reasoning as Probe.tsx's TargetScanState, since this
@@ -76,6 +77,7 @@ export function BreachCheck({ caseId, targets, credentials }: { caseId: string; 
   const [recursionDepth, setRecursionDepth] = useState<(typeof CRAWL_DEPTHS)[number]>(0)
   const [credentialId, setCredentialId] = useState<string | undefined>()
   const [scans, setScans] = useState<Record<string, CrawlTargetState>>({})
+  const crawlBatch = useScanBatch()
 
   const hasScans = Object.keys(scans).length > 0
   const [formOpen, setFormOpen] = useCollapsible('breach.form', true)
@@ -95,7 +97,7 @@ export function BreachCheck({ caseId, targets, credentials }: { caseId: string; 
       if (restored.length === 0) return
       setScans((prev) => {
         const next = { ...prev }
-        for (const r of restored) if (!next[r.scan.target]) next[r.scan.target] = { status: 'done', result: r.data }
+        for (const r of restored) if (!next[r.scan.target]) next[r.scan.target] = { status: 'done', result: r.data, scanId: r.scan.id }
         return next
       })
     })
@@ -109,7 +111,9 @@ export function BreachCheck({ caseId, targets, credentials }: { caseId: string; 
   const manualTargets = useMemo(() => manualTarget.split(/[,\n]+/).map((s) => s.trim()).filter(Boolean), [manualTarget])
   const runTargets = useMemo(() => [...new Set([...selected, ...manualTargets])], [selected, manualTargets])
   const crawling = Object.values(scans).some((s) => s.status === 'running')
-  const canCrawl = runTargets.length > 0 && !crawling
+  // speed.rps is null while a Custom rate is out of range, which blocks the crawl.
+  const speed = useScanSpeed()
+  const canCrawl = runTargets.length > 0 && !crawling && speed.rps !== null
 
   // runCrawl kicks off one independent crawl per target in runTargets --
   // each resolves on its own schedule, same batch pattern as Probe.tsx.
@@ -117,18 +121,31 @@ export function BreachCheck({ caseId, targets, credentials }: { caseId: string; 
     if (!canCrawl) return
     const list = runTargets
     setScans(Object.fromEntries(list.map((t) => [t, { status: 'running' as const, progress: emptyProgress() }])))
-    for (const t of list) runOneCrawl(t)
+    // One signal covers the whole crawl batch, so Stop all reaches every crawl.
+    const signal = crawlBatch.begin()
+    for (const t of list) runOneCrawl(t, signal)
   }
 
   // runOneCrawl streams this target's crawl into its card, and lands the
   // addresses it found once the crawl finishes.
-  const runOneCrawl = (targetValue: string) =>
+  const runOneCrawl = (targetValue: string, signal?: AbortSignal) =>
     runTrackedScan<BreachCrawlResponse>(
       // A target picked from the case list (or typed bare) has no scheme --
       // breach.CrawlForEmails rejects that outright, same as secretscan.Run.
-      () => api.crawlEmails({ url: toAbsoluteUrl(targetValue), recursionDepth, credentialId, caseId }),
+      () => api.crawlEmails({ requestsPerSecond: speed.rps ?? undefined, url: toAbsoluteUrl(targetValue), recursionDepth, credentialId, caseId }),
       (update) => setScans((prev) => (prev[targetValue] ? { ...prev, [targetValue]: update(prev[targetValue]) } : prev)),
+      signal,
     )
+
+  // stopCrawl stops one target's running crawl. Its card settles itself once
+  // the server's terminal event arrives.
+  const stopCrawl = (t: string) => stopTrackedScan(scans[t])
+
+  // stopCrawlAll ends the whole crawl batch: every running crawl is cancelled.
+  const stopCrawlAll = () => {
+    crawlBatch.stop()
+    setScans((prev) => stopAllScans(prev))
+  }
 
   const crawlLabel = runTargets.length > 1 ? `Crawl (${runTargets.length})` : 'Crawl'
 
@@ -247,7 +264,17 @@ export function BreachCheck({ caseId, targets, credentials }: { caseId: string; 
       })
       return
     }
-    const message = outcome.error ?? 'Breach check failed'
+    // A stopped check has neither a result nor an error. Its addresses go back
+    // to unchecked, so they can be checked again, rather than being marked failed.
+    if (!outcome.error) {
+      setChecks((prev) => {
+        const next = { ...prev }
+        for (const e of unique) next[e] = { status: 'idle' }
+        return next
+      })
+      return
+    }
+    const message = outcome.error
     setChecks((prev) => {
       const next = { ...prev }
       for (const e of unique) next[e] = { status: 'error', error: message }
@@ -314,6 +341,8 @@ export function BreachCheck({ caseId, targets, credentials }: { caseId: string; 
           ))}
         </div>
 
+        {speed.control}
+
         <CredentialPicker credentials={credentials} selected={credentialId} onSelect={setCredentialId} />
 
         <button
@@ -343,6 +372,8 @@ export function BreachCheck({ caseId, targets, credentials }: { caseId: string; 
                 entries={Object.entries(scans)}
                 getSummary={crawlSummary}
                 getProgress={(scan) => scan.progress}
+                onStop={stopCrawl}
+                onStopAll={stopCrawlAll}
                 renderCard={(t, scan) => <CrawlTargetCard target={t} scan={scan} />}
               />
             )}
@@ -355,6 +386,7 @@ export function BreachCheck({ caseId, targets, credentials }: { caseId: string; 
                   progress={checkRun.progress}
                   selected={false}
                   onSelect={() => {}}
+                  onStop={() => stopTrackedScan(checkRun)}
                 />
               </div>
             )}
@@ -505,6 +537,7 @@ function BreachCheckHistoryList({ caseId }: { caseId: string }) {
 // those addresses turns up breached, decided later in the email list below.
 function crawlSummary(scan: CrawlTargetState): BatchResultSummary {
   if (scan.status === 'running') return { label: 'Running…', tone: 'neutral', running: true }
+  if (scan.status === 'cancelled') return stoppedSummary
   if (scan.status === 'error') return { label: 'Error', tone: 'danger' }
   const n = scan.result?.emails.length ?? 0
   return n === 0 ? { label: 'No emails', tone: 'clean' } : { label: `${n} email${n === 1 ? '' : 's'}`, tone: 'warn' }
@@ -514,6 +547,7 @@ const CRAWL_STATUS_STYLES: Record<CrawlTargetState['status'], { label: string; c
   running: { label: 'Running…', cls: 'border-amber-700 bg-amber-950/40 text-amber-300' },
   done: { label: 'Done', cls: 'border-emerald-700 bg-emerald-950/40 text-emerald-300' },
   error: { label: 'Failed', cls: 'border-red-700 bg-red-950/40 text-red-300' },
+  cancelled: { label: 'Stopped', cls: 'border-neutral-700 bg-neutral-900 text-neutral-400' },
 }
 
 function CrawlTargetCard({ target, scan }: { target: string; scan: CrawlTargetState }) {
@@ -844,6 +878,7 @@ function BreachRow({ breach: b }: { breach: Breach }) {
 // is in flight, then how many breaches the addresses turned up once it lands.
 function checkSummary(run: TrackedScan<BreachCheckResponse>): BatchResultSummary {
   if (run.status === 'running') return { label: 'Running…', tone: 'neutral', running: true }
+  if (run.status === 'cancelled') return stoppedSummary
   if (run.status === 'error') return { label: 'Error', tone: 'danger' }
   const total = (run.result?.results ?? []).reduce((n, r) => n + (r.breaches?.length ?? 0), 0)
   return total === 0 ? { label: 'Clean', tone: 'clean' } : { label: `${total} breach${total === 1 ? '' : 'es'}`, tone: 'danger' }

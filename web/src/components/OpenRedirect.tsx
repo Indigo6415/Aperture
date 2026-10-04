@@ -5,17 +5,18 @@ import { CollapsibleFormPanel } from './CollapsibleFormPanel'
 import { TargetPicker } from './TargetPicker'
 import { CredentialPicker } from './CredentialPicker'
 import { CallbackPicker } from './CallbackPicker'
-import { BatchResultsPanel, type BatchResultSummary } from './BatchResultsPanel'
+import { BatchResultsPanel, stoppedSummary, type BatchResultSummary } from './BatchResultsPanel'
 import { ScanHistoryPanel } from './ScanHistoryPanel'
 import { ScanWindowTabs } from './ScanWindowTabs'
 import { latestByTarget, loadCaseScans } from '../scanHistory'
 import { useAutoCollapseOnce, useCollapsible } from '../collapsible'
 import { inputBase } from '../formStyles'
 import { toAbsoluteUrl } from '../url'
-import { emptyProgress, runTrackedScan, type TrackedScan } from '../scanProgress'
+import { emptyProgress, runTrackedScan, type TrackedScan, runBatch, stopTrackedScan, useScanBatch, stopAllScans } from '../scanProgress'
 import { SeverityTiles, ModuleResultsList, totalFindingsOf, hasSevereFindings } from './ScanModuleResults'
 
 import { ScanErrorNotice } from './ScanErrorNotice'
+import { useScanSpeed } from './scanSpeed'
 
 type TargetScanState = TrackedScan<OpenRedirectResponse>
 
@@ -31,6 +32,7 @@ export function OpenRedirect({ caseId, targets, credentials }: { caseId: string;
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [manualTarget, setManualTarget] = useState('')
   const [scans, setScans] = useState<Record<string, TargetScanState>>({})
+  const batch = useScanBatch()
   const [credentialId, setCredentialId] = useState<string | undefined>()
   const [extraParams, setExtraParams] = useState('')
   const [callback, setCallback] = useState<CallbackSelection | null>(null)
@@ -51,7 +53,7 @@ export function OpenRedirect({ caseId, targets, credentials }: { caseId: string;
       if (restored.length === 0) return
       setScans((prev) => {
         const next = { ...prev }
-        for (const r of restored) if (!next[r.scan.target]) next[r.scan.target] = { status: 'done', result: r.data }
+        for (const r of restored) if (!next[r.scan.target]) next[r.scan.target] = { status: 'done', result: r.data, scanId: r.scan.id }
         return next
       })
     })
@@ -65,20 +67,33 @@ export function OpenRedirect({ caseId, targets, credentials }: { caseId: string;
   const params = useMemo(() => extraParams.split(',').map((s) => s.trim()).filter(Boolean), [extraParams])
 
   const running = Object.values(scans).some((s) => s.status === 'running')
-  const canRun = runTargets.length > 0 && !running
+  // stopScan stops one target's running scan. Its card settles itself once the
+  // server's terminal event arrives.
+  const stopScan = (t: string) => stopTrackedScan(scans[t])
+  const speed = useScanSpeed()
+  const canRun = runTargets.length > 0 && !running && speed.rps !== null
 
   const runScan = () => {
     if (!canRun) return
     const list = runTargets
     setScans(Object.fromEntries(list.map((t) => [t, { status: 'running' as const, progress: emptyProgress() }])))
-    for (const t of list) runOneScan(t)
+    // One signal covers the whole batch, so Stop all reaches targets not yet started.
+    const signal = batch.begin()
+    runBatch(list, (t) => runOneScan(t, signal))
+  }
+
+  // retryScan restarts one failed target's scan in place: its card goes back to
+  // running and the scan runs again, while the other targets keep going.
+  const retryScan = (targetValue: string) => {
+    setScans((prev) => ({ ...prev, [targetValue]: { status: 'running' as const, progress: emptyProgress() } }))
+    void runOneScan(targetValue, batch.current())
   }
 
   // runOneScan streams this target's run into its card, and lands the full
   // result once it finishes.
-  const runOneScan = (targetValue: string) =>
+  const runOneScan = (targetValue: string, signal?: AbortSignal) =>
     runTrackedScan<OpenRedirectResponse>(
-      () => api.openRedirect({
+      () => api.openRedirect({ requestsPerSecond: speed.rps ?? undefined,
         url: toAbsoluteUrl(targetValue),
         params: params.length ? params : undefined,
         credentialId,
@@ -87,14 +102,22 @@ export function OpenRedirect({ caseId, targets, credentials }: { caseId: string;
         followRedirects,
       }),
       (update) => setScans((prev) => (prev[targetValue] ? { ...prev, [targetValue]: update(prev[targetValue]) } : prev)),
+      signal,
     )
+
+  // stopAll ends the whole batch: targets not yet started are skipped, and
+  // every running target is cancelled.
+  const stopAll = () => {
+    batch.stop()
+    setScans((prev) => stopAllScans(prev))
+  }
 
   const runLabel = runTargets.length > 1 ? `Run (${runTargets.length})` : 'Run'
 
   return (
     <div className="flex h-full flex-col gap-4 overflow-y-auto p-6">
       <CollapsibleFormPanel
-        title="Open Redirect Scanner"
+        title="Open Redirect"
         open={formOpen}
         onToggle={() => setFormOpen(!formOpen)}
         summary={runTargets.length > 0 ? `${runTargets.length} target${runTargets.length === 1 ? '' : 's'} queued` : 'No targets selected'}
@@ -104,7 +127,7 @@ export function OpenRedirect({ caseId, targets, credentials }: { caseId: string;
         runLabel={runLabel}
       >
         <div>
-          <h1 className="text-sm font-semibold uppercase tracking-wide text-neutral-400">Open Redirect Scanner</h1>
+          <h1 className="text-sm font-semibold uppercase tracking-wide text-neutral-400">Open Redirect</h1>
           <p className="mt-1 text-xs text-neutral-500">
             Tries every common redirect parameter name (plus anything already in the URL's own query string) with about a
             dozen parser-disagreement payloads (absolute, protocol-relative, backslash, tab and whitespace, missing slashes,
@@ -148,6 +171,10 @@ export function OpenRedirect({ caseId, targets, credentials }: { caseId: string;
             className={`mt-1 ${inputBase}`}
           />
         </label>
+
+
+        {speed.control}
+
 
         <CredentialPicker credentials={credentials} selected={credentialId} onSelect={setCredentialId} />
 
@@ -206,7 +233,7 @@ export function OpenRedirect({ caseId, targets, credentials }: { caseId: string;
               </div>
             )}
             {hasScans && (
-              <BatchResultsPanel entries={Object.entries(scans)} getSummary={openRedirectSummary} getProgress={(scan) => scan.progress} renderCard={(t, scan) => <TargetScanCard target={t} scan={scan} />} />
+              <BatchResultsPanel entries={Object.entries(scans)} getSummary={openRedirectSummary} getProgress={(scan) => scan.progress} onRetry={retryScan} onStop={stopScan} onStopAll={stopAll} renderCard={(t, scan) => <TargetScanCard target={t} scan={scan} />} />
             )}
           </>
         )}
@@ -216,8 +243,9 @@ export function OpenRedirect({ caseId, targets, credentials }: { caseId: string;
 }
 
 function openRedirectSummary(scan: TargetScanState): BatchResultSummary {
+  if (scan.status === 'cancelled') return stoppedSummary
   if (scan.status === 'running') return { label: 'Running…', tone: 'neutral', running: true }
-  if (scan.status === 'error') return { label: 'Error', tone: 'danger' }
+  if (scan.status === 'error') return { label: 'Error', tone: 'danger', failed: true }
   const modules = scan.result?.modules ?? []
   const total = totalFindingsOf(modules)
   if (total === 0) return { label: 'Clean', tone: 'clean' }
@@ -228,6 +256,7 @@ const SCAN_STATUS_STYLES: Record<TargetScanState['status'], { label: string; cls
   running: { label: 'Running…', cls: 'border-amber-700 bg-amber-950/40 text-amber-300' },
   done: { label: 'Done', cls: 'border-emerald-700 bg-emerald-950/40 text-emerald-300' },
   error: { label: 'Failed', cls: 'border-red-700 bg-red-950/40 text-red-300' },
+  cancelled: { label: 'Stopped', cls: 'border-neutral-700 bg-neutral-900 text-neutral-400' },
 }
 
 function ScanStatusBadge({ status }: { status: TargetScanState['status'] }) {
@@ -252,11 +281,26 @@ function TargetScanCard({ target, scan }: { target: string; scan: TargetScanStat
           <div className="rounded-lg border border-neutral-800 bg-neutral-900 p-3 text-xs text-neutral-400">
             <div className="flex flex-wrap gap-x-6 gap-y-1">
               <span>
-                Baseline → <span className="font-mono text-neutral-200">{result.baseline.statusCode}</span>
+                Baseline →{' '}
+                {result.baseline.error ? (
+                  <span className="text-amber-400" title={result.baseline.error}>
+                    failed (continued without it)
+                  </span>
+                ) : (
+                  <span className="font-mono text-neutral-200">{result.baseline.statusCode}</span>
+                )}
               </span>
               <span>
                 Parameters tested → <span className="font-mono text-neutral-300">{result.paramsTested.length}</span>
               </span>
+              {result.timedOut !== undefined && result.requests !== undefined && (
+                <span title="Requests that ran out of their time budget. A high count means the host was slow or throttling.">
+                  Timed out →{' '}
+                  <span className={`font-mono ${result.timedOut > 0 ? 'text-amber-400' : 'text-neutral-300'}`}>
+                    {result.timedOut} / {result.requests}
+                  </span>
+                </span>
+              )}
               {result.probesSent !== undefined && (
                 <span>
                   Probes sent → <span className="font-mono text-neutral-300">{result.probesSent}</span>

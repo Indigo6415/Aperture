@@ -22,6 +22,8 @@ import { OpenRedirect } from './OpenRedirect'
 import { Ssrf } from './Ssrf'
 import { Csrf } from './Csrf'
 import { SstiScan } from './SstiScan'
+import { PathTraversal } from './PathTraversal'
+import { Xxe } from './Xxe'
 import { XssScan } from './XssScan'
 import { Tester } from './Tester'
 import { Collaborator } from './Collaborator'
@@ -121,6 +123,8 @@ type Tab =
   | 'ssrf'
   | 'csrf'
   | 'sstiscan'
+  | 'pathtraversal'
+  | 'xxe'
   | 'xss'
   | 'tester'
   | 'collaborator'
@@ -132,57 +136,57 @@ const TAB_META: Record<Tab, { label: string; icon: IconType }> = {
   credentials: { label: 'Credentials', icon: IconKey },
   cookieVault: { label: 'Cookie Vault', icon: IconCookie },
   identify: { label: 'Identify', icon: IconRadar },
-  feroxbuster: { label: 'Directory Scanner', icon: IconFolderSearch },
-  'ffuf-subdomain': { label: 'Subdomain Scanner', icon: IconGlobe },
-  'ffuf-vhost': { label: 'VHost Scanner', icon: IconServer },
+  feroxbuster: { label: 'Directory', icon: IconFolderSearch },
+  'ffuf-subdomain': { label: 'Subdomain', icon: IconGlobe },
+  'ffuf-vhost': { label: 'VHost', icon: IconServer },
   'ffuf-custom': { label: 'FFuF', icon: IconLightning },
   subfinder: { label: 'Subfinder', icon: IconGlobe },
   katana: { label: 'Katana Crawler', icon: IconFolder },
   nuclei: { label: 'Nuclei', icon: IconWarning },
-  jwtscan: { label: 'JWT Scanner', icon: IconShieldKey },
+  jwtscan: { label: 'JWT', icon: IconShieldKey },
   probe: { label: 'Probe', icon: IconCrosshair },
   domainscan: { label: 'Domain Scan', icon: IconBug },
   secrets: { label: 'Secrets', icon: IconLock },
   breach: { label: 'Breach Check', icon: IconKey },
   bypass403: { label: '403 Bypass', icon: IconUnlock },
-  pwreset: { label: 'Password Reset Scanner', icon: IconMailQuestion },
+  pwreset: { label: 'Password Reset', icon: IconMailQuestion },
   graphqlenum: { label: 'GraphQL Enumeration', icon: IconBraces },
   apienum: { label: 'API Enumerator', icon: IconRouteTree },
-  corsscan: { label: 'CORS Scanner', icon: IconGlobe },
+  corsscan: { label: 'CORS', icon: IconGlobe },
   openredirect: { label: 'Open Redirect', icon: IconRepeat },
-  ssrf: { label: 'SSRF Scanner', icon: IconServer },
+  ssrf: { label: 'SSRF', icon: IconServer },
   csrf: { label: 'CSRF Sweep', icon: IconSitemap },
-  sstiscan: { label: 'SSTI Scanner', icon: IconBraces },
-  xss: { label: 'XSS Scanner', icon: IconCode },
+  sstiscan: { label: 'SSTI', icon: IconBraces },
+  pathtraversal: { label: 'Path Traversal', icon: IconFolder },
+  xxe: { label: 'XXE', icon: IconCode },
+  xss: { label: 'XSS', icon: IconCode },
   tester: { label: 'Tester', icon: IconSend },
   collaborator: { label: 'Collaborator', icon: IconActivity },
 }
 
-// NAV_GROUPS is the left navbar's shape: case-management tabs pinned above
-// the groups, then groups ordered the way a case is actually worked --
-// identify the target first, run the automated scanners, reach for a
-// standalone tool for something targeted, and finish in the
-// intelligence/analysis views that summarize everything above. Each group
-// (other than the pinned "Case" one) is independently collapsible -- see
-// the `navGroupOpen` state below.
+// NAV_GROUPS is the left navbar's shape. PINNED_TABS sit at the top with no
+// group around them: the case-management tabs, plus Identify, since that's
+// the first thing a case is worked with and shouldn't be hidden inside a
+// collapsible section. Below them, each group is independently collapsible
+// and ordered the way a case is actually worked: recon to discover the
+// attack surface, vulnerability scanners against that surface, then the
+// standalone utilities for targeted manual work.
 type NavGroup = { id: string; label: string; icon: IconType; tabs: Tab[] }
 
-const PINNED_TABS: Tab[] = ['targets', 'credentials', 'cookieVault']
+const PINNED_TABS: Tab[] = ['targets', 'identify', 'credentials', 'cookieVault']
 
 const NAV_GROUPS: NavGroup[] = [
-  { id: 'identify', label: 'Identify', icon: IconRadar, tabs: ['identify'] },
   {
-    id: 'scanners',
-    label: 'Scanners',
-    icon: IconScan,
-    tabs: ['feroxbuster', 'ffuf-subdomain', 'ffuf-vhost', 'subfinder', 'katana', 'nuclei'],
+    id: 'recon',
+    label: 'Recon',
+    icon: IconRadar,
+    tabs: ['feroxbuster', 'ffuf-subdomain', 'ffuf-vhost', 'ffuf-custom', 'subfinder', 'katana', 'nuclei'],
   },
   {
-    id: 'tools',
-    label: 'Tools',
-    icon: IconWrench,
+    id: 'vulnerabilities',
+    label: 'Vulnerabilities',
+    icon: IconScan,
     tabs: [
-      'ffuf-custom',
       'jwtscan',
       'probe',
       'domainscan',
@@ -197,10 +201,16 @@ const NAV_GROUPS: NavGroup[] = [
       'ssrf',
       'csrf',
       'sstiscan',
+      'pathtraversal',
+      'xxe',
       'xss',
-      'tester',
-      'collaborator',
     ],
+  },
+  {
+    id: 'utilities',
+    label: 'Utilities',
+    icon: IconWrench,
+    tabs: ['tester', 'collaborator'],
   },
 ]
 
@@ -487,6 +497,8 @@ export function CaseView({ caseId }: { caseId: string }) {
     ssrf: STATUS_DOT.done,
     csrf: STATUS_DOT.done,
     sstiscan: STATUS_DOT.done,
+    pathtraversal: STATUS_DOT.done,
+    xxe: STATUS_DOT.done,
     xss: STATUS_DOT.done,
     tester: STATUS_DOT.done,
     collaborator: STATUS_DOT.done,
@@ -517,6 +529,8 @@ export function CaseView({ caseId }: { caseId: string }) {
     ssrf: null,
     csrf: null,
     sstiscan: null,
+    pathtraversal: null,
+    xxe: null,
     xss: null,
     tester: null,
     collaborator: null,
@@ -556,17 +570,17 @@ export function CaseView({ caseId }: { caseId: string }) {
 
       <div className="flex flex-1 overflow-hidden">
         {navOpen ? (
-          <aside className="flex w-52 shrink-0 flex-col overflow-y-auto border-r border-neutral-800 bg-neutral-950 p-2">
+          <aside className="flex w-56 shrink-0 flex-col overflow-y-auto border-r border-neutral-800 bg-neutral-950 p-2">
             <button onClick={() => setNavOpen(false)} title="Collapse" className="mb-1 self-end px-1 text-xs text-neutral-600 hover:text-neutral-300">
               ◂
             </button>
-            <div className="space-y-0.5">
+            <div className="grid grid-cols-2 gap-1.5">
               {PINNED_TABS.map((id) => (
                 <NavTabButton key={id} id={id} active={tab === id} dot={dots[id]} count={counts[id]} onSelect={() => setTab(id)} />
               ))}
             </div>
             <div className="my-2 border-t border-neutral-900" />
-            <div className="space-y-1">
+            <div className="space-y-3">
               {NAV_GROUPS.map((group) => (
                 <NavGroupSection key={group.id} group={group} activeTab={tab} dots={dots} counts={counts} onSelect={setTab} />
               ))}
@@ -601,7 +615,7 @@ export function CaseView({ caseId }: { caseId: string }) {
             reset a results table's row selection right before you meant to
             click "Save selected to case". */}
         <div className="flex-1 overflow-hidden">
-          <div className={`h-full ${tab === 'targets' ? '' : 'hidden'}`}>
+          <div className={`h-full overflow-y-auto ${tab === 'targets' ? '' : 'hidden'}`}>
             <TargetsTab caseId={caseId} targets={targets} lists={targetLists} onChange={refreshTargets} onListsChanged={refreshTargetLists} />
           </div>
 
@@ -822,6 +836,14 @@ export function CaseView({ caseId }: { caseId: string }) {
             <SstiScan caseId={caseId} targets={targets} credentials={credentials} />
           </div>
 
+          <div className={`h-full overflow-y-auto ${tab === 'pathtraversal' ? '' : 'hidden'}`}>
+            <PathTraversal caseId={caseId} targets={targets} credentials={credentials} />
+          </div>
+
+          <div className={`h-full overflow-y-auto ${tab === 'xxe' ? '' : 'hidden'}`}>
+            <Xxe caseId={caseId} targets={targets} credentials={credentials} />
+          </div>
+
           <div className={`h-full overflow-y-auto ${tab === 'xss' ? '' : 'hidden'}`}>
             <XssScan caseId={caseId} targets={targets} credentials={credentials} />
           </div>
@@ -852,8 +874,10 @@ export function CaseView({ caseId }: { caseId: string }) {
 
 // --- Nav (left sidebar) ---
 
-// NavTabButton is one row in the expanded nav -- either pinned above the
-// groups (Targets/Credentials) or inside a NavGroupSection below.
+// NavTabButton is one rectangular tile in the nav's 2-column grid -- either
+// pinned at the top (Targets/Identify/Credentials/Cookie Vault) or inside a
+// NavGroupSection below. The icon and label fill the tile; the status dot
+// sits in the top-right corner and the item count in the top-left.
 function NavTabButton({
   id,
   active,
@@ -871,24 +895,28 @@ function NavTabButton({
   return (
     <button
       onClick={onSelect}
-      className={`flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm ${
-        active ? 'bg-neutral-800 text-neutral-100' : 'text-neutral-400 hover:bg-neutral-900 hover:text-neutral-200'
+      title={`${label}${count !== null ? ` (${count})` : ''}`}
+      className={`relative flex h-16 flex-col items-center justify-center gap-1.5 rounded-md border px-1.5 text-center text-[11px] leading-tight ${
+        active
+          ? 'border-sky-500 bg-sky-950/40 text-sky-300'
+          : 'border-neutral-800 bg-neutral-900 text-neutral-400 hover:border-neutral-600 hover:text-neutral-200'
       }`}
     >
-      <Icon className="h-3.5 w-3.5 shrink-0" />
-      <span className="flex-1 truncate">{label}</span>
-      <span className="inline-block h-1.5 w-1.5 shrink-0 rounded-full" style={{ background: dot }} />
-      {count !== null && <span className="text-xs text-neutral-500">{count}</span>}
+      <Icon className="h-4 w-4 shrink-0" />
+      <span className="line-clamp-2">{label}</span>
+      <span className="absolute right-1.5 top-1.5 h-1.5 w-1.5 rounded-full" style={{ background: dot }} />
+      {count !== null && <span className="absolute left-1.5 top-1 text-[10px] text-neutral-500">{count}</span>}
     </button>
   )
 }
 
-// NavGroupSection renders one collapsible group (Identify/Scanners/Tools/
-// Intelligence). Each group remembers its own open/closed state under its
-// own key so collapsing "Tools" doesn't affect "Scanners" -- and it starts
-// open, expanding to reveal the active tab if a group is reopened to reveal
-// a saved-collapsed tab that later becomes active (e.g. via a "Send to X"
-// handoff from elsewhere in the case).
+// NavGroupSection renders one collapsible group (Recon/Vulnerabilities/
+// Utilities) as a header plus its tiles in a 2-column grid. Each group
+// remembers its own open/closed state under its own key so collapsing
+// "Utilities" doesn't affect "Recon" -- and it starts open, expanding to
+// reveal the active tab if a group is reopened to reveal a saved-collapsed
+// tab that later becomes active (e.g. via a "Send to X" handoff from
+// elsewhere in the case).
 function NavGroupSection({
   group,
   activeTab,
@@ -917,7 +945,7 @@ function NavGroupSection({
         <span className="text-sky-700">{open ? '▾' : '▸'}</span>
       </button>
       {open && (
-        <div className="space-y-0.5 border-l-2 border-transparent pt-0.5">
+        <div className="grid grid-cols-2 gap-1.5 pt-1.5">
           {group.tabs.map((id) => (
             <NavTabButton key={id} id={id} active={activeTab === id} dot={dots[id]} count={counts[id]} onSelect={() => onSelect(id)} />
           ))}
@@ -1182,9 +1210,9 @@ function TargetsTab({
                       e.stopPropagation()
                       openMenu(e, [
                         { label: 'Copy value', onSelect: () => copyToClipboard(t.value, 'Copied target') },
-                        { label: 'Send to JWT Scanner', onSelect: () => sendToJwtScanner(t.value) },
+                        { label: 'Send to JWT', onSelect: () => sendToJwtScanner(t.value) },
                         { label: 'Send to Probe', onSelect: () => sendToProbe(t.value) },
-                        { label: 'Send to Secret Scanner', onSelect: () => sendToSecretScan(t.value) },
+                        { label: 'Send to Secrets', onSelect: () => sendToSecretScan(t.value) },
                         { label: 'Send to 403 Bypass', onSelect: () => sendToBypass403(t.value) },
                         { label: 'Send to Tester', onSelect: () => sendToTester(t.value) },
                         'separator',
@@ -1685,6 +1713,7 @@ function ToolTab({
           key, target, status, done, total, etaSeconds: estimateEtaSeconds(done, total, startedAt), startedAt,
           wordlist: detail?.wordlist, extensions: detail?.extensions, candidates: detail?.candidates,
           threads: detail?.threads, timeoutSeconds: detail?.timeoutSeconds, rateLimit: detail?.rateLimit,
+          runId: job.runId, nodeId,
         })
       })
 

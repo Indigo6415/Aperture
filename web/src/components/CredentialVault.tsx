@@ -128,8 +128,8 @@ export function CredentialVault({ caseId, credentials, onChanged }: { caseId: st
         <div>
           <h1 className="text-sm font-semibold uppercase tracking-wide text-neutral-400">Credentials</h1>
           <p className="mt-1 text-xs text-neutral-500">
-            Save an auth bundle (headers and/or a cookie) once, then apply it from Repeater, the JWT Scanner, Probe, or Secret
-            Scanner instead of re-pasting it every time. Scoped to this case.
+            Save an auth bundle (headers and/or a cookie) once, then apply it from Repeater, JWT, Probe, or Secrets
+            instead of re-pasting it every time. Scoped to this case.
           </p>
         </div>
 

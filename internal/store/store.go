@@ -31,6 +31,12 @@ func randomID() string {
 
 type Store struct {
 	db *sql.DB
+	// requests queues request-log rows for the single background writer
+	// (see requests.go). requestsStop asks it to finish, and requestsDone
+	// closes once it has.
+	requests     chan RequestRecord
+	requestsStop chan struct{}
+	requestsDone chan struct{}
 }
 
 // Open opens (creating if necessary) the SQLite database at path and
@@ -49,10 +55,15 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	s.startRequestWriter()
 	return s, nil
 }
 
-func (s *Store) Close() error { return s.db.Close() }
+// Close drains any queued request-log rows, then closes the database.
+func (s *Store) Close() error {
+	s.stopRequestWriter()
+	return s.db.Close()
+}
 
 func (s *Store) migrate() error {
 	const schema = `
@@ -312,10 +323,65 @@ CREATE TABLE IF NOT EXISTS case_scans (
 	created_at DATETIME NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_case_scans_case_id ON case_scans(case_id);
+
+-- requests is the HTTP request log: one row per request a native scanner put
+-- on the wire (see netgov.Exchange). It is written by the background writer
+-- in requests.go, never inline with a request, and is what the "Inspect
+-- requests" view lists. request_raw and response_raw hold the full rendered
+-- exchange (body capped), so the list query selects only the small columns
+-- and detail is fetched one row at a time.
+-- run_id is either a job's run (runs.id) or a direct scan's id, which is also
+-- its case_scans.id. There is deliberately no foreign key: a direct scan has no
+-- runs row, and DeleteCase clears these rows itself.
+CREATE TABLE IF NOT EXISTS requests (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	run_id TEXT NOT NULL,
+	node_id TEXT NOT NULL,
+	method TEXT NOT NULL,
+	url TEXT NOT NULL,
+	host TEXT NOT NULL,
+	status_code INTEGER NOT NULL,
+	size INTEGER NOT NULL,
+	ttfb_ms INTEGER NOT NULL,
+	error TEXT NOT NULL DEFAULT '',
+	request_raw TEXT NOT NULL,
+	response_raw TEXT NOT NULL,
+	timestamp DATETIME NOT NULL,
+	-- ref names this exchange; from_ref names the exchange whose 3xx redirected
+	-- here. Both are empty for rows written before redirect linking existed.
+	ref TEXT NOT NULL DEFAULT '',
+	from_ref TEXT NOT NULL DEFAULT '',
+	location TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_requests_node ON requests(run_id, node_id);
+
+-- request_hits records the requests a scan reported as findings: one row per
+-- (method, URL) a finding captured as its request, per node. The request log
+-- marks a logged exchange as a hit when its method and URL appear here, so only
+-- requests that actually produced a finding are highlighted. Written when a
+-- finding is saved (job nodes) or when a direct scan's result is saved.
+CREATE TABLE IF NOT EXISTS request_hits (
+	run_id TEXT NOT NULL,
+	node_id TEXT NOT NULL,
+	method TEXT NOT NULL,
+	url TEXT NOT NULL,
+	PRIMARY KEY (run_id, node_id, method, url)
+);
 `
 	_, err := s.db.Exec(schema)
 	if err != nil {
 		return fmt.Errorf("store: migrate: %w", err)
+	}
+	// requests predates redirect linking, so an existing table needs its two
+	// new columns added by hand, once (see the requests schema comment above).
+	if err := s.ensureColumn("requests", "ref", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("requests", "from_ref", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("requests", "location", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
 	}
 	// findings predates triage_status/triage_note -- CREATE TABLE IF NOT
 	// EXISTS above only applies that shape to a brand new database, so an
@@ -678,12 +744,27 @@ func (s *Store) ListCases() ([]Case, error) {
 // since those are keyed by run_id and jobs.run_id has no FK to enforce it --
 // orphaned runs/findings for a deleted case's jobs are harmless dead rows,
 // consistent with how flows/runs already outlive whatever created them.
+// The request log is the exception: it can grow large, so the case's rows
+// are removed here, in the same transaction, before the cascade drops the
+// case_scans rows that identify the direct scans they belong to.
 func (s *Store) DeleteCase(id string) error {
-	_, err := s.db.Exec(`DELETE FROM cases WHERE id = ?`, id)
+	tx, err := s.db.Begin()
 	if err != nil {
 		return fmt.Errorf("store: delete case: %w", err)
 	}
-	return nil
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`
+		DELETE FROM requests
+		WHERE run_id IN (SELECT id FROM case_scans WHERE case_id = ?)
+		   OR run_id IN (SELECT run_id FROM jobs WHERE case_id = ? AND run_id IS NOT NULL)
+	`, id, id); err != nil {
+		return fmt.Errorf("store: delete case requests: %w", err)
+	}
+	if _, err := tx.Exec(`DELETE FROM cases WHERE id = ?`, id); err != nil {
+		return fmt.Errorf("store: delete case: %w", err)
+	}
+	return tx.Commit()
 }
 
 // --- Target Lists ---

@@ -2,17 +2,31 @@ package openredirect
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/Indigo6415/Aperture/internal/netgov"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
+	"sync/atomic"
 	"time"
 )
 
 const (
 	requestTimeout = 8 * time.Second
 	maxBodyBytes   = 128 * 1024
+)
+
+// baselineTimeout is the budget for each attempt at the baseline request. It
+// is longer than requestTimeout because the first request to a host also runs
+// netgov's canary probe, and a host that is still paused from an earlier scan
+// makes the request wait out that pause first. Vars rather than consts so the
+// tests can shrink them.
+var (
+	baselineTimeout    = 15 * time.Second
+	baselineRetries    = 2
+	baselineRetryPause = 3 * time.Second
 )
 
 type orResult struct {
@@ -74,6 +88,12 @@ func withParam(target *url.URL, param, value string) string {
 //     Go's request writer silently drops a Host set via req.Header, which
 //     used to make operator-supplied Host headers no-ops.
 func send(ctx context.Context, sem chan struct{}, rawURL string, headers map[string]string) (*orResult, error) {
+	return sendWithin(ctx, sem, requestTimeout, rawURL, headers)
+}
+
+// sendWithin is send with an explicit per-request budget, for callers such as
+// the baseline that need more time than requestTimeout allows.
+func sendWithin(ctx context.Context, sem chan struct{}, timeout time.Duration, rawURL string, headers map[string]string) (*orResult, error) {
 	// Only a semaphore-holding caller is throttled, so the baseline and
 	// callback confirmations can go without waiting on the probe fan-out.
 	if sem != nil {
@@ -87,7 +107,7 @@ func send(ctx context.Context, sem chan struct{}, rawURL string, headers map[str
 
 	// RoundTrip has no http.Client timeout behind it, so the per-request
 	// budget is applied to the context instead.
-	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
@@ -123,4 +143,63 @@ func send(ctx context.Context, sem chan struct{}, rawURL string, headers map[str
 		Body:       string(raw),
 		Request:    CapturedRequest{Method: http.MethodGet, URL: rawURL, Headers: sentHeaders},
 	}, nil
+}
+
+// baselineRequest sends the baseline GET, retrying up to baselineRetries more
+// times after a transport failure, with baselineRetryPause between attempts.
+// Each attempt gets baselineTimeout. It gives up early if the run's own
+// context has ended, since retrying a cancelled run only wastes time.
+func baselineRequest(ctx context.Context, rawURL string, headers map[string]string, stats *runStats) (*orResult, error) {
+	var lastErr error
+	// One initial attempt plus baselineRetries retries.
+	for attempt := 0; attempt <= baselineRetries; attempt++ {
+		// Pause before every retry (not before the first attempt) so a host
+		// that just paused or throttled has a moment to recover.
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(baselineRetryPause):
+			}
+		}
+		res, err := sendWithin(ctx, nil, baselineTimeout, rawURL, headers)
+		stats.record(ctx, err)
+		if err == nil {
+			return res, nil
+		}
+		lastErr = err
+		// The run itself was cancelled; another attempt cannot succeed.
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	return nil, fmt.Errorf("after %d attempts: %w", baselineRetries+1, lastErr)
+}
+
+// runStats counts one run's requests and how many of them timed out. Every
+// goroutine in a run adds to it, so both counters are atomic.
+type runStats struct {
+	requests atomic.Int64
+	timedOut atomic.Int64
+}
+
+// record counts one finished request, and also counts it as a timeout when
+// err is one. ctx is the run's own context, not the per-request one: a
+// timeout that only happened because the whole run was ended (cancelled or
+// past its own deadline) says nothing about the host, so it is not counted.
+func (s *runStats) record(ctx context.Context, err error) {
+	s.requests.Add(1)
+	if err != nil && ctx.Err() == nil && isTimeout(err) {
+		s.timedOut.Add(1)
+	}
+}
+
+// isTimeout reports whether err means a request ran out of its time budget,
+// as opposed to a refused connection, a reset, or a host block.
+func isTimeout(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }

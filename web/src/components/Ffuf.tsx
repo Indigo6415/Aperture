@@ -175,6 +175,7 @@ export function FfufTab({
           key, target, status, done, total, etaSeconds: estimateEtaSeconds(done, total, startedAt),
           wordlist: detail?.wordlist, extensions: detail?.extensions, candidates: detail?.candidates,
           threads: detail?.threads, timeoutSeconds: detail?.timeoutSeconds, rateLimit: detail?.rateLimit,
+          runId: job.runId, nodeId,
         })
       })
     }

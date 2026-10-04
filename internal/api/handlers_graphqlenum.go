@@ -18,10 +18,12 @@ import (
 // mirrors graphqlenum.Request field-for-field, plus the credential/case
 // wiring every other tool's request carries (see bypass403Request).
 type graphqlEnumRequest struct {
-	URL          string            `json:"url"`
-	CredentialID string            `json:"credentialId,omitempty"`
-	Headers      map[string]string `json:"headers,omitempty"`
-	CaseID       string            `json:"caseId,omitempty"`
+	// RequestsPerSecond is the scan speed the Slow/Normal/Fast/Custom control sends; zero means scanRate's default.
+	RequestsPerSecond float64           `json:"requestsPerSecond,omitempty"`
+	URL               string            `json:"url"`
+	CredentialID      string            `json:"credentialId,omitempty"`
+	Headers           map[string]string `json:"headers,omitempty"`
+	CaseID            string            `json:"caseId,omitempty"`
 }
 
 // graphqlEnumTimeout bounds a full run: one baseline request, up to five
@@ -38,6 +40,11 @@ const graphqlEnumTimeout = 60 * time.Second
 func (s *Server) handleGraphQLEnum(w http.ResponseWriter, r *http.Request) {
 	var req graphqlEnumRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	rps, err := scanRate(req.RequestsPerSecond)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -62,6 +69,7 @@ func (s *Server) handleGraphQLEnum(w http.ResponseWriter, r *http.Request) {
 	req.Headers = s.applyDomainCookie(req.CaseID, req.URL, req.Headers)
 
 	s.queueScan(w, streamedScan{
+		rps:     rps,
 		caseID:  req.CaseID,
 		target:  req.URL,
 		tool:    "graphqlenum",

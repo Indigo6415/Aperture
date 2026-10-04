@@ -11,6 +11,7 @@ import (
 
 	"github.com/Indigo6415/Aperture/internal/domainscan"
 	"github.com/Indigo6415/Aperture/internal/engine"
+	"github.com/Indigo6415/Aperture/internal/netgov"
 	"github.com/Indigo6415/Aperture/internal/store"
 )
 
@@ -34,6 +35,9 @@ type domainScanRequest struct {
 	// CaseID optionally scopes this scan to a case -- see
 	// probeScanRequest.CaseID's doc comment.
 	CaseID string `json:"caseId,omitempty"`
+	// RequestsPerSecond is the scan speed the Slow/Normal/Fast/Custom control
+	// sends; zero means scanRate's default.
+	RequestsPerSecond float64 `json:"requestsPerSecond,omitempty"`
 }
 
 // maxDomainScanCrawlDepth/maxDomainScanPages cap what a request can ask
@@ -53,6 +57,7 @@ type pendingDomainScan struct {
 	Target string
 	Opts   domainscan.Options
 	CaseID string
+	RPS    float64
 }
 
 // domainScanStartResult is the immediate response to starting a domain
@@ -82,6 +87,11 @@ func (s *Server) handleDomainScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Target = strings.TrimSpace(req.Target)
+	rps, err := scanRate(req.RequestsPerSecond)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 	if req.Target == "" {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("target is required"))
 		return
@@ -116,7 +126,7 @@ func (s *Server) handleDomainScan(w http.ResponseWriter, r *http.Request) {
 
 	scanID := newID()
 	s.domainScanMu.Lock()
-	s.pendingDomainScans[scanID] = pendingDomainScan{Target: req.Target, Opts: opts, CaseID: req.CaseID}
+	s.pendingDomainScans[scanID] = pendingDomainScan{Target: req.Target, Opts: opts, CaseID: req.CaseID, RPS: rps}
 	s.domainScanMu.Unlock()
 	time.AfterFunc(domainScanClaimTimeout, func() {
 		s.domainScanMu.Lock()
@@ -157,10 +167,20 @@ func (s *Server) handleWatchDomainScan(w http.ResponseWriter, r *http.Request) {
 func (s *Server) runDomainScan(scanID string, pending pendingDomainScan) {
 	opts := pending.Opts
 	opts.Progress = hubReporter{hub: s.hub, scanID: scanID}
-	resp, err := domainscan.RunScanStreaming(context.Background(), pending.Target, opts, func(m domainscan.ModuleResult) {
+	ctx, cancel := context.WithCancel(s.withScanRecorder(netgov.WithPolicy(context.Background(), netgov.Policy{MaxRPS: pending.RPS}), scanID))
+	s.trackScanCancel(scanID, cancel)
+	defer s.untrackScanCancel(scanID)
+	defer cancel()
+	resp, err := domainscan.RunScanStreaming(ctx, pending.Target, opts, func(m domainscan.ModuleResult) {
 		mod := m
 		s.hub.publish(scanID, RunEvent{Type: "domainModule", DomainModule: &mod})
 	})
+	// A stopped scan is reported as stopped and never saved, even if the run
+	// returned partial output without an error.
+	if ctx.Err() == context.Canceled {
+		publishScanStopped(s.hub, scanID)
+		return
+	}
 	if err != nil {
 		s.hub.publish(scanID, RunEvent{Type: "done", Status: engine.StatusFailed, Message: err.Error()})
 		return
@@ -178,7 +198,7 @@ func (s *Server) runDomainScan(scanID string, pending pendingDomainScan) {
 		}
 		summary := fmt.Sprintf("%d finding(s) across %d module(s)", findingCount, len(resp.Modules))
 		if data, err := json.Marshal(resp); err == nil {
-			s.saveCaseScan(pending.CaseID, pending.Target, "domainscan", severity, summary, data)
+			s.saveCaseScan(scanID, pending.CaseID, pending.Target, "domainscan", severity, summary, data)
 		}
 	}
 }

@@ -25,11 +25,9 @@ const probeScanClaimTimeout = 30 * time.Second
 // probeScanRequest is the request body for POST /api/probe/scan.
 type probeScanRequest struct {
 	Target string `json:"target"`
-	// Preset mirrors engine.ScanOptions' Preset field (aggressive/normal/
-	// stealth/custom) -- resolved into a request concurrency the same way
-	// a job's thread count is, rather than probescan having its own
-	// parallel preset table.
-	Preset string `json:"preset,omitempty"`
+	// RequestsPerSecond is the scan speed the Slow/Normal/Fast/Custom control
+	// sends; zero means scanRate's default.
+	RequestsPerSecond float64 `json:"requestsPerSecond,omitempty"`
 	// CredentialID optionally names a saved case credential (see
 	// handlers_credentials.go) whose headers/cookie are applied to every
 	// request this scan issues.
@@ -49,6 +47,7 @@ type pendingProbeScan struct {
 	Target string
 	Opts   probescan.Options
 	CaseID string
+	RPS    float64
 }
 
 // probeScanStartResult is the immediate response to starting a probe scan:
@@ -80,12 +79,17 @@ func (s *Server) handleProbeScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Target = strings.TrimSpace(req.Target)
+	rps, err := scanRate(req.RequestsPerSecond)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 	if req.Target == "" {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("target is required"))
 		return
 	}
 
-	opts := probescan.Options{Concurrency: engine.ScanOptions{Preset: req.Preset}.Resolved().Threads}
+	opts := probescan.Options{Concurrency: engine.ScanOptions{}.Resolved().Threads}
 	if req.CredentialID != "" {
 		cred, err := s.store.GetCredential(req.CredentialID)
 		if errors.Is(err, store.ErrNotFound) {
@@ -102,7 +106,7 @@ func (s *Server) handleProbeScan(w http.ResponseWriter, r *http.Request) {
 
 	scanID := newID()
 	s.probeMu.Lock()
-	s.pendingProbeScans[scanID] = pendingProbeScan{Target: req.Target, Opts: opts, CaseID: req.CaseID}
+	s.pendingProbeScans[scanID] = pendingProbeScan{Target: req.Target, Opts: opts, CaseID: req.CaseID, RPS: rps}
 	s.probeMu.Unlock()
 	time.AfterFunc(probeScanClaimTimeout, func() {
 		s.probeMu.Lock()
@@ -143,10 +147,20 @@ func (s *Server) handleWatchProbeScan(w http.ResponseWriter, r *http.Request) {
 func (s *Server) runProbeScan(scanID string, pending pendingProbeScan) {
 	opts := pending.Opts
 	opts.Progress = hubReporter{hub: s.hub, scanID: scanID}
-	resp, err := probescan.RunScanStreaming(netgov.WithPolicy(context.Background(), netgov.Policy{MaxConcurrency: pending.Opts.Concurrency}), pending.Target, opts, func(m probescan.ModuleResult) {
+	ctx, cancel := context.WithCancel(s.withScanRecorder(netgov.WithPolicy(context.Background(), netgov.Policy{MaxConcurrency: pending.Opts.Concurrency, MaxRPS: pending.RPS}), scanID))
+	s.trackScanCancel(scanID, cancel)
+	defer s.untrackScanCancel(scanID)
+	defer cancel()
+	resp, err := probescan.RunScanStreaming(ctx, pending.Target, opts, func(m probescan.ModuleResult) {
 		mod := m
 		s.hub.publish(scanID, RunEvent{Type: "module", Module: &mod})
 	})
+	// A stopped scan is reported as stopped and never saved, even if the run
+	// returned partial output without an error.
+	if ctx.Err() == context.Canceled {
+		publishScanStopped(s.hub, scanID)
+		return
+	}
 	if err != nil {
 		s.hub.publish(scanID, RunEvent{Type: "done", Status: engine.StatusFailed, Message: err.Error()})
 		return
@@ -164,7 +178,7 @@ func (s *Server) runProbeScan(scanID string, pending pendingProbeScan) {
 		}
 		summary := fmt.Sprintf("%d finding(s) across %d module(s)", findingCount, len(resp.Modules))
 		if data, err := json.Marshal(resp); err == nil {
-			s.saveCaseScan(pending.CaseID, pending.Target, "probe", severity, summary, data)
+			s.saveCaseScan(scanID, pending.CaseID, pending.Target, "probe", severity, summary, data)
 		}
 	}
 }

@@ -16,7 +16,9 @@ import (
 
 // bypass403Request is the request body for POST /api/bypass403/run.
 type bypass403Request struct {
-	URL string `json:"url"`
+	// RequestsPerSecond is the scan speed the Slow/Normal/Fast/Custom control sends; zero means scanRate's default.
+	RequestsPerSecond float64 `json:"requestsPerSecond,omitempty"`
+	URL               string  `json:"url"`
 	// CredentialID optionally names a saved case credential (see
 	// handlers_credentials.go) merged into Headers -- same shape as every
 	// other tool's request.
@@ -44,6 +46,11 @@ func (s *Server) handleBypass403(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	rps, err := scanRate(req.RequestsPerSecond)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 	req.URL = strings.TrimSpace(req.URL)
 	if req.URL == "" {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("url is required"))
@@ -65,6 +72,7 @@ func (s *Server) handleBypass403(w http.ResponseWriter, r *http.Request) {
 	req.Headers = s.applyDomainCookie(req.CaseID, req.URL, req.Headers)
 
 	s.queueScan(w, streamedScan{
+		rps:     rps,
 		caseID:  req.CaseID,
 		target:  req.URL,
 		tool:    "bypass403",

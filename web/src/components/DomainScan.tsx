@@ -10,7 +10,7 @@ import type {
 import { CollapsibleFormPanel } from './CollapsibleFormPanel'
 import { TargetPicker } from './TargetPicker'
 import { CredentialPicker } from './CredentialPicker'
-import { BatchResultsPanel, type BatchResultSummary } from './BatchResultsPanel'
+import { BatchResultsPanel, stoppedSummary, type BatchResultSummary } from './BatchResultsPanel'
 import { ScanHistoryPanel } from './ScanHistoryPanel'
 import { ScanWindowTabs } from './ScanWindowTabs'
 import { latestByTarget, loadCaseScans } from '../scanHistory'
@@ -20,7 +20,7 @@ import { inputBase } from '../formStyles'
 import { toAbsoluteUrl } from '../url'
 import { SEVERITY_META, SEVERITY_ORDER } from '../severityColor'
 import { sendToTester } from '../testerHandoff'
-import { applyScanEvent, emptyProgress, finishProgress, type ScanProgress } from '../scanProgress'
+import { applyScanEvent, emptyProgress, finishProgress, type ScanProgress, runBatch, stopTrackedScan, useScanBatch, stopAllScans } from '../scanProgress'
 
 // TestState/TargetScanState mirror Probe.tsx's own -- one registered
 // module's place in a running scan, and one target's place in a (possibly
@@ -28,9 +28,13 @@ import { applyScanEvent, emptyProgress, finishProgress, type ScanProgress } from
 // identical here so the two tools feel like the same family of tool.
 
 import { ScanErrorNotice } from './ScanErrorNotice'
+import { useScanSpeed } from './scanSpeed'
 
 interface TargetScanState {
-  status: 'running' | 'done' | 'error'
+  status: 'running' | 'done' | 'error' | 'cancelled'
+  // scanId is set once the scan has started, so its card's Stop button can
+  // cancel it (see stopTrackedScan).
+  scanId?: string
   // progress is the run's live per-module state (see scanProgress.ts), shown
   // as a grid of squares on the target's card.
   progress?: ScanProgress
@@ -57,6 +61,7 @@ export function DomainScan({
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [manualTarget, setManualTarget] = useState('')
   const [scans, setScans] = useState<Record<string, TargetScanState>>({})
+  const batch = useScanBatch()
   const [credentialId, setCredentialId] = useState<string | undefined>()
   const [crawlDepth, setCrawlDepth] = useState(2)
   const [view, setView] = useState<'scan' | 'history'>('scan')
@@ -76,7 +81,7 @@ export function DomainScan({
       if (restored.length === 0) return
       setScans((prev) => {
         const next = { ...prev }
-        for (const r of restored) if (!next[r.scan.target]) next[r.scan.target] = { status: 'done', result: r.data }
+        for (const r of restored) if (!next[r.scan.target]) next[r.scan.target] = { status: 'done', result: r.data, scanId: r.scan.id }
         return next
       })
     })
@@ -90,20 +95,30 @@ export function DomainScan({
   const runTargets = useMemo(() => [...new Set([...selected, ...manualTargets])], [selected, manualTargets])
 
   const running = Object.values(scans).some((s) => s.status === 'running')
-  const canRun = runTargets.length > 0 && !running
+  const speed = useScanSpeed()
+  const canRun = runTargets.length > 0 && !running && speed.rps !== null
 
   const runScan = () => {
     if (!canRun) return
     const list = runTargets
     setScans(Object.fromEntries(list.map((t) => [t, { status: 'running' as const, progress: emptyProgress() }])))
-    for (const t of list) runOneScan(t)
+    // One signal covers the whole batch, so Stop all reaches targets not yet started.
+    const signal = batch.begin()
+    runBatch(list, (t) => runOneScan(t, signal))
+  }
+
+  // retryScan restarts one failed target's scan in place: its card goes back to
+  // running and the scan runs again, while the other targets keep going.
+  const retryScan = (targetValue: string) => {
+    setScans((prev) => ({ ...prev, [targetValue]: { status: 'running' as const, progress: emptyProgress() } }))
+    void runOneScan(targetValue, batch.current())
   }
 
   // runOneScan streams this target's domain scan into its card: each module's
   // start and finish arrive as progress events, and the full result is built
   // from the module events once the terminal "done" lands. Same pattern as
   // Probe.tsx's runOneScan.
-  const runOneScan = async (targetValue: string) => {
+  const runOneScan = async (targetValue: string, signal?: AbortSignal) => {
     // Modules finish in whatever order their own crawl+tool run happens to
     // complete, streamed one at a time over this target's domain scan
     // WebSocket -- collected here and only turned into a result once the
@@ -113,18 +128,26 @@ export function DomainScan({
       setScans((prev) => (prev[targetValue] ? { ...prev, [targetValue]: fn(prev[targetValue]) } : prev))
     let stopWatch: () => void = () => {}
     try {
-      const { scanId } = await api.domainScan({
+      const { scanId } = await api.domainScan({ requestsPerSecond: speed.rps ?? undefined,
         target: toAbsoluteUrl(targetValue),
         credentialId,
         crawlDepth,
         caseId,
       })
+      patch((cur) => ({ ...cur, scanId }))
+      if (signal?.aborted) {
+        stopTrackedScan({ scanId })
+        return
+      }
       await new Promise<void>((resolve, reject) => {
         stopWatch = watchDomainScan(scanId, (ev) => {
           if (ev.type === 'domainModule' && ev.domainModule) {
             collected.push(ev.domainModule)
           } else if (ev.type === 'done') {
-            if (ev.status === 'failed') {
+            if (ev.status === 'cancelled') {
+              patch((cur) => ({ ...cur, status: 'cancelled', progress: finishProgress(cur.progress ?? emptyProgress()) }))
+              resolve()
+            } else if (ev.status === 'failed') {
               reject(new Error(ev.message || 'Domain scan failed'))
             } else if (ev.domainTarget) {
               const result: DomainScanResponse = { target: ev.domainTarget, modules: collected }
@@ -144,6 +167,17 @@ export function DomainScan({
     } finally {
       stopWatch()
     }
+  }
+
+  // stopScan stops one target's running scan. Its card settles itself once the
+  // server's terminal event arrives.
+  const stopScan = (t: string) => stopTrackedScan(scans[t])
+
+  // stopAll ends the whole batch: targets not yet started are skipped, and
+  // every running target is cancelled.
+  const stopAll = () => {
+    batch.stop()
+    setScans((prev) => stopAllScans(prev))
   }
 
   const runLabel = runTargets.length > 1 ? `Run Domain Scan (${runTargets.length})` : 'Run Domain Scan'
@@ -206,6 +240,10 @@ export function DomainScan({
           </select>
         </label>
 
+
+        {speed.control}
+
+
         <CredentialPicker credentials={credentials} selected={credentialId} onSelect={setCredentialId} />
 
         <button
@@ -233,6 +271,7 @@ export function DomainScan({
                 entries={Object.entries(scans)}
                 getSummary={domainScanSummary}
                 getProgress={(scan) => scan.progress}
+                onRetry={retryScan} onStop={stopScan} onStopAll={stopAll}
                 renderCard={(t, scan) => <TargetScanCard target={t} scan={scan} />}
               />
             )}
@@ -255,8 +294,9 @@ export function DomainScan({
 // batch covers more than BatchResultsPanel's threshold -- same reasoning as
 // Probe.tsx's probeScanSummary.
 function domainScanSummary(scan: TargetScanState): BatchResultSummary {
+  if (scan.status === 'cancelled') return stoppedSummary
   if (scan.status === 'running') return { label: 'Running…', tone: 'neutral', running: true }
-  if (scan.status === 'error') return { label: 'Error', tone: 'danger' }
+  if (scan.status === 'error') return { label: 'Error', tone: 'danger', failed: true }
   const modules = scan.result?.modules ?? []
   const total = modules.reduce((n, m) => n + m.findings.length, 0)
   if (total === 0) return { label: 'Clean', tone: 'clean' }
@@ -316,6 +356,7 @@ const SCAN_STATUS_STYLES: Record<TargetScanState['status'], { label: string; cls
   running: { label: 'Running…', cls: 'border-amber-700 bg-amber-950/40 text-amber-300' },
   done: { label: 'Done', cls: 'border-emerald-700 bg-emerald-950/40 text-emerald-300' },
   error: { label: 'Failed', cls: 'border-red-700 bg-red-950/40 text-red-300' },
+  cancelled: { label: 'Stopped', cls: 'border-neutral-700 bg-neutral-900 text-neutral-400' },
 }
 
 function ScanStatusBadge({ status }: { status: TargetScanState['status'] }) {

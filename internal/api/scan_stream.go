@@ -3,10 +3,12 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"time"
 
 	"github.com/Indigo6415/Aperture/internal/engine"
+	"github.com/Indigo6415/Aperture/internal/netgov"
 	"github.com/Indigo6415/Aperture/internal/scanprogress"
 )
 
@@ -26,7 +28,31 @@ type streamedScan struct {
 	target  string
 	tool    string
 	timeout time.Duration
-	run     func(ctx context.Context, rep scanprogress.Reporter) (scanOutcome, error)
+	// rps is the request rate this scan's outbound requests are paced to,
+	// from scanRate. Zero leaves pacing off.
+	rps float64
+	run func(ctx context.Context, rep scanprogress.Reporter) (scanOutcome, error)
+}
+
+// defaultScanRPS is the request rate a scan runs at when its request names
+// none -- the Normal speed preset in the UI.
+const defaultScanRPS = 50
+
+// maxScanRPS caps a requested rate so one request can't ask for more than
+// the shared transport is meant to carry.
+const maxScanRPS = 1000
+
+// scanRate turns a requested requests-per-second value into the rate a scan
+// runs at. Zero (the field omitted) means the default; anything negative or
+// above maxScanRPS is rejected.
+func scanRate(requested float64) (float64, error) {
+	if requested == 0 {
+		return defaultScanRPS, nil
+	}
+	if requested < 0 || requested > maxScanRPS {
+		return 0, fmt.Errorf("requestsPerSecond must be between 0 and %d", maxScanRPS)
+	}
+	return requested, nil
 }
 
 // scanOutcome is what a finished streamed scan hands back: the full result
@@ -89,10 +115,24 @@ func (s *Server) handleWatchScan(w http.ResponseWriter, r *http.Request) {
 // away a run that's already spent its requests, and the result still lands
 // in the case's saved scans.
 func (s *Server) runStreamedScan(scanID string, scan streamedScan) {
-	ctx, cancel := context.WithTimeout(context.Background(), scan.timeout)
+	// The rate rides on the context, which the shared netgov transport reads
+	// for every request the scan makes.
+	base := s.withScanRecorder(netgov.WithPolicy(context.Background(), netgov.Policy{MaxRPS: scan.rps}), scanID)
+	ctx, cancel := context.WithTimeout(base, scan.timeout)
+	// Registering cancel lets handleCancelScan stop this run early. Once the run
+	// returns, the deferred untrack removes the entry, so a late stop request
+	// finds nothing to cancel.
+	s.trackScanCancel(scanID, cancel)
+	defer s.untrackScanCancel(scanID)
 	defer cancel()
 
 	out, err := scan.run(ctx, hubReporter{hub: s.hub, scanID: scanID})
+	// Checked before err: a stopped scan may return any error, or none, and
+	// its partial output must not be saved as a finished result.
+	if ctx.Err() == context.Canceled {
+		publishScanStopped(s.hub, scanID)
+		return
+	}
 	if err != nil {
 		s.hub.publish(scanID, RunEvent{Type: "done", Status: engine.StatusFailed, Message: err.Error()})
 		return
@@ -104,7 +144,14 @@ func (s *Server) runStreamedScan(scanID string, scan streamedScan) {
 		return
 	}
 	s.hub.publish(scanID, RunEvent{Type: "done", Status: engine.StatusSucceeded, Result: data})
-	s.saveCaseScan(scan.caseID, scan.target, scan.tool, out.severity, out.summary, data)
+	s.saveCaseScan(scanID, scan.caseID, scan.target, scan.tool, out.severity, out.summary, data)
+}
+
+// publishScanStopped sends the terminal event for a scan the user stopped. It
+// carries no result and isn't saved to the case, so a stopped run reads as
+// stopped rather than as a clean or failed one.
+func publishScanStopped(h *hub, scanID string) {
+	h.publish(scanID, RunEvent{Type: "done", Status: engine.StatusCancelled, Message: "Scan stopped"})
 }
 
 // hubReporter adapts scanprogress.Reporter onto one scan's hub channel: each

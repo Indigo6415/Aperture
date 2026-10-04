@@ -208,10 +208,19 @@ func ApplyHeaders(req *http.Request, headers map[string]string) {
 // as-is, which several scanners rely on to judge a single hop.
 func NewClient(timeout time.Duration, followRedirects bool) *http.Client {
 	c := &http.Client{Timeout: timeout, Transport: Shared}
-	if !followRedirects {
-		c.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+	// CheckRedirect runs before each followed hop, which is where the hop is
+	// linked to the 3xx that led to it. Following is still the client's own
+	// decision; this only adds the link and reproduces net/http's default limit.
+	c.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if !followRedirects {
 			return http.ErrUseLastResponse
 		}
+		// net/http's default cap when no CheckRedirect is set.
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		linkRedirect(req, via[len(via)-1])
+		return nil
 	}
 	return c
 }
@@ -309,15 +318,26 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		if err != nil {
 			return nil, err
 		}
+		sent := time.Now()
 		resp, err := t.inner.RoundTrip(req)
 		release()
 		if err != nil {
 			t.recordError(host, st, ctx.Err() == nil)
+			// The request went out, so it belongs in a scan's request log even
+			// though no response came back.
+			recordFailure(req, sent, err)
 			return nil, err
 		}
 
+		// Time to headers is taken before classify, which may read part of the
+		// body and would otherwise inflate it.
+		ttfb := time.Since(sent)
 		v := classify(resp)
 		t.record(host, st, v)
+		// Wrapped after classify so the recorded body includes the bytes it
+		// peeked at. Every attempt is recorded, including blocked ones that
+		// get retried below.
+		observeResponse(req, resp, sent, ttfb)
 
 		// Blocked idempotent requests are retried after the host's pause ends.
 		// The retry only happens when the pause is short enough to wait for.
@@ -822,4 +842,23 @@ func randomToken() string {
 		return strconv.FormatInt(time.Now().UnixNano(), 36)
 	}
 	return hex.EncodeToString(b[:])
+}
+
+// WithPolicyRoundTripper wraps inner so every request it forwards carries p
+// on its context. It serves callers that build requests without a context
+// of their own, so their per-scan rate still reaches the shared transport.
+func WithPolicyRoundTripper(inner http.RoundTripper, p Policy) http.RoundTripper {
+	return policyRoundTripper{inner: inner, pol: p}
+}
+
+// policyRoundTripper is the RoundTripper behind WithPolicyRoundTripper.
+type policyRoundTripper struct {
+	inner http.RoundTripper
+	pol   Policy
+}
+
+// RoundTrip stamps the wrapped policy onto the request's context and forwards
+// it to the inner transport.
+func (t policyRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return t.inner.RoundTrip(req.WithContext(WithPolicy(req.Context(), t.pol)))
 }

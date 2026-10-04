@@ -3,6 +3,7 @@ import type { Finding } from '../types'
 import { hostnameOf } from '../url'
 import { SEVERITY_META } from '../severityColor'
 import { CopyButton } from './CopyButton'
+import { SendToTesterButton } from './SendToTesterButton'
 import { copyToClipboard, useContextMenu } from '../contextMenu'
 import { sendToTester } from '../testerHandoff'
 import { BatchResultsPanel, type BatchResultSummary } from './BatchResultsPanel'
@@ -178,6 +179,7 @@ function NucleiFindingRow({ finding: f }: { finding: Finding }) {
               <CopyButton text={f.url} />
             </span>
           </div>
+          <SendToTesterButton url={f.url} method={f.method} headers={f.headers} />
           {templateId && (
             <p className="text-[11px] text-neutral-500">
               <span className="text-neutral-600">Template — </span>

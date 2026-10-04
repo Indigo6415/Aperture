@@ -1,17 +1,22 @@
 package jwtscan
 
 import (
+	"context"
 	"fmt"
+	"github.com/Indigo6415/Aperture/internal/netgov"
 	"github.com/Indigo6415/Aperture/internal/scanprogress"
+	"net/http"
 	"strings"
 )
 
 // ScanRequest is everything one JWT misconfiguration scan needs -- mirrors
 // JWTear's CLI flags (-u/-t/-m/--cookie/--pubkey/--wordlist/-H) one for one.
 type ScanRequest struct {
-	URL          string
-	Token        string
-	Method       string // defaults to GET
+	URL    string
+	Token  string
+	Method string // defaults to GET
+	// MaxRPS paces the scan's requests to the target, 0 leaves pacing off.
+	MaxRPS       float64
 	Cookie       string // empty sends the token as Authorization: Bearer instead
 	ExtraHeaders map[string]string
 	PubKeyPEM    string   // enables the RS256->HS256 confusion test
@@ -61,7 +66,7 @@ type ScanResponse struct {
 // unreachable target, or a token that the target doesn't even accept) --
 // once running, every individual test failing to find anything is a normal
 // ScanResponse result, not an error.
-func RunScan(req ScanRequest, oob OOBConfig) (*ScanResponse, error) {
+func RunScan(runCtx context.Context, req ScanRequest, oob OOBConfig) (*ScanResponse, error) {
 	rep := scanprogress.Or(req.Progress)
 
 	header, payload, _, err := ParseJWT(req.Token)
@@ -74,6 +79,10 @@ func RunScan(req ScanRequest, oob OOBConfig) (*ScanResponse, error) {
 		method = "GET"
 	}
 	client := newHTTPClient()
+	client.Transport = netgov.WithPolicyRoundTripper(client.Transport, netgov.Policy{MaxRPS: req.MaxRPS})
+	// Bound to ctx so a stop aborts the request in flight and every later one
+	// fails at once, rather than the scan running on to completion.
+	client.Transport = contextRoundTripper{ctx: runCtx, inner: client.Transport}
 
 	okResp, okStatuses, err := sampleBaseline(client, req.URL, req.Token, method, req.Cookie, req.ExtraHeaders)
 	if err != nil {
@@ -186,6 +195,20 @@ func RunScan(req ScanRequest, oob OOBConfig) (*ScanResponse, error) {
 		resp.CrackedSecret = *cracked
 	}
 	return resp, nil
+}
+
+// contextRoundTripper binds every request it forwards to ctx. The JWT probes
+// build some requests without a context of their own, so wrapping the client
+// is the one place that covers all of them.
+type contextRoundTripper struct {
+	ctx   context.Context
+	inner http.RoundTripper
+}
+
+// RoundTrip re-points the request at the scan's context, then forwards it.
+// Once ctx is cancelled the inner transport aborts the request.
+func (t contextRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return t.inner.RoundTrip(req.WithContext(t.ctx))
 }
 
 // track runs one test as a progress check: its square reads as testing while
