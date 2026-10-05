@@ -92,13 +92,45 @@ func clientRedirectTargets(body string) []string {
 	return out
 }
 
+// domSourceRe matches a read of a DOM property that carries URL or document
+// data, the "sources" side of Oralyzer's source/sink list. The property names
+// are the ones a page would use to pick a redirect destination.
+var domSourceRe = regexp.MustCompile(`\b(?:location\.(?:href|hash|search|pathname|hostname)|document\.(?:URL|documentURI|baseURI|referrer|cookie)|window\.name)\b`)
+
+// domSourcesIn lists the distinct DOM sources body reads from, in order of first
+// appearance. A property followed by a single "=" is being assigned to, which
+// makes it a sink (the redirect itself), not a source, so it is skipped.
+func domSourcesIn(body string) []string {
+	var out []string
+	seen := map[string]bool{}
+	// Each match is checked for an assignment that follows it.
+	for _, loc := range domSourceRe.FindAllStringIndex(body, -1) {
+		rest := strings.TrimLeft(body[loc[1]:], " \t")
+		if strings.HasPrefix(rest, "=") && !strings.HasPrefix(rest, "==") {
+			continue
+		}
+		name := body[loc[0]:loc[1]]
+		if !seen[name] {
+			seen[name] = true
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
 // moduleDef is one vector family -- expand turns it into the concrete
 // requests to send for this particular run (one per candidate parameter,
 // per path segment, per header, ...). Every probe a module expands to is
 // attributed individually via its own identifier.
 type moduleDef struct {
 	id, name, severity string
-	expand             func(d runDeps) []probeSpec
+	// expand lists the probes this module sends. Its redirects are then
+	// confirmed against the callback like every other module's.
+	expand func(d runDeps) []probeSpec
+	// direct, when set, replaces the callback pipeline for this module. It
+	// sends its own requests and judges the responses itself, for vectors
+	// that prove themselves in the response (see crlfModule).
+	direct func(ctx context.Context, d runDeps, sent *atomic.Int64) []Finding
 }
 
 // probeSpec is one concrete request a module wants sent.
@@ -297,6 +329,34 @@ var forwardedHostModule = moduleDef{
 	},
 }
 
+// ipLiteralModule sends the callback's IPv4 address in every spelling a parser
+// accepts (see ipLiteralForms), once per candidate parameter. A filter that
+// blocks the dotted-quad, or a hostname allowlist that never matches an IP
+// literal, can accept one spelling and not another. When the callback is a
+// domain there are no forms to send, so the module expands to nothing.
+var ipLiteralModule = moduleDef{
+	id: "ip-literal", name: "IP-literal redirect", severity: "medium",
+	expand: func(d runDeps) []probeSpec {
+		forms := ipLiteralForms(hostOnly(d.req.CallbackBase))
+		specs := make([]probeSpec, 0, len(forms)*len(d.params))
+		// One probe per (parameter, spelling), each with its own identifier.
+		for _, p := range d.params {
+			// Each spelling of the callback address gets its own probe.
+			for _, f := range forms {
+				identifier := openRedirectIdentifierFor("ip-literal", p+" "+f.kind, d.nonce)
+				value := "https://" + d.poisonAt(f.host, identifier) + "/"
+				specs = append(specs, probeSpec{
+					label:      fmt.Sprintf("Parameter %q", p),
+					sent:       fmt.Sprintf("%s=%s", p, value),
+					identifier: identifier,
+					rawURL:     withParam(d.target, p, value),
+				})
+			}
+		}
+		return specs
+	},
+}
+
 // openRedirectModules is every vector this scanner tries. Each query-parameter
 // payload is a distinct parser-disagreement shape (see PortSwigger's URL
 // validation bypass cheat sheet and the OWASP open-redirect guidance): the
@@ -400,6 +460,53 @@ var openRedirectModules = []moduleDef{
 	queryModule("https-triple-slash", "Scheme triple-slash redirect", "medium", func(p string, _ *url.URL) string {
 		return "https:///" + p + "/"
 	}),
+	// Every scheme in this block is https. The confirmation request fetches the
+	// redirect over the scheme it names, and the callback listener is TLS, so an
+	// http:// spelling could never reach it.
+	//
+	// The scheme in mixed case. Browsers match schemes case-insensitively, but
+	// a filter that rejects "https://" by a literal, case-sensitive prefix
+	// never sees it.
+	queryModule("scheme-case", "Mixed-case scheme redirect", "medium", func(p string, _ *url.URL) string {
+		return "HtTPs://" + p + "/"
+	}),
+	// The scheme with its colon and slashes percent-encoded. The query encoder
+	// encodes the '%' again, so the app has to decode twice to see "https://":
+	// the same shape as double-encoded above, applied to the scheme.
+	queryModule("scheme-encoded", "Encoded-scheme redirect", "medium", func(p string, _ *url.URL) string {
+		return "https%3A%2F%2F" + p + "/"
+	}),
+	// "https://" hidden inside the scheme. A filter that strips "https://" once
+	// leaves "https://<poison>" behind, and the browser follows that.
+	queryModule("nested-scheme", "Nested-scheme redirect", "medium", func(p string, _ *url.URL) string {
+		return "hthttps://tps://" + p + "/"
+	}),
+	// A leading space before the scheme. Browsers strip leading spaces and C0
+	// control characters, but a check that reads the first characters sees
+	// " https", not "https".
+	queryModule("leading-scheme-whitespace", "Leading-space scheme redirect", "low", func(p string, _ *url.URL) string {
+		return " https://" + p + "/"
+	}),
+	// A tab between the scheme and its slashes. Browsers delete ASCII tab and
+	// newline from anywhere in a URL, so "https:\t//" reads as "https://".
+	queryModule("scheme-tab", "Tab-in-scheme redirect", "low", func(p string, _ *url.URL) string {
+		return "https:\t//" + p + "/"
+	}),
+	// Alternating backslash and slash. Browsers normalize "/\/\" to "//", while
+	// a filter that checks for a literal "//" sees a path.
+	queryModule("backslash-alternating", "Alternating backslash-slash redirect", "medium", func(p string, _ *url.URL) string {
+		return "/\\/\\" + p + "/"
+	}),
+	// The callback host with each ASCII dot replaced by an ideographic full stop
+	// (U+3002). IDNA maps it back to "." when the browser resolves the host, so
+	// the redirect reaches the callback while a dot-matching filter finds none.
+	queryModule("unicode-dot", "Unicode full-stop host redirect", "medium", func(p string, _ *url.URL) string {
+		return "https://" + fullwidthHost(p) + "/"
+	}),
+	// The callback's IPv4 address in each spelling a parser accepts (decimal,
+	// hex, octal, mixed, IPv6-mapped), for a filter that matches the
+	// dotted-quad only. Only applies when the callback is an IPv4 literal.
+	ipLiteralModule,
 
 	pathModule("path-absolute", "Path-segment absolute redirect", "medium", func(p string) string {
 		return "https://" + p + "/"
@@ -411,6 +518,8 @@ var openRedirectModules = []moduleDef{
 	refererModule,
 	hostHeaderModule,
 	forwardedHostModule,
+
+	crlfModule,
 }
 
 // hostOnly returns s up to (not including) its first "/" -- just the host
@@ -550,7 +659,11 @@ func (d runDeps) findCallbackHop(ctx context.Context, res *orResult, base *url.U
 		if err != nil {
 			break
 		}
-		if strings.EqualFold(loc.Host, cbHost) {
+		if sameCallbackHost(loc, cbHost) {
+			// A browser reaches the callback under any spelling of its host, so
+			// the confirming request uses the canonical host the listener was
+			// registered under, not whichever spelling the target sent.
+			loc.Host = cbHost
 			confirm, rebuilt := d.confirmURL(loc, ps)
 			how := "redirected (Location header)"
 			if rebuilt {
@@ -575,7 +688,13 @@ func (d runDeps) findCallbackHop(ctx context.Context, res *orResult, base *url.U
 	// describe a client-side redirect to it. Only a redirect literal that names
 	// the callback host and this probe's identifier is worth confirming.
 	if !isRedirect(res) && clientRedirectTo(res.Body, cbHost, ps.identifier) {
-		return followed, "https://" + d.poison(ps.identifier) + "/", "rendered a client-side redirect", true, true
+		how := "rendered a client-side redirect"
+		// Naming the DOM property the script reads (e.g. location.search) shows
+		// the operator where the destination comes from in the page.
+		if srcs := domSourcesIn(res.Body); len(srcs) > 0 {
+			how += ", reading " + strings.Join(srcs, ", ")
+		}
+		return followed, "https://" + d.poison(ps.identifier) + "/", how, true, true
 	}
 	return followed, "", "", false, false
 }

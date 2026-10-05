@@ -193,8 +193,14 @@ func TestIPSpoofHeaderBypassIsCounted(t *testing.T) {
 	if !strings.Contains(xff.BodySnippet, "admin console") {
 		t.Errorf("BodySnippet = %q, want it to show the admin console", xff.BodySnippet)
 	}
-	if res.BypassCount != 1 {
-		t.Errorf("BypassCount = %d, want exactly 1 (only X-Forwarded-For opens the path)", res.BypassCount)
+	// The hop-by-hop variant sends the same X-Forwarded-For value (plus a
+	// Connection listing it), so this origin opens for it too. Exactly those
+	// two may count; no other header does.
+	if res.BypassCount != 2 {
+		t.Errorf("BypassCount = %d, want exactly 2 (X-Forwarded-For plain and hop-by-hop, which carry the same value)", res.BypassCount)
+	}
+	if a := findAttempt(t, res, "header-hop-by-hop-x-forwarded-for"); !a.Bypassed {
+		t.Error("header-hop-by-hop-x-forwarded-for not bypassed, but the origin reads the same X-Forwarded-For value")
 	}
 	if a := findAttempt(t, res, "header-ip-x-real-ip"); a.Bypassed {
 		t.Error("header-ip-x-real-ip was counted, but the server only trusts X-Forwarded-For")

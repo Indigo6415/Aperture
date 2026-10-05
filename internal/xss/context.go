@@ -314,26 +314,122 @@ func looksLikeCode(s string) bool {
 	return strings.ContainsAny(s, "(=`")
 }
 
+// Element sets for the handlers that fire without the user doing anything. An
+// injected handler is inert on an element that cannot fire it.
+var (
+	// autofocusTags are the elements that honor the autofocus attribute. Checked
+	// in headless Chrome: <input autofocus> fires its onfocus on load, but
+	// <a href autofocus> does not.
+	autofocusTags = map[string]bool{"button": true, "input": true, "select": true, "textarea": true}
+	// errorEventTags are the elements that fire an error event when a resource fails.
+	errorEventTags = map[string]bool{
+		"img": true, "input": true, "script": true, "iframe": true, "video": true,
+		"audio": true, "object": true, "embed": true, "link": true, "source": true, "track": true,
+	}
+	// loadEventTags are the elements that fire a load event.
+	loadEventTags = map[string]bool{
+		"img": true, "iframe": true, "script": true, "link": true, "object": true,
+		"embed": true, "body": true, "frame": true, "svg": true,
+	}
+)
+
+// eventHandlerAttrPattern finds an injected event-handler attribute, such as onerror=.
+// Its group 1 is the handler name without "on".
+var eventHandlerAttrPattern = regexp.MustCompile(`(?i)\bon([a-z]+)\s*=`)
+
+// tagNameAttrPattern finds the start of an element and captures its name.
+var tagNameAttrPattern = regexp.MustCompile(`<([a-zA-Z][a-zA-Z0-9-]*)`)
+
+// handlerUse is one event-handler attribute an injection adds, and the element
+// that carries it.
+type handlerUse struct {
+	name  string
+	owner string
+}
+
+// injectedHandlers lists the event handlers in injected text. Each handler belongs
+// to the nearest element opened before it. A handler that comes before any new
+// element belongs to host, the element the injection breaks out into.
+func injectedHandlers(injected, host string) []handlerUse {
+	tags := tagNameAttrPattern.FindAllStringSubmatchIndex(injected, -1)
+	var out []handlerUse
+	for _, m := range eventHandlerAttrPattern.FindAllStringSubmatchIndex(injected, -1) {
+		owner := host
+		for _, t := range tags {
+			if t[0] < m[0] {
+				owner = asciiLower(injected[t[2]:t[3]])
+			}
+		}
+		out = append(out, handlerUse{name: "on" + asciiLower(injected[m[2]:m[3]]), owner: owner})
+	}
+	return out
+}
+
+// handlerFiresOn reports whether an event handler fires on an element named owner
+// without the user doing anything. Only the automatic events count: load and error
+// on the elements that fetch a resource, toggle on details, begin on SVG timing,
+// and focus only when autofocus is set on an element that can take it. A handler
+// such as onclick or onmouseover needs the victim to act, so it is not counted.
+func handlerFiresOn(name, injected, owner string) bool {
+	switch name {
+	case "onerror":
+		return errorEventTags[owner]
+	case "onload":
+		return loadEventTags[owner]
+	case "ontoggle":
+		return owner == "details"
+	case "onstart":
+		return owner == "marquee"
+	case "onbegin":
+		return owner == "animate" || owner == "set" || owner == "animatemotion" || owner == "animatetransform"
+	case "onfocus":
+		lower := asciiLower(injected)
+		return strings.Contains(lower, "autofocus") && (autofocusTags[owner] || strings.Contains(lower, "tabindex"))
+	}
+	return false
+}
+
+// handlersInertOn reports whether an injected run cannot execute because every
+// handler it adds is one that does not fire automatically on the element it lands
+// on. Injected text that opens a <script> is never inert: that runs whatever the
+// handlers do.
+func handlersInertOn(injected, host string) bool {
+	if strings.Contains(asciiLower(injected), "<script") {
+		return false
+	}
+	uses := injectedHandlers(injected, host)
+	if len(uses) == 0 {
+		return false
+	}
+	for _, u := range uses {
+		if handlerFiresOn(u.name, injected, u.owner) {
+			return false
+		}
+	}
+	return true
+}
+
 // executesAt reports whether payload, placed at a position whose parser state
 // is st, would run or render as markup in the browser. valueEmpty is true when
 // the payload is the first thing in its attribute value.
 func executesAt(st htmlState, payload string, valueEmpty bool) bool {
 	switch st.kind {
 	case ctxText:
-		// Markup in text becomes live elements.
-		return markupStartPattern.MatchString(payload)
+		// Markup in text becomes live elements, but a handler that needs the user
+		// to act does not run on its own.
+		return markupStartPattern.MatchString(payload) && !handlersInertOn(payload, "")
 
 	case ctxAttribute:
 		if st.quote != 0 {
 			// A quoted value must be closed first, and what follows the quote must
 			// inject code.
-			if k := strings.IndexByte(payload, st.quote); k >= 0 && injectsCode(payload[k+1:]) {
+			if k := strings.IndexByte(payload, st.quote); k >= 0 && injectsCode(payload[k+1:]) && !handlersInertOn(payload[k+1:], st.tag) {
 				return true
 			}
 		} else {
 			// An unquoted value (or an attribute name position) ends at whitespace,
 			// "/" or ">".
-			if k := strings.IndexAny(payload, " \t\r\n\f/>"); k >= 0 && injectsCode(payload[k:]) {
+			if k := strings.IndexAny(payload, " \t\r\n\f/>"); k >= 0 && injectsCode(payload[k:]) && !handlersInertOn(payload[k:], st.tag) {
 				return true
 			}
 		}
@@ -372,31 +468,80 @@ func executesInScript(st htmlState, payload string) bool {
 		// Code before the end tag runs only if it is valid in the current state.
 		return executesInScript(st, payload[:k])
 	}
-	switch {
-	case st.jsComment == '/':
-		// A line comment hides the payload until a newline, after which code may run.
-		k := strings.IndexByte(payload, '\n')
-		return k >= 0 && looksLikeCode(payload[k+1:])
-	case st.jsComment == '*':
-		// A block comment hides the payload until "*/".
-		k := strings.Index(payload, "*/")
-		return k >= 0 && looksLikeCode(payload[k+2:])
-	case st.quote == '`':
-		// A template literal runs any ${...} expression without breaking out.
-		if strings.Contains(payload, "${") {
+	return scriptPayloadRuns(st, payload)
+}
+
+// scriptPayloadRuns walks payload with the JavaScript lexer's rules, starting in
+// the string or comment the landing point is in. Only characters outside strings
+// and comments are code. The payload runs when some code character calls,
+// assigns, or opens a template expression.
+//
+// The walk matters because the payload's own quotes can be the ones that open a
+// string. A payload such as ';alert(1);' that lands in code is inert: its
+// leading quote starts a string, and nothing after it is code.
+func scriptPayloadRuns(st htmlState, payload string) bool {
+	quote := st.quote
+	comment := st.jsComment
+	for i := 0; i < len(payload); i++ {
+		c := payload[i]
+		// next is the byte after c, or 0 at the end of the payload.
+		var next byte
+		if i+1 < len(payload) {
+			next = payload[i+1]
+		}
+		switch {
+		case comment == '/':
+			// A line comment ends at a newline.
+			if c == '\n' {
+				comment = 0
+			}
+		case comment == '*':
+			// A block comment ends at "*/".
+			if c == '*' && next == '/' {
+				comment = 0
+				i++
+			}
+		case quote == '`':
+			// Inside a template literal, ${ opens an expression that runs, and a
+			// backtick closes the literal.
+			if c == '$' && next == '{' {
+				return true
+			}
+			if c == '\\' {
+				i++
+			} else if c == '`' {
+				quote = 0
+			}
+		case quote != 0:
+			// Inside a string literal only the matching, unescaped quote ends it.
+			if c == '\\' {
+				i++
+			} else if c == quote {
+				quote = 0
+			}
+		case c == '/' && next == '/':
+			comment = '/'
+			i++
+		case c == '/' && next == '*':
+			comment = '*'
+			i++
+		case c == '<' && i == 0:
+			// A payload that opens with markup is not valid JavaScript at a code
+			// position, so nothing it carries runs.
+			return false
+		case c == '"' || c == '\'':
+			quote = c
+		case c == '`':
+			// A backtick right after a name is a tagged-template call, which runs.
+			if i > 0 && isNameChar(payload[i-1]) {
+				return true
+			}
+			quote = c
+		case c == '(' || c == '=':
 			return true
 		}
-		k := strings.IndexByte(payload, '`')
-		return k >= 0 && looksLikeCode(payload[k+1:])
-	case st.quote != 0:
-		// A string literal ends only at its matching quote, then the rest must be code.
-		k := strings.IndexByte(payload, st.quote)
-		return k >= 0 && looksLikeCode(payload[k+1:])
-	default:
-		// Plain code runs as it is. A payload that opens with markup does not,
-		// since "<" is not valid JavaScript there.
-		return !strings.HasPrefix(payload, "<") && looksLikeCode(payload)
 	}
+	return false
 }
 
 // payloadExecutes reports whether a payload that appears verbatim in body would
@@ -423,6 +568,34 @@ func payloadExecutes(body, payload string) bool {
 			return true
 		}
 		from = idx + 1
+	}
+	return false
+}
+
+// payloadRunsInScriptBody reports whether payload executes when body is loaded as
+// a script file, such as a JSONP response. The body is read as the code of a
+// <script> element, so the state at each occurrence is the state the browser is
+// in there. A script file cannot be closed by its own end tag, so the payload is
+// judged with the lexer alone, and a "</script>" in it does not count as a breakout.
+func payloadRunsInScriptBody(body, payload string) bool {
+	if payload == "" {
+		return false
+	}
+	const prefix = "<script>"
+	wrapped := prefix + body
+	from := len(prefix)
+	// The same occurrence bound as payloadExecutes keeps this linear.
+	const maxOccurrences = 64
+	for n := 0; n < maxOccurrences; n++ {
+		idx := strings.Index(wrapped[from:], payload)
+		if idx < 0 {
+			return false
+		}
+		at := from + idx
+		if scriptPayloadRuns(stateAt(wrapped, at), payload) {
+			return true
+		}
+		from = at + 1
 	}
 	return false
 }

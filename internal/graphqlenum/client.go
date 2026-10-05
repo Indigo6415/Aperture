@@ -166,6 +166,18 @@ type gqlEnvelope struct {
 
 type gqlError struct {
 	Message string `json:"message"`
+	// Locations and Extensions are the rest of the GraphQL-over-HTTP error
+	// object. They're only read by looksLikeGraphQLErrors -- a line/column
+	// location, or an errors[].extensions.code, is structurally unique to a
+	// GraphQL error and lets the baseline recognize an endpoint that answers
+	// as GraphQL but refuses the universal probe query (see confirmEndpoint).
+	Locations []struct {
+		Line   int `json:"line"`
+		Column int `json:"column"`
+	} `json:"locations"`
+	Extensions struct {
+		Code string `json:"code"`
+	} `json:"extensions"`
 }
 
 // parseEnvelope best-effort decodes body as a single GraphQL response
@@ -209,4 +221,70 @@ func (env gqlEnvelope) typename() string {
 		return ""
 	}
 	return v.Typename
+}
+
+// graphQLErrorPhrases are substrings that show up in GraphQL engines' error
+// messages and essentially never in a generic JSON API's {"errors":[...]}
+// response. Matched case-insensitively against each error message. They let
+// the baseline confirm an endpoint that answers as GraphQL but refuses the
+// universal "{__typename}" probe -- one that only runs persisted/safelisted
+// operations (e.g. Netflix's /graphql), requires authentication, or has
+// arbitrary queries and introspection switched off -- instead of writing it
+// off as "not GraphQL".
+var graphQLErrorPhrases = []string{
+	"cannot query field",
+	"must provide query string",
+	"must provide an operation",
+	"must provide operation name",
+	"no operation named",
+	"unknown operation",
+	"syntax error",           // GraphQL parse errors are "Syntax Error: ..."
+	"expected name",          // the usual continuation of a GraphQL syntax error
+	"persisted query",        // "persisted query not found" and similar phrasings
+	"persistedquerynotfound", // the single-token form Apollo and others use
+	"did you mean",
+	"introspection",
+	"graphql",
+}
+
+// looksLikeGraphQLErrors reports whether env is a GraphQL *error* response --
+// the signal the baseline falls back to when the probe query didn't return a
+// typed data object. It confirms on either a structural marker (a line/column
+// location or an errors[].extensions.code, both defined only by the GraphQL
+// spec) or a known GraphQL error phrase, so a plain REST endpoint that happens
+// to answer a POST with {"errors":["..."]} is not mistaken for GraphQL.
+func (env gqlEnvelope) looksLikeGraphQLErrors() bool {
+	// Walk every error object; any single GraphQL-shaped one is enough.
+	for _, e := range env.Errors {
+		// A line/column location is part of the GraphQL error spec and isn't
+		// something a generic JSON API attaches to its errors.
+		if len(e.Locations) > 0 {
+			return true
+		}
+		// errors[].extensions.code (e.g. GRAPHQL_VALIDATION_FAILED,
+		// PERSISTED_QUERY_NOT_FOUND) is likewise GraphQL-spec shape.
+		if e.Extensions.Code != "" {
+			return true
+		}
+		msg := strings.ToLower(e.Message)
+		// Otherwise fall back to the curated phrase list.
+		for _, p := range graphQLErrorPhrases {
+			if strings.Contains(msg, p) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// firstErrorText returns the first non-empty error message verbatim -- used
+// as the baseline's evidence when it confirmed off an error response, so the
+// operator can see exactly what the endpoint said.
+func (env gqlEnvelope) firstErrorText() string {
+	for _, e := range env.Errors {
+		if e.Message != "" {
+			return e.Message
+		}
+	}
+	return ""
 }

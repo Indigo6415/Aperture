@@ -47,10 +47,12 @@ func findAlternateEndpoint(ctx context.Context, client *http.Client, target *url
 			if err != nil {
 				continue
 			}
-			// The same confirmation rule as the requested URL: a data object
-			// carrying a typename. A JSON API that answers every POST with its
-			// own data envelope doesn't carry one.
-			if env, ok := parseEnvelope(res.Body); ok && env.hasData() && env.typename() != "" {
+			// The same confirmation rule as the requested URL (see
+			// confirmFromResponse): a typed data object, or -- for an endpoint
+			// that refuses the probe query -- a GraphQL-shaped error response.
+			// A JSON API that answers every POST with its own data envelope, or
+			// with a non-GraphQL error, satisfies neither.
+			if _, ok := confirmFromResponse(res); ok {
 				return u, res, true
 			}
 		}

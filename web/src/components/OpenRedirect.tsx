@@ -13,10 +13,12 @@ import { useAutoCollapseOnce, useCollapsible } from '../collapsible'
 import { inputBase } from '../formStyles'
 import { toAbsoluteUrl } from '../url'
 import { emptyProgress, runTrackedScan, type TrackedScan, runBatch, stopTrackedScan, useScanBatch, stopAllScans } from '../scanProgress'
+import { indicatorOfScans, useReportScanIndicator } from '../scanIndicator'
 import { SeverityTiles, ModuleResultsList, totalFindingsOf, hasSevereFindings } from './ScanModuleResults'
 
 import { ScanErrorNotice } from './ScanErrorNotice'
 import { useScanSpeed } from './scanSpeed'
+import { ParamMiningToggle } from './ParamMiningToggle'
 
 type TargetScanState = TrackedScan<OpenRedirectResponse>
 
@@ -65,8 +67,12 @@ export function OpenRedirect({ caseId, targets, credentials }: { caseId: string;
   const manualTargets = useMemo(() => manualTarget.split(/[,\n]+/).map((s) => s.trim()).filter(Boolean), [manualTarget])
   const runTargets = useMemo(() => [...new Set([...selected, ...manualTargets])], [selected, manualTargets])
   const params = useMemo(() => extraParams.split(',').map((s) => s.trim()).filter(Boolean), [extraParams])
+  const [mineParams, setMineParams] = useState(false)
+  const [discover, setDiscover] = useState(false)
 
   const running = Object.values(scans).some((s) => s.status === 'running')
+  // Publishes this tab's scan state to the case nav's border.
+  useReportScanIndicator('openredirect', indicatorOfScans(scans, (s) => s.result?.modules ?? []))
   // stopScan stops one target's running scan. Its card settles itself once the
   // server's terminal event arrives.
   const stopScan = (t: string) => stopTrackedScan(scans[t])
@@ -96,6 +102,9 @@ export function OpenRedirect({ caseId, targets, credentials }: { caseId: string;
       () => api.openRedirect({ requestsPerSecond: speed.rps ?? undefined,
         url: toAbsoluteUrl(targetValue),
         params: params.length ? params : undefined,
+
+        mineParams: mineParams || undefined,
+        discover: discover || undefined,
         credentialId,
         caseId,
         callback: callback ?? undefined,
@@ -170,6 +179,24 @@ export function OpenRedirect({ caseId, targets, credentials }: { caseId: string;
             placeholder="returnTo, successUrl"
             className={`mt-1 ${inputBase}`}
           />
+        </label>
+
+        <ParamMiningToggle checked={mineParams} onChange={setMineParams} />
+
+        <label className="flex items-start gap-2">
+          <input
+            type="checkbox"
+            checked={discover}
+            onChange={(e) => setDiscover(e.target.checked)}
+            className="mt-0.5 accent-sky-500"
+          />
+          <span>
+            <span className="block text-xs font-medium text-neutral-300">Discover historical endpoints</span>
+            <span className="block text-[11px] text-neutral-600">
+              Asks Common Crawl for redirect-shaped URLs it has seen under this host and scans up to five of them as well. Sends a
+              query about the host to a third party, and the run takes much longer. Off by default.
+            </span>
+          </span>
         </label>
 
 

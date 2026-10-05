@@ -45,6 +45,11 @@ type Finding struct {
 	// header the target actually sent. Exploitability is a separate question and
 	// is explained in Detail.
 	Confidence string `json:"confidence,omitempty"`
+	// Exploitation says how an attacker would turn this finding into a real
+	// attack. It is the per-finding text where one is set, and otherwise the
+	// owning module's default (see runWithClient). Kept apart from Detail,
+	// which explains what the header shows.
+	Exploitation string `json:"exploitation,omitempty"`
 }
 
 type ModuleResult struct {
@@ -86,7 +91,10 @@ type Result struct {
 
 type moduleDef struct {
 	id, name, severity string
-	run                func(ctx context.Context, deps runDeps) []Finding
+	// exploitation is the module's default attack write-up, applied to any of
+	// its findings that did not set their own.
+	exploitation string
+	run          func(ctx context.Context, deps runDeps) []Finding
 }
 
 // runDeps is what every module needs -- bundled into one struct (rather than
@@ -114,8 +122,11 @@ func registeredModules() []moduleDef {
 		varyOriginModule,
 		nullOriginModule,
 		wildcardWithCredentialsModule,
+		wildcardOriginModule,
+		thirdPartyOriginModule,
 		insecureProtocolModule,
 		relatedDomainTrustModule,
+		parserBypassModule,
 		preflightPermissivenessModule,
 	}
 }
@@ -176,10 +187,14 @@ func runWithClient(ctx context.Context, req Request, client *http.Client) (*Resu
 			findings := m.run(ctx, deps)
 			rep.Done(m.id, len(findings), nil)
 			// Every CORS finding is read from a header the target sent, so its
-			// evidence is confirmed even when its exploitability is not.
+			// evidence is confirmed even when its exploitability is not. A
+			// finding that set no exploitation of its own inherits the module's.
 			for j := range findings {
 				if findings[j].Confidence == "" {
 					findings[j].Confidence = ConfidenceConfirmed
+				}
+				if findings[j].Exploitation == "" {
+					findings[j].Exploitation = m.exploitation
 				}
 			}
 			if findings == nil {

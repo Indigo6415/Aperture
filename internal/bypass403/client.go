@@ -61,16 +61,25 @@ func newHTTPResult(resp *http.Response, body []byte) *httpResult {
 // the request's Host header/authority -- normally the same value, but a
 // technique that spoofs the Host header (see attempts.go's "header-host-*"
 // entries) needs to keep dialing the real target while lying about which
-// virtual host it thinks it's asking for.
-func doAttempt(ctx context.Context, client *http.Client, method, scheme, connectHost, hostHeader, literalTarget string, headers map[string]string) (*httpResult, error) {
+// virtual host it thinks it's asking for. reqBody is sent as the request
+// body; "" sends none, which is what every read-style attempt uses.
+func doAttempt(ctx context.Context, client *http.Client, method, scheme, connectHost, hostHeader, literalTarget, reqBody string, headers map[string]string) (*httpResult, error) {
 	req := &http.Request{
 		Method: method,
 		URL:    &url.URL{Scheme: scheme, Host: connectHost, Opaque: literalTarget},
 		Header: make(http.Header),
 		Host:   hostHeader,
 	}
+	// A body is only attached when there is one, so a plain GET goes out
+	// with no Content-Length and no body at all.
+	if reqBody != "" {
+		req.Body = io.NopCloser(strings.NewReader(reqBody))
+		req.ContentLength = int64(len(reqBody))
+	}
 	req = req.WithContext(ctx)
 	req.Header.Set("User-Agent", "Aperture-403Bypass")
+	// Each caller-supplied header overrides the default above (e.g. a
+	// technique's own Content-Type).
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}

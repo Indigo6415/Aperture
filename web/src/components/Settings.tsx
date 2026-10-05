@@ -2,6 +2,18 @@ import { useEffect, useState } from 'react'
 import { api } from '../api'
 import type { SettingsInfo } from '../types'
 import { applyMode, applyTheme, getStoredMode, getStoredTheme, THEMES, type Mode, type Theme } from '../theme'
+import { NotificationSettings } from './NotificationSettings'
+
+// SettingsTab is which section of the settings page is showing. The page used
+// to be one long scroll of cards; it's now split into tabs so each concern
+// (secrets, appearance, notifications) has its own pane.
+type SettingsTab = 'apiKeys' | 'appearance' | 'notifications'
+
+const TABS: { id: SettingsTab; label: string }[] = [
+  { id: 'apiKeys', label: 'API Keys' },
+  { id: 'appearance', label: 'Appearance' },
+  { id: 'notifications', label: 'Notifications' },
+]
 
 // KeyCard (below) renders one API-key card: DNSDumpster and NVD share the
 // exact same save/clear/status shape (see internal/api/settings.go's
@@ -11,6 +23,7 @@ import { applyMode, applyTheme, getStoredMode, getStoredTheme, THEMES, type Mode
 // show "configured" or offer to replace it, never redisplay it.
 export function Settings() {
   const [info, setInfo] = useState<SettingsInfo | null>(null)
+  const [tab, setTab] = useState<SettingsTab>('apiKeys')
 
   useEffect(() => {
     api.getSettings().then(setInfo)
@@ -19,12 +32,38 @@ export function Settings() {
   return (
     // Scroll container: the app shell clips overflow, so each page must scroll itself
     <div className="h-full overflow-y-auto">
-    <div className="mx-auto max-w-lg space-y-6 p-6">
-      <h1 className="text-sm font-semibold uppercase tracking-wide text-neutral-400">Settings</h1>
+      <div className="mx-auto max-w-2xl space-y-6 p-6">
+        <h1 className="text-sm font-semibold uppercase tracking-wide text-neutral-400">Settings</h1>
 
-      <ModeToggle />
-      <ThemePicker />
+        {/* Tab bar: each button swaps the pane below rather than scrolling one
+            long page. */}
+        <div className="flex gap-1 border-b border-neutral-800">
+          {TABS.map((t) => (
+            <button
+              key={t.id}
+              onClick={() => setTab(t.id)}
+              className={`-mb-px border-b-2 px-3 py-2 text-xs font-medium ${
+                tab === t.id ? 'border-sky-500 text-sky-400' : 'border-transparent text-neutral-400 hover:text-neutral-200'
+              }`}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
 
+        {tab === 'apiKeys' && <ApiKeysTab info={info} onSaved={setInfo} />}
+        {tab === 'appearance' && <AppearanceTab />}
+        {tab === 'notifications' && <NotificationSettings />}
+      </div>
+    </div>
+  )
+}
+
+// ApiKeysTab holds the three external-service key cards that used to sit at
+// the bottom of the single settings page.
+function ApiKeysTab({ info, onSaved }: { info: SettingsInfo | null; onSaved: (info: SettingsInfo) => void }) {
+  return (
+    <div className="space-y-6">
       <KeyCard
         title="DNSDumpster API key"
         description={
@@ -39,7 +78,7 @@ export function Settings() {
         }
         configured={info?.dnsdumpsterApiKeySet ?? null}
         save={(apiKey) => api.setDNSDumpsterKey(apiKey)}
-        onSaved={setInfo}
+        onSaved={onSaved}
       />
 
       <KeyCard
@@ -61,7 +100,7 @@ export function Settings() {
         }
         configured={info?.nvdApiKeySet ?? null}
         save={(apiKey) => api.setNVDKey(apiKey)}
-        onSaved={setInfo}
+        onSaved={onSaved}
       />
 
       <KeyCard
@@ -79,9 +118,18 @@ export function Settings() {
         }
         configured={info?.hibpApiKeySet ?? null}
         save={(apiKey) => api.setHIBPKey(apiKey)}
-        onSaved={setInfo}
+        onSaved={onSaved}
       />
     </div>
+  )
+}
+
+// AppearanceTab groups the light/dark and theme-palette pickers.
+function AppearanceTab() {
+  return (
+    <div className="space-y-6">
+      <ModeToggle />
+      <ThemePicker />
     </div>
   )
 }

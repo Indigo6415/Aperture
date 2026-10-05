@@ -551,3 +551,151 @@ body {
     animation: none;
   }
 }
+
+
+/* Case nav scanner tiles. The border moves through three states:
+     scan-live  -- a comet of light sweeps around the border while the scan runs,
+                   its length breathing, and the tile's glow pulses softly;
+     scan-done  -- the comet closes into a full ring and flashes out, and the
+                   border settles into a solid outline in the result's color;
+     scan-breathe -- a finished tab nobody has opened yet keeps breathing.
+   --scan-angle and --scan-arc are registered so they animate smoothly; a plain
+   custom property would snap instead of turning or stretching. */
+@property --scan-angle {
+  syntax: '<angle>';
+  inherits: false;
+  initial-value: 0deg;
+}
+
+@property --scan-arc {
+  syntax: '<angle>';
+  inherits: false;
+  initial-value: 120deg;
+}
+
+@keyframes scan-sweep {
+  to { --scan-angle: 360deg; }
+}
+
+/* The comet's length swells and shrinks so the sweep looks like it is working. */
+@keyframes scan-arc-breathe {
+  0%, 100% { --scan-arc: 90deg; }
+  50% { --scan-arc: 160deg; }
+}
+
+/* On finish the comet stretches to a full ring and fades out. */
+@keyframes scan-complete {
+  0% { --scan-arc: 120deg; opacity: 1; }
+  70% { opacity: 1; }
+  100% { --scan-arc: 360deg; opacity: 0; }
+}
+
+/* A soft flare just outside the tile when a scan finishes. */
+@keyframes scan-flash {
+  from { opacity: 0.9; }
+  to { opacity: 0; }
+}
+
+@keyframes scan-live-glow {
+  0%, 100% { box-shadow: 0 0 0 0 transparent; }
+  50% { box-shadow: 0 0 12px 0 color-mix(in srgb, var(--scan-color) 30%, transparent); }
+}
+
+/* scan-breathe eases the glow around a finished tab from faint to strong and
+   back, so a result nobody has opened yet is hard to miss. */
+@keyframes scan-breathe {
+  0%, 100% {
+    box-shadow: 0 0 0 1px var(--scan-color), 0 0 4px 0 color-mix(in srgb, var(--scan-color) 25%, transparent);
+  }
+  50% {
+    box-shadow: 0 0 0 2px var(--scan-color), 0 0 26px 4px color-mix(in srgb, var(--scan-color) 90%, transparent);
+  }
+}
+
+/* The badge drops in once when a scan finishes. */
+@keyframes scan-badge-in {
+  from { opacity: 0; transform: translateY(-3px) scale(0.8); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+.scan-badge {
+  animation: scan-badge-in 0.4s cubic-bezier(0.2, 0.9, 0.3, 1.2) both;
+}
+
+/* Shared ring for the comet and the closing ring: the 1.5px padding is the ring,
+   and the mask keeps only that ring, so the tile's background and content show
+   through untouched. The arc runs from a dim tail, to a bright body, to a
+   near-white head. */
+.scan-live::before,
+.scan-done::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 2px;
+  background: conic-gradient(
+    from var(--scan-angle),
+    transparent 0deg,
+    color-mix(in srgb, var(--scan-color) 45%, transparent) calc(var(--scan-arc) * 0.4),
+    var(--scan-color) var(--scan-arc),
+    color-mix(in srgb, var(--scan-color) 45%, white) calc(var(--scan-arc) + 1.5deg),
+    transparent calc(var(--scan-arc) + 6deg)
+  );
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  pointer-events: none;
+}
+
+.scan-live {
+  animation: scan-live-glow 1.8s ease-in-out infinite;
+}
+
+.scan-live::before {
+  animation: scan-sweep 2.4s linear infinite, scan-arc-breathe 3.2s ease-in-out infinite;
+}
+
+/* The border colour and glow ease from the scanning look into the result. */
+.scan-live,
+.scan-done {
+  transition: border-color 0.8s ease, box-shadow 0.8s ease;
+}
+
+.scan-done::before {
+  animation: scan-sweep 2.4s linear infinite, scan-complete 0.9s cubic-bezier(0.2, 0.7, 0.2, 1) forwards;
+}
+
+.scan-done::after {
+  content: '';
+  position: absolute;
+  inset: -2px;
+  border-radius: inherit;
+  pointer-events: none;
+  opacity: 0;
+  box-shadow: 0 0 22px 2px var(--scan-color);
+  animation: scan-flash 1s ease-out forwards;
+}
+
+/* A finished tab with nothing new shows a solid outline in its color. */
+.scan-outline {
+  box-shadow: 0 0 0 1px var(--scan-color);
+}
+
+/* A finished tab nobody has opened yet breathes until it is. */
+.scan-breathe {
+  animation: scan-breathe 1.8s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .scan-live,
+  .scan-live::before,
+  .scan-done::before,
+  .scan-done::after,
+  .scan-breathe,
+  .scan-badge {
+    animation: none;
+  }
+  .scan-live::before {
+    opacity: 0.6;
+  }
+}

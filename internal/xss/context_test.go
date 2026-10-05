@@ -257,7 +257,7 @@ func TestRunFindsNewContexts(t *testing.T) {
 	for _, tpl := range injectionTemplates {
 		slug := strings.ReplaceAll(tpl.name, " ", "-")
 		t.Run("raw "+tpl.name, func(t *testing.T) {
-			res, err := Run(context.Background(), Request{URL: srv.URL + "/raw/" + slug + "?q=seed"})
+			res, err := Run(context.Background(), Request{URL: srv.URL + "/raw/" + slug + "?q=seed"}, OOBConfig{})
 			if err != nil {
 				t.Fatalf("Run: %v", err)
 			}
@@ -266,7 +266,7 @@ func TestRunFindsNewContexts(t *testing.T) {
 			}
 		})
 		t.Run("safe "+tpl.name, func(t *testing.T) {
-			res, err := Run(context.Background(), Request{URL: srv.URL + "/safe/" + slug + "?q=seed"})
+			res, err := Run(context.Background(), Request{URL: srv.URL + "/safe/" + slug + "?q=seed"}, OOBConfig{})
 			if err != nil {
 				t.Fatalf("Run: %v", err)
 			}

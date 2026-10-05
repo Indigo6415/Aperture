@@ -29,6 +29,7 @@ type pathTraversalRequest struct {
 	Body           string            `json:"body,omitempty"`
 	ContentType    string            `json:"contentType,omitempty"`
 	Params         []string          `json:"params,omitempty"`
+	MineParams     bool              `json:"mineParams,omitempty"`
 	CredentialID   string            `json:"credentialId,omitempty"`
 	Headers        map[string]string `json:"headers,omitempty"`
 	CaseID         string            `json:"caseId,omitempty"`
@@ -107,6 +108,7 @@ func (s *Server) handlePathTraversal(w http.ResponseWriter, r *http.Request) {
 				Body:           req.Body,
 				ContentType:    req.ContentType,
 				Params:         req.Params,
+				MineParams:     req.MineParams,
 				Headers:        req.Headers,
 				RecursionDepth: req.RecursionDepth,
 				MaxPages:       req.MaxPages,

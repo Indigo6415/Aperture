@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState, type ReactElement, type SVGProps } from 'react'
+import { useCallback, useEffect, useRef, useState, type CSSProperties, type ReactElement, type SVGProps } from 'react'
 import { api, watchJob } from '../api'
+import { BADGE_LABEL, IDLE_INDICATOR, INDICATOR_COLOR, ScanIndicatorContext, severityOfName, worseSeverity, type IndicatorSeverity, type ScanIndicator, type ScanPhase } from '../scanIndicator'
 import type { Case, Check, CheckKind, CookieVaultEntry, Credential, Finding, Job, JobOptions, JobOptionsPreset, NodeStatus, RunStatus, Target, TargetList, TargetListKind, TargetPingResult, Tool } from '../types'
 import { JOB_PRESETS } from '../presets'
 import { statusHexColor } from '../statusColor'
@@ -24,6 +25,7 @@ import { Ssrf } from './Ssrf'
 import { Csrf } from './Csrf'
 import { SstiScan } from './SstiScan'
 import { PathTraversal } from './PathTraversal'
+import { Idor } from './Idor'
 import { Xxe } from './Xxe'
 import { XssScan } from './XssScan'
 import { Tester } from './Tester'
@@ -128,6 +130,7 @@ type Tab =
   | 'csrf'
   | 'sstiscan'
   | 'pathtraversal'
+  | 'idor'
   | 'xxe'
   | 'xss'
   | 'tester'
@@ -163,6 +166,7 @@ const TAB_META: Record<Tab, { label: string; icon: IconType }> = {
   csrf: { label: 'CSRF Sweep', icon: IconSitemap },
   sstiscan: { label: 'SSTI', icon: IconBraces },
   pathtraversal: { label: 'Path Traversal', icon: IconFolder },
+  idor: { label: 'IDOR', icon: IconUnlock },
   xxe: { label: 'XXE', icon: IconCode },
   xss: { label: 'XSS', icon: IconCode },
   tester: { label: 'Tester', icon: IconSend },
@@ -179,6 +183,11 @@ const TAB_META: Record<Tab, { label: string; icon: IconType }> = {
 type NavGroup = { id: string; label: string; icon: IconType; tabs: Tab[] }
 
 const PINNED_TABS: Tab[] = ['targets', 'identify', 'credentials', 'cookieVault']
+
+// JOB_INDICATOR_TABS are the tabs whose scans run as jobs tracked here in
+// CaseView (identify and the recon tools), so their nav border is derived
+// from those jobs rather than reported by the tab itself.
+const JOB_INDICATOR_TABS: Tool[] = ['identify', 'feroxbuster', 'ffuf-subdomain', 'ffuf-vhost', 'ffuf-custom', 'subfinder', 'katana', 'nuclei']
 
 const NAV_GROUPS: NavGroup[] = [
   {
@@ -208,6 +217,7 @@ const NAV_GROUPS: NavGroup[] = [
       'csrf',
       'sstiscan',
       'pathtraversal',
+      'idor',
       'xxe',
       'xss',
     ],
@@ -247,6 +257,16 @@ export function CaseView({ caseId }: { caseId: string }) {
   // (not a ref) because the render reads it.
   const [nodeStartedAt, setNodeStartedAt] = useState<Record<string, number>>({})
   const [tab, setTab] = useState<Tab>('targets')
+  // Each scanner tab's live state for the nav's border, keyed by tab id.
+  // Scanner tabs publish theirs through ScanIndicatorContext; the job-driven
+  // tabs are derived from jobs below.
+  const [indicators, setIndicators] = useState<Record<string, ScanIndicator>>({})
+  // Tabs that finished a run while the user was on another tab. Their border
+  // breathes until the user opens them.
+  const [unseen, setUnseen] = useState<Record<string, true>>({})
+  // The phase each tab had the last time the unseen check ran, so it can tell
+  // a run that just finished from one that was already done.
+  const lastPhase = useRef<Record<string, ScanPhase>>({})
   // Whether the scope editor is open under the case header.
   const [scopeOpen, setScopeOpen] = useState(false)
   const [reportFormat, setReportFormat] = useState<'json' | 'html' | 'pdf'>('html')
@@ -477,45 +497,88 @@ export function CaseView({ caseId }: { caseId: string }) {
     })
   }
 
+  // reportIndicator is the reporter every scanner tab gets through
+  // ScanIndicatorContext. It is stable, and it skips a report that changes
+  // nothing, so a scan's progress events don't re-render the whole case.
+  const reportIndicator = useCallback((key: string, indicator: ScanIndicator) => {
+    setIndicators((prev) => {
+      const before = prev[key]
+      if (before && before.phase === indicator.phase && before.severity === indicator.severity) return prev
+      return { ...prev, [key]: indicator }
+    })
+  }, [])
+
+  // The job-driven tabs report from their jobs: running while any job is,
+  // otherwise done with the worst severity their findings carry (only nuclei
+  // findings carry one).
+  useEffect(() => {
+    for (const tool of JOB_INDICATOR_TABS) {
+      const list = jobsOfTool(tool)
+      // Never run: nothing to outline.
+      if (list.length === 0) {
+        reportIndicator(tool, IDLE_INDICATOR)
+        continue
+      }
+      if (list.some((j) => statusOf(j) === 'running')) {
+        reportIndicator(tool, { phase: 'running', severity: null })
+        continue
+      }
+      let severity: IndicatorSeverity | null = null
+      for (const f of findingsOfTool(tool)) severity = worseSeverity(severity, severityOfName(f.severity))
+      reportIndicator(tool, { phase: 'done', severity })
+    }
+    // jobsOfTool, statusOf and findingsOfTool are plain render helpers over
+    // jobs, jobStatus and runFindings, which are the deps listed here.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jobs, jobStatus, runFindings, reportIndicator])
+
+  // Works out which tabs finished a run while they were off screen. Those stay
+  // unseen (and their border breathes) until the user opens them. A tab that
+  // starts running again is no longer unseen, since it is showing live.
+  useEffect(() => {
+    const finishedElsewhere: string[] = []
+    const started: string[] = []
+    for (const [key, ind] of Object.entries(indicators)) {
+      const was = lastPhase.current[key]
+      lastPhase.current[key] = ind.phase
+      if (ind.phase === 'running') started.push(key)
+      // A run that finished on a tab the user isn't looking at.
+      else if (ind.phase === 'done' && was === 'running' && key !== tab) finishedElsewhere.push(key)
+    }
+    if (started.length === 0 && finishedElsewhere.length === 0) return
+    setUnseen((prev) => {
+      let changed = false
+      const next = { ...prev }
+      for (const key of started) {
+        if (!next[key]) continue
+        delete next[key]
+        changed = true
+      }
+      for (const key of finishedElsewhere) {
+        if (next[key]) continue
+        next[key] = true
+        changed = true
+      }
+      return changed ? next : prev
+    })
+  }, [indicators, tab])
+
+  // Opening a tab marks it seen, however the user got there (a click, or a
+  // "Send to X" handoff switching tabs for them).
+  useEffect(() => {
+    setUnseen((prev) => {
+      if (!prev[tab]) return prev
+      const next = { ...prev }
+      delete next[tab]
+      return next
+    })
+  }, [tab])
+
   if (!c) {
     return <div className="p-8 text-neutral-500">Loading…</div>
   }
 
   const runningJobs = jobs.filter((j) => statusOf(j) === 'running')
-  const dots: Record<Tab, string> = {
-    targets: STATUS_DOT.done,
-    identify: jobsOfTool('identify').length === 0 ? STATUS_DOT.pending : jobsOfTool('identify').some((j) => statusOf(j) === 'running') ? STATUS_DOT.running : STATUS_DOT.done,
-    feroxbuster: jobsOfTool('feroxbuster').length === 0 ? STATUS_DOT.pending : jobsOfTool('feroxbuster').some((j) => statusOf(j) === 'running') ? STATUS_DOT.running : STATUS_DOT.done,
-    'ffuf-subdomain':
-      jobsOfTool('ffuf-subdomain').length === 0 ? STATUS_DOT.pending : jobsOfTool('ffuf-subdomain').some((j) => statusOf(j) === 'running') ? STATUS_DOT.running : STATUS_DOT.done,
-    'ffuf-vhost': jobsOfTool('ffuf-vhost').length === 0 ? STATUS_DOT.pending : jobsOfTool('ffuf-vhost').some((j) => statusOf(j) === 'running') ? STATUS_DOT.running : STATUS_DOT.done,
-    'ffuf-custom': jobsOfTool('ffuf-custom').length === 0 ? STATUS_DOT.pending : jobsOfTool('ffuf-custom').some((j) => statusOf(j) === 'running') ? STATUS_DOT.running : STATUS_DOT.done,
-    subfinder: jobsOfTool('subfinder').length === 0 ? STATUS_DOT.pending : jobsOfTool('subfinder').some((j) => statusOf(j) === 'running') ? STATUS_DOT.running : STATUS_DOT.done,
-    katana: jobsOfTool('katana').length === 0 ? STATUS_DOT.pending : jobsOfTool('katana').some((j) => statusOf(j) === 'running') ? STATUS_DOT.running : STATUS_DOT.done,
-    nuclei: jobsOfTool('nuclei').length === 0 ? STATUS_DOT.pending : jobsOfTool('nuclei').some((j) => statusOf(j) === 'running') ? STATUS_DOT.running : STATUS_DOT.done,
-    jwtscan: STATUS_DOT.done,
-    probe: STATUS_DOT.done,
-    domainscan: STATUS_DOT.done,
-    secrets: STATUS_DOT.done,
-    breach: STATUS_DOT.done,
-    bypass403: STATUS_DOT.done,
-    gitdump: STATUS_DOT.done,
-    pwreset: STATUS_DOT.done,
-    graphqlenum: STATUS_DOT.done,
-    apienum: STATUS_DOT.done,
-    corsscan: STATUS_DOT.done,
-    openredirect: STATUS_DOT.done,
-    ssrf: STATUS_DOT.done,
-    csrf: STATUS_DOT.done,
-    sstiscan: STATUS_DOT.done,
-    pathtraversal: STATUS_DOT.done,
-    xxe: STATUS_DOT.done,
-    xss: STATUS_DOT.done,
-    tester: STATUS_DOT.done,
-    collaborator: STATUS_DOT.done,
-    credentials: STATUS_DOT.done,
-    cookieVault: STATUS_DOT.done,
-  }
   const counts: Record<Tab, number | null> = {
     targets: targets.length,
     identify: null,
@@ -542,6 +605,7 @@ export function CaseView({ caseId }: { caseId: string }) {
     csrf: null,
     sstiscan: null,
     pathtraversal: null,
+    idor: null,
     xxe: null,
     xss: null,
     tester: null,
@@ -551,386 +615,447 @@ export function CaseView({ caseId }: { caseId: string }) {
   }
 
   return (
-    <div className="flex h-full flex-col">
-      <header className="flex items-center gap-3 border-b border-neutral-800 bg-neutral-950 px-4 py-2">
-        <h1 className="text-sm font-medium text-neutral-100">{c.name}</h1>
-        <button
-          type="button"
-          onClick={() => setScopeOpen((v) => !v)}
-          className="rounded border border-neutral-700 px-2 py-0.5 text-xs text-neutral-300 hover:bg-neutral-800"
-        >
-          Scope{scopeOpen ? ' ▴' : ' ▾'}
-        </button>
-        {c.description && <span className="truncate text-xs text-neutral-500">{c.description}</span>}
-        <span className="text-xs text-neutral-500">{new Date(c.createdAt).toLocaleString()}</span>
-        {runningJobs.length > 0 && (
-          <span className="rounded-full bg-amber-900/40 px-2 py-0.5 text-xs text-amber-400">
-            {runningJobs.length} job{runningJobs.length === 1 ? '' : 's'} running
-          </span>
-        )}
-        <div className="ml-auto flex items-center gap-2">
-          <select
-            value={reportFormat}
-            onChange={(e) => setReportFormat(e.target.value as 'json' | 'html' | 'pdf')}
-            className="rounded border border-neutral-700 bg-neutral-900 px-1.5 py-1 text-xs text-neutral-300 outline-none focus:border-sky-500"
+    <ScanIndicatorContext.Provider value={reportIndicator}>
+      <div className="flex h-full flex-col">
+        <header className="flex items-center gap-3 border-b border-neutral-800 bg-neutral-950 px-4 py-2">
+          <h1 className="text-sm font-medium text-neutral-100">{c.name}</h1>
+          <button
+            type="button"
+            onClick={() => setScopeOpen((v) => !v)}
+            className="rounded border border-neutral-700 px-2 py-0.5 text-xs text-neutral-300 hover:bg-neutral-800"
           >
-            <option value="html">HTML</option>
-            <option value="pdf">PDF</option>
-            <option value="json">JSON</option>
-          </select>
-          <a
-            href={api.reportUrl(caseId, reportFormat)}
-            className="rounded border border-neutral-700 px-2.5 py-1 text-xs text-neutral-300 hover:border-sky-500 hover:text-sky-400"
-          >
-            Download report
-          </a>
-        </div>
-      </header>
-      {scopeOpen && <ScopeEditor key={c.id} caseId={c.id} />}
+            Scope{scopeOpen ? ' ▴' : ' ▾'}
+          </button>
+          {c.description && <span className="truncate text-xs text-neutral-500">{c.description}</span>}
+          <span className="text-xs text-neutral-500">{new Date(c.createdAt).toLocaleString()}</span>
+          {runningJobs.length > 0 && (
+            <span className="rounded-full bg-amber-900/40 px-2 py-0.5 text-xs text-amber-400">
+              {runningJobs.length} job{runningJobs.length === 1 ? '' : 's'} running
+            </span>
+          )}
+          <div className="ml-auto flex items-center gap-2">
+            <select
+              value={reportFormat}
+              onChange={(e) => setReportFormat(e.target.value as 'json' | 'html' | 'pdf')}
+              className="rounded border border-neutral-700 bg-neutral-900 px-1.5 py-1 text-xs text-neutral-300 outline-none focus:border-sky-500"
+            >
+              <option value="html">HTML</option>
+              <option value="pdf">PDF</option>
+              <option value="json">JSON</option>
+            </select>
+            <a
+              href={api.reportUrl(caseId, reportFormat)}
+              className="rounded border border-neutral-700 px-2.5 py-1 text-xs text-neutral-300 hover:border-sky-500 hover:text-sky-400"
+            >
+              Download report
+            </a>
+          </div>
+        </header>
+        {scopeOpen && <ScopeEditor key={c.id} caseId={c.id} />}
 
-      <div className="flex flex-1 overflow-hidden">
-        {navOpen ? (
-          <aside className="flex w-56 shrink-0 flex-col overflow-y-auto border-r border-neutral-800 bg-neutral-950 p-2">
-            <button onClick={() => setNavOpen(false)} title="Collapse" className="mb-1 self-end px-1 text-xs text-neutral-600 hover:text-neutral-300">
-              ◂
-            </button>
-            <div className="grid grid-cols-2 gap-1.5">
-              {PINNED_TABS.map((id) => (
-                <NavTabButton key={id} id={id} active={tab === id} dot={dots[id]} count={counts[id]} onSelect={() => setTab(id)} />
-              ))}
+        <div className="flex flex-1 overflow-hidden">
+          {navOpen ? (
+            <aside className="flex w-56 shrink-0 flex-col overflow-y-auto border-r border-neutral-800 bg-neutral-950 p-2">
+              <button onClick={() => setNavOpen(false)} title="Collapse" className="mb-1 self-end px-1 text-xs text-neutral-600 hover:text-neutral-300">
+                ◂
+              </button>
+              <div className="grid grid-cols-2 gap-1.5">
+                {PINNED_TABS.map((id) => (
+                  <NavTabButton key={id} id={id} active={tab === id} indicator={indicators[id]} unseen={!!unseen[id]} count={counts[id]} onSelect={() => setTab(id)} />
+                ))}
+              </div>
+              <div className="my-2 border-t border-neutral-900" />
+              <div className="space-y-3">
+                {NAV_GROUPS.map((group) => (
+                  <NavGroupSection key={group.id} group={group} activeTab={tab} indicators={indicators} unseen={unseen} counts={counts} onSelect={setTab} />
+                ))}
+              </div>
+            </aside>
+          ) : (
+            <aside className="flex w-9 shrink-0 flex-col items-center gap-1 overflow-y-auto border-r border-neutral-800 bg-neutral-950 py-2">
+              <button onClick={() => setNavOpen(true)} title="Expand navigation" className="mb-1 text-neutral-600 hover:text-neutral-300">
+                ▸
+              </button>
+              {[...PINNED_TABS, ...NAV_GROUPS.flatMap((g) => g.tabs)].map((id) => {
+                const Icon = TAB_META[id].icon
+                // The rail is too small for the tile's text, so it shows the same
+                // scan border on the icon button alone.
+                const scan = scanTileProps(indicators[id], !!unseen[id])
+                return (
+                  <button
+                    key={id}
+                    onClick={() => setTab(id)}
+                    title={`${TAB_META[id].label}${counts[id] !== null ? ` (${counts[id]})` : ''}`}
+                    style={scan.style}
+                    className={`relative flex h-7 w-7 items-center justify-center rounded border ${scan.className} ${
+                      scan.ownBorder ? '' : 'border-transparent'
+                    } ${tab === id ? 'bg-neutral-800 text-neutral-100' : 'text-neutral-500 hover:bg-neutral-900 hover:text-neutral-300'}`}
+                  >
+                    <Icon className="h-4 w-4" />
+                    {indicators[id]?.phase === 'done' && (
+                      <span className="absolute -right-0.5 -top-0.5 h-2 w-2 rounded-full" style={{ background: INDICATOR_COLOR[indicators[id]?.severity ?? 'clean'] }} />
+                    )}
+                  </button>
+                )
+              })}
+            </aside>
+          )}
+
+          {/* Every tab stays mounted (toggled via `hidden`, not conditional
+              rendering) so switching tabs to peek at another tool doesn't
+              reset a results table's row selection right before you meant to
+              click "Save selected to case". */}
+          <div className="flex-1 overflow-hidden">
+            <div className={`h-full overflow-y-auto ${tab === 'targets' ? '' : 'hidden'}`}>
+              <TargetsTab caseId={caseId} targets={targets} lists={targetLists} onChange={refreshTargets} onListsChanged={refreshTargetLists} />
             </div>
-            <div className="my-2 border-t border-neutral-900" />
-            <div className="space-y-3">
-              {NAV_GROUPS.map((group) => (
-                <NavGroupSection key={group.id} group={group} activeTab={tab} dots={dots} counts={counts} onSelect={setTab} />
-              ))}
+
+            <div className={`h-full overflow-y-auto ${tab === 'credentials' ? '' : 'hidden'}`}>
+              <CredentialVault caseId={caseId} credentials={credentials} onChanged={refreshCredentials} />
             </div>
-          </aside>
-        ) : (
-          <aside className="flex w-9 shrink-0 flex-col items-center gap-1 overflow-y-auto border-r border-neutral-800 bg-neutral-950 py-2">
-            <button onClick={() => setNavOpen(true)} title="Expand navigation" className="mb-1 text-neutral-600 hover:text-neutral-300">
-              ▸
-            </button>
-            {[...PINNED_TABS, ...NAV_GROUPS.flatMap((g) => g.tabs)].map((id) => {
-              const Icon = TAB_META[id].icon
-              return (
-                <button
-                  key={id}
-                  onClick={() => setTab(id)}
-                  title={`${TAB_META[id].label}${counts[id] !== null ? ` (${counts[id]})` : ''}`}
-                  className={`relative flex h-7 w-7 items-center justify-center rounded ${
-                    tab === id ? 'bg-neutral-800 text-neutral-100' : 'text-neutral-500 hover:bg-neutral-900 hover:text-neutral-300'
-                  }`}
-                >
-                  <Icon className="h-4 w-4" />
-                  <span className="absolute right-0.5 top-0.5 h-1.5 w-1.5 rounded-full" style={{ background: dots[id] }} />
-                </button>
-              )
-            })}
-          </aside>
+
+            <div className={`h-full overflow-y-auto ${tab === 'cookieVault' ? '' : 'hidden'}`}>
+              <CookieVault caseId={caseId} entries={cookieVault} onChanged={refreshCookieVault} />
+            </div>
+
+            <div className={`h-full ${tab === 'identify' ? '' : 'hidden'}`}>
+              <IdentifyTab
+                caseId={caseId}
+                targets={targets}
+                jobs={jobsOfTool('identify')}
+                statusOf={statusOf}
+                checks={checks}
+                onStart={addJob}
+                onCancel={cancelJob}
+                onTargetsChanged={refreshTargets}
+                requestSaveTargets={requestSaveTargets}
+              />
+            </div>
+
+            <div className={`h-full ${tab === 'feroxbuster' ? '' : 'hidden'}`}>
+              <ToolTab
+                caseId={caseId}
+                tool="feroxbuster"
+                targets={targets}
+                credentials={credentials}
+                jobs={jobsOfTool('feroxbuster')}
+                findings={findingsOfTool('feroxbuster')}
+                statusOf={statusOf}
+                nodeStatus={nodeStatus}
+                jobProgress={jobProgress}
+                nodeStartedAt={nodeStartedAt}
+                onStart={addJob}
+                onCancel={cancelJob}
+                onPromote={(values) => promoteFromTool('feroxbuster', values)}
+                deriveTargetValue={(f) => f.url}
+                schemeField
+                recursiveField
+              />
+            </div>
+
+            <div className={`h-full ${tab === 'ffuf-subdomain' ? '' : 'hidden'}`}>
+              <ToolTab
+                caseId={caseId}
+                tool="ffuf-subdomain"
+                targets={targets}
+                credentials={credentials}
+                jobs={jobsOfTool('ffuf-subdomain')}
+                findings={findingsOfTool('ffuf-subdomain')}
+                statusOf={statusOf}
+                nodeStatus={nodeStatus}
+                jobProgress={jobProgress}
+                nodeStartedAt={nodeStartedAt}
+                onStart={addJob}
+                onCancel={cancelJob}
+                onPromote={(values) => promoteFromTool('ffuf-subdomain', values)}
+                schemeField
+              />
+            </div>
+
+            <div className={`h-full ${tab === 'ffuf-vhost' ? '' : 'hidden'}`}>
+              <ToolTab
+                caseId={caseId}
+                tool="ffuf-vhost"
+                targets={targets}
+                credentials={credentials}
+                jobs={jobsOfTool('ffuf-vhost')}
+                findings={findingsOfTool('ffuf-vhost')}
+                statusOf={statusOf}
+                nodeStatus={nodeStatus}
+                jobProgress={jobProgress}
+                nodeStartedAt={nodeStartedAt}
+                onStart={addJob}
+                onCancel={cancelJob}
+                onPromote={(values) => promoteFromTool('ffuf-vhost', values)}
+                schemeField
+                hostSuffixField
+              />
+            </div>
+
+            <div className={`h-full ${tab === 'subfinder' ? '' : 'hidden'}`}>
+              <ToolTab
+                caseId={caseId}
+                tool="subfinder"
+                targets={targets}
+                credentials={credentials}
+                jobs={jobsOfTool('subfinder')}
+                findings={findingsOfTool('subfinder')}
+                statusOf={statusOf}
+                nodeStatus={nodeStatus}
+                jobProgress={jobProgress}
+                nodeStartedAt={nodeStartedAt}
+                onStart={addJob}
+                onCancel={cancelJob}
+                onPromote={(values) => promoteFromTool('subfinder', values)}
+                wordlistField={false}
+                credentialField={false}
+              />
+            </div>
+
+            <div className={`h-full ${tab === 'katana' ? '' : 'hidden'}`}>
+              <ToolTab
+                caseId={caseId}
+                tool="katana"
+                targets={targets}
+                credentials={credentials}
+                jobs={jobsOfTool('katana')}
+                findings={findingsOfTool('katana')}
+                statusOf={statusOf}
+                nodeStatus={nodeStatus}
+                jobProgress={jobProgress}
+                nodeStartedAt={nodeStartedAt}
+                onStart={addJob}
+                onCancel={cancelJob}
+                onPromote={(values) => promoteFromTool('katana', values)}
+                schemeField
+                wordlistField={false}
+              />
+            </div>
+
+            <div className={`h-full ${tab === 'ffuf-custom' ? '' : 'hidden'}`}>
+              <FfufTab
+                caseId={caseId}
+                targets={targets}
+                credentials={credentials}
+                jobs={jobsOfTool('ffuf-custom')}
+                findings={findingsOfTool('ffuf-custom')}
+                statusOf={statusOf}
+                nodeStatus={nodeStatus}
+                jobProgress={jobProgress}
+                nodeStartedAt={nodeStartedAt}
+                onStart={addJob}
+                onCancel={cancelJob}
+                onPromote={(values) => promoteFromTool('ffuf-custom', values)}
+              />
+            </div>
+
+            <div className={`h-full ${tab === 'nuclei' ? '' : 'hidden'}`}>
+              <ToolTab
+                caseId={caseId}
+                tool="nuclei"
+                targets={targets}
+                credentials={credentials}
+                jobs={jobsOfTool('nuclei')}
+                findings={findingsOfTool('nuclei')}
+                statusOf={statusOf}
+                nodeStatus={nodeStatus}
+                jobProgress={jobProgress}
+                nodeStartedAt={nodeStartedAt}
+                onStart={addJob}
+                onCancel={cancelJob}
+                onPromote={(values) => promoteFromTool('nuclei', values)}
+                schemeField
+                wordlistField={false}
+                credentialField={false}
+                resultsView={(nucleiFindings) => <NucleiResults findings={nucleiFindings} />}
+              />
+            </div>
+
+            <div className={`h-full overflow-hidden ${tab === 'jwtscan' ? '' : 'hidden'}`}>
+              <JwtScan caseId={caseId} targets={targets} credentials={credentials} prefill={jwtPrefill} />
+            </div>
+
+            <div className={`h-full overflow-y-auto ${tab === 'probe' ? '' : 'hidden'}`}>
+              <Probe caseId={caseId} targets={targets} credentials={credentials} prefill={probePrefill} />
+            </div>
+
+            <div className={`h-full overflow-y-auto ${tab === 'domainscan' ? '' : 'hidden'}`}>
+              <DomainScan caseId={caseId} targets={targets} credentials={credentials} />
+            </div>
+
+            <div className={`h-full overflow-y-auto ${tab === 'secrets' ? '' : 'hidden'}`}>
+              <SecretScan caseId={caseId} targets={targets} credentials={credentials} prefill={secretScanPrefill} />
+            </div>
+
+            <div className={`h-full overflow-y-auto ${tab === 'breach' ? '' : 'hidden'}`}>
+              <BreachCheck caseId={caseId} targets={targets} credentials={credentials} />
+            </div>
+
+            <div className={`h-full overflow-y-auto ${tab === 'bypass403' ? '' : 'hidden'}`}>
+              <Bypass403 caseId={caseId} targets={targets} credentials={credentials} prefill={bypass403Prefill} />
+            </div>
+
+            <div className={`h-full overflow-y-auto ${tab === 'gitdump' ? '' : 'hidden'}`}>
+              <GitDump caseId={caseId} targets={targets} credentials={credentials} />
+            </div>
+
+            <div className={`h-full overflow-y-auto ${tab === 'pwreset' ? '' : 'hidden'}`}>
+              <PwReset caseId={caseId} targets={targets} credentials={credentials} />
+            </div>
+
+            <div className={`h-full overflow-y-auto ${tab === 'graphqlenum' ? '' : 'hidden'}`}>
+              <GraphqlEnum caseId={caseId} targets={targets} credentials={credentials} />
+            </div>
+
+            <div className={`h-full overflow-y-auto ${tab === 'apienum' ? '' : 'hidden'}`}>
+              <ApiEnum caseId={caseId} targets={targets} credentials={credentials} requestSaveTargets={requestSaveTargets} onTargetsChanged={refreshTargets} />
+            </div>
+
+            <div className={`h-full overflow-y-auto ${tab === 'corsscan' ? '' : 'hidden'}`}>
+              <Cors caseId={caseId} targets={targets} credentials={credentials} />
+            </div>
+
+            <div className={`h-full overflow-y-auto ${tab === 'openredirect' ? '' : 'hidden'}`}>
+              <OpenRedirect caseId={caseId} targets={targets} credentials={credentials} />
+            </div>
+
+            <div className={`h-full overflow-y-auto ${tab === 'ssrf' ? '' : 'hidden'}`}>
+              <Ssrf caseId={caseId} targets={targets} credentials={credentials} />
+            </div>
+
+            <div className={`h-full overflow-y-auto ${tab === 'csrf' ? '' : 'hidden'}`}>
+              <Csrf caseId={caseId} targets={targets} credentials={credentials} />
+            </div>
+
+            <div className={`h-full overflow-y-auto ${tab === 'sstiscan' ? '' : 'hidden'}`}>
+              <SstiScan caseId={caseId} targets={targets} credentials={credentials} />
+            </div>
+
+            <div className={`h-full overflow-y-auto ${tab === 'pathtraversal' ? '' : 'hidden'}`}>
+              <PathTraversal caseId={caseId} targets={targets} credentials={credentials} />
+            </div>
+
+            <div className={`h-full overflow-y-auto ${tab === 'idor' ? '' : 'hidden'}`}>
+              <Idor caseId={caseId} targets={targets} credentials={credentials} cookieVault={cookieVault} />
+            </div>
+
+            <div className={`h-full overflow-y-auto ${tab === 'xxe' ? '' : 'hidden'}`}>
+              <Xxe caseId={caseId} targets={targets} credentials={credentials} />
+            </div>
+
+            <div className={`h-full overflow-y-auto ${tab === 'xss' ? '' : 'hidden'}`}>
+              <XssScan caseId={caseId} targets={targets} credentials={credentials} />
+            </div>
+
+            <div className={`h-full overflow-hidden ${tab === 'tester' ? '' : 'hidden'}`}>
+              <Tester caseId={caseId} targets={targets} credentials={credentials} cookieVault={cookieVault} prefill={testerPrefill} />
+            </div>
+
+            <div className={`h-full overflow-y-auto ${tab === 'collaborator' ? '' : 'hidden'}`}>
+              <Collaborator />
+            </div>
+
+          </div>
+        </div>
+
+        {pendingPromote && (
+          <SaveToListModal
+            lists={targetLists}
+            itemLabel={`${pendingPromote.values.length} target${pendingPromote.values.length === 1 ? '' : 's'}`}
+            onPick={confirmPromote}
+            onCreateList={createTargetList}
+            onClose={() => setPendingPromote(null)}
+          />
         )}
-
-        {/* Every tab stays mounted (toggled via `hidden`, not conditional
-            rendering) so switching tabs to peek at another tool doesn't
-            reset a results table's row selection right before you meant to
-            click "Save selected to case". */}
-        <div className="flex-1 overflow-hidden">
-          <div className={`h-full overflow-y-auto ${tab === 'targets' ? '' : 'hidden'}`}>
-            <TargetsTab caseId={caseId} targets={targets} lists={targetLists} onChange={refreshTargets} onListsChanged={refreshTargetLists} />
-          </div>
-
-          <div className={`h-full overflow-y-auto ${tab === 'credentials' ? '' : 'hidden'}`}>
-            <CredentialVault caseId={caseId} credentials={credentials} onChanged={refreshCredentials} />
-          </div>
-
-          <div className={`h-full overflow-y-auto ${tab === 'cookieVault' ? '' : 'hidden'}`}>
-            <CookieVault caseId={caseId} entries={cookieVault} onChanged={refreshCookieVault} />
-          </div>
-
-          <div className={`h-full ${tab === 'identify' ? '' : 'hidden'}`}>
-            <IdentifyTab
-              caseId={caseId}
-              targets={targets}
-              jobs={jobsOfTool('identify')}
-              statusOf={statusOf}
-              checks={checks}
-              onStart={addJob}
-              onCancel={cancelJob}
-              onTargetsChanged={refreshTargets}
-              requestSaveTargets={requestSaveTargets}
-            />
-          </div>
-
-          <div className={`h-full ${tab === 'feroxbuster' ? '' : 'hidden'}`}>
-            <ToolTab
-              caseId={caseId}
-              tool="feroxbuster"
-              targets={targets}
-              credentials={credentials}
-              jobs={jobsOfTool('feroxbuster')}
-              findings={findingsOfTool('feroxbuster')}
-              statusOf={statusOf}
-              nodeStatus={nodeStatus}
-              jobProgress={jobProgress}
-              nodeStartedAt={nodeStartedAt}
-              onStart={addJob}
-              onCancel={cancelJob}
-              onPromote={(values) => promoteFromTool('feroxbuster', values)}
-              deriveTargetValue={(f) => f.url}
-              schemeField
-              recursiveField
-            />
-          </div>
-
-          <div className={`h-full ${tab === 'ffuf-subdomain' ? '' : 'hidden'}`}>
-            <ToolTab
-              caseId={caseId}
-              tool="ffuf-subdomain"
-              targets={targets}
-              credentials={credentials}
-              jobs={jobsOfTool('ffuf-subdomain')}
-              findings={findingsOfTool('ffuf-subdomain')}
-              statusOf={statusOf}
-              nodeStatus={nodeStatus}
-              jobProgress={jobProgress}
-              nodeStartedAt={nodeStartedAt}
-              onStart={addJob}
-              onCancel={cancelJob}
-              onPromote={(values) => promoteFromTool('ffuf-subdomain', values)}
-              schemeField
-            />
-          </div>
-
-          <div className={`h-full ${tab === 'ffuf-vhost' ? '' : 'hidden'}`}>
-            <ToolTab
-              caseId={caseId}
-              tool="ffuf-vhost"
-              targets={targets}
-              credentials={credentials}
-              jobs={jobsOfTool('ffuf-vhost')}
-              findings={findingsOfTool('ffuf-vhost')}
-              statusOf={statusOf}
-              nodeStatus={nodeStatus}
-              jobProgress={jobProgress}
-              nodeStartedAt={nodeStartedAt}
-              onStart={addJob}
-              onCancel={cancelJob}
-              onPromote={(values) => promoteFromTool('ffuf-vhost', values)}
-              schemeField
-              hostSuffixField
-            />
-          </div>
-
-          <div className={`h-full ${tab === 'subfinder' ? '' : 'hidden'}`}>
-            <ToolTab
-              caseId={caseId}
-              tool="subfinder"
-              targets={targets}
-              credentials={credentials}
-              jobs={jobsOfTool('subfinder')}
-              findings={findingsOfTool('subfinder')}
-              statusOf={statusOf}
-              nodeStatus={nodeStatus}
-              jobProgress={jobProgress}
-              nodeStartedAt={nodeStartedAt}
-              onStart={addJob}
-              onCancel={cancelJob}
-              onPromote={(values) => promoteFromTool('subfinder', values)}
-              wordlistField={false}
-              credentialField={false}
-            />
-          </div>
-
-          <div className={`h-full ${tab === 'katana' ? '' : 'hidden'}`}>
-            <ToolTab
-              caseId={caseId}
-              tool="katana"
-              targets={targets}
-              credentials={credentials}
-              jobs={jobsOfTool('katana')}
-              findings={findingsOfTool('katana')}
-              statusOf={statusOf}
-              nodeStatus={nodeStatus}
-              jobProgress={jobProgress}
-              nodeStartedAt={nodeStartedAt}
-              onStart={addJob}
-              onCancel={cancelJob}
-              onPromote={(values) => promoteFromTool('katana', values)}
-              schemeField
-              wordlistField={false}
-            />
-          </div>
-
-          <div className={`h-full ${tab === 'ffuf-custom' ? '' : 'hidden'}`}>
-            <FfufTab
-              caseId={caseId}
-              targets={targets}
-              credentials={credentials}
-              jobs={jobsOfTool('ffuf-custom')}
-              findings={findingsOfTool('ffuf-custom')}
-              statusOf={statusOf}
-              nodeStatus={nodeStatus}
-              jobProgress={jobProgress}
-              nodeStartedAt={nodeStartedAt}
-              onStart={addJob}
-              onCancel={cancelJob}
-              onPromote={(values) => promoteFromTool('ffuf-custom', values)}
-            />
-          </div>
-
-          <div className={`h-full ${tab === 'nuclei' ? '' : 'hidden'}`}>
-            <ToolTab
-              caseId={caseId}
-              tool="nuclei"
-              targets={targets}
-              credentials={credentials}
-              jobs={jobsOfTool('nuclei')}
-              findings={findingsOfTool('nuclei')}
-              statusOf={statusOf}
-              nodeStatus={nodeStatus}
-              jobProgress={jobProgress}
-              nodeStartedAt={nodeStartedAt}
-              onStart={addJob}
-              onCancel={cancelJob}
-              onPromote={(values) => promoteFromTool('nuclei', values)}
-              schemeField
-              wordlistField={false}
-              credentialField={false}
-              resultsView={(nucleiFindings) => <NucleiResults findings={nucleiFindings} />}
-            />
-          </div>
-
-          <div className={`h-full overflow-hidden ${tab === 'jwtscan' ? '' : 'hidden'}`}>
-            <JwtScan caseId={caseId} targets={targets} credentials={credentials} prefill={jwtPrefill} />
-          </div>
-
-          <div className={`h-full overflow-y-auto ${tab === 'probe' ? '' : 'hidden'}`}>
-            <Probe caseId={caseId} targets={targets} credentials={credentials} prefill={probePrefill} />
-          </div>
-
-          <div className={`h-full overflow-y-auto ${tab === 'domainscan' ? '' : 'hidden'}`}>
-            <DomainScan caseId={caseId} targets={targets} credentials={credentials} />
-          </div>
-
-          <div className={`h-full overflow-y-auto ${tab === 'secrets' ? '' : 'hidden'}`}>
-            <SecretScan caseId={caseId} targets={targets} credentials={credentials} prefill={secretScanPrefill} />
-          </div>
-
-          <div className={`h-full overflow-y-auto ${tab === 'breach' ? '' : 'hidden'}`}>
-            <BreachCheck caseId={caseId} targets={targets} credentials={credentials} />
-          </div>
-
-          <div className={`h-full overflow-y-auto ${tab === 'bypass403' ? '' : 'hidden'}`}>
-            <Bypass403 caseId={caseId} targets={targets} credentials={credentials} prefill={bypass403Prefill} />
-          </div>
-
-          <div className={`h-full overflow-y-auto ${tab === 'gitdump' ? '' : 'hidden'}`}>
-            <GitDump caseId={caseId} targets={targets} credentials={credentials} />
-          </div>
-
-          <div className={`h-full overflow-y-auto ${tab === 'pwreset' ? '' : 'hidden'}`}>
-            <PwReset caseId={caseId} targets={targets} credentials={credentials} />
-          </div>
-
-          <div className={`h-full overflow-y-auto ${tab === 'graphqlenum' ? '' : 'hidden'}`}>
-            <GraphqlEnum caseId={caseId} targets={targets} credentials={credentials} />
-          </div>
-
-          <div className={`h-full overflow-y-auto ${tab === 'apienum' ? '' : 'hidden'}`}>
-            <ApiEnum caseId={caseId} targets={targets} credentials={credentials} requestSaveTargets={requestSaveTargets} onTargetsChanged={refreshTargets} />
-          </div>
-
-          <div className={`h-full overflow-y-auto ${tab === 'corsscan' ? '' : 'hidden'}`}>
-            <Cors caseId={caseId} targets={targets} credentials={credentials} />
-          </div>
-
-          <div className={`h-full overflow-y-auto ${tab === 'openredirect' ? '' : 'hidden'}`}>
-            <OpenRedirect caseId={caseId} targets={targets} credentials={credentials} />
-          </div>
-
-          <div className={`h-full overflow-y-auto ${tab === 'ssrf' ? '' : 'hidden'}`}>
-            <Ssrf caseId={caseId} targets={targets} credentials={credentials} />
-          </div>
-
-          <div className={`h-full overflow-y-auto ${tab === 'csrf' ? '' : 'hidden'}`}>
-            <Csrf caseId={caseId} targets={targets} credentials={credentials} />
-          </div>
-
-          <div className={`h-full overflow-y-auto ${tab === 'sstiscan' ? '' : 'hidden'}`}>
-            <SstiScan caseId={caseId} targets={targets} credentials={credentials} />
-          </div>
-
-          <div className={`h-full overflow-y-auto ${tab === 'pathtraversal' ? '' : 'hidden'}`}>
-            <PathTraversal caseId={caseId} targets={targets} credentials={credentials} />
-          </div>
-
-          <div className={`h-full overflow-y-auto ${tab === 'xxe' ? '' : 'hidden'}`}>
-            <Xxe caseId={caseId} targets={targets} credentials={credentials} />
-          </div>
-
-          <div className={`h-full overflow-y-auto ${tab === 'xss' ? '' : 'hidden'}`}>
-            <XssScan caseId={caseId} targets={targets} credentials={credentials} />
-          </div>
-
-          <div className={`h-full overflow-hidden ${tab === 'tester' ? '' : 'hidden'}`}>
-            <Tester caseId={caseId} targets={targets} credentials={credentials} cookieVault={cookieVault} prefill={testerPrefill} />
-          </div>
-
-          <div className={`h-full overflow-y-auto ${tab === 'collaborator' ? '' : 'hidden'}`}>
-            <Collaborator />
-          </div>
-
-        </div>
       </div>
-
-      {pendingPromote && (
-        <SaveToListModal
-          lists={targetLists}
-          itemLabel={`${pendingPromote.values.length} target${pendingPromote.values.length === 1 ? '' : 's'}`}
-          onPick={confirmPromote}
-          onCreateList={createTargetList}
-          onClose={() => setPendingPromote(null)}
-        />
-      )}
-    </div>
+    </ScanIndicatorContext.Provider>
   )
 }
 
 // --- Nav (left sidebar) ---
 
+// ScanTileProps is what a nav tile needs from its scan state: the classes and
+// inline style for its border, and whether that border is colored by the scan
+// (in which case the tile's own active/idle border colors step aside).
+interface ScanTileProps {
+  className: string
+  style: CSSProperties
+  ownBorder: boolean
+}
+
+// scanTileProps turns a tab's indicator into how its nav tile looks. A running
+// tab gets a comet sweeping its border and a soft pulse. When the run finishes
+// the comet closes into a ring and flashes out, and the border settles into a
+// solid outline in the result's color, which breathes until the user opens the
+// tab. A tab that never ran keeps its plain look.
+function scanTileProps(indicator: ScanIndicator | undefined, unseen: boolean): ScanTileProps {
+  if (!indicator || indicator.phase === 'idle') return { className: '', style: {}, ownBorder: false }
+  if (indicator.phase === 'running') {
+    return { className: 'scan-live', style: { '--scan-color': INDICATOR_COLOR.running } as CSSProperties, ownBorder: false }
+  }
+  // A finished run with nothing worth a look shows the clean green.
+  const color = INDICATOR_COLOR[indicator.severity ?? 'clean']
+  return {
+    className: unseen ? 'scan-done scan-breathe' : 'scan-done scan-outline',
+    style: { '--scan-color': color, borderColor: color } as CSSProperties,
+    ownBorder: true,
+  }
+}
+
 // NavTabButton is one rectangular tile in the nav's 2-column grid -- either
 // pinned at the top (Targets/Identify/Credentials/Cookie Vault) or inside a
-// NavGroupSection below. The icon and label fill the tile; the status dot
-// sits in the top-right corner and the item count in the top-left.
+// NavGroupSection below. The icon and label fill the tile, the item count sits
+// in the top-left, and a scanner tab's border shows its scan state (see
+// scanTileProps).
 function NavTabButton({
   id,
   active,
-  dot,
+  indicator,
+  unseen,
   count,
   onSelect,
 }: {
   id: Tab
   active: boolean
-  dot: string
+  indicator: ScanIndicator | undefined
+  unseen: boolean
   count: number | null
   onSelect: () => void
 }) {
   const { label, icon: Icon } = TAB_META[id]
+  const scan = scanTileProps(indicator, unseen)
+  // The border color comes from the scan when there is one, so the active
+  // tab only gets its sky border when no scan color is shown.
+  const borderClass = scan.ownBorder ? '' : active ? 'border-sky-500' : 'border-neutral-800 hover:border-neutral-600'
   return (
     <button
       onClick={onSelect}
       title={`${label}${count !== null ? ` (${count})` : ''}`}
-      className={`relative flex h-16 flex-col items-center justify-center gap-1.5 rounded-md border px-1.5 text-center text-[11px] leading-tight ${
-        active
-          ? 'border-sky-500 bg-sky-950/40 text-sky-300'
-          : 'border-neutral-800 bg-neutral-900 text-neutral-400 hover:border-neutral-600 hover:text-neutral-200'
+      style={scan.style}
+      className={`relative flex h-16 flex-col items-center justify-center gap-1.5 rounded-md border px-1.5 text-center text-[11px] leading-tight ${scan.className} ${borderClass} ${
+        active ? 'bg-sky-950/40 text-sky-300' : 'bg-neutral-900 text-neutral-400 hover:text-neutral-200'
       }`}
     >
       <Icon className="h-4 w-4 shrink-0" />
       <span className="line-clamp-2">{label}</span>
-      <span className="absolute right-1.5 top-1.5 h-1.5 w-1.5 rounded-full" style={{ background: dot }} />
       {count !== null && <span className="absolute left-1.5 top-1 text-[10px] text-neutral-500">{count}</span>}
+      {indicator?.phase === 'done' && <ResultBadge severity={indicator.severity} />}
     </button>
+  )
+}
+
+// ResultBadge is the labelled pill on a finished tile's top-right corner. It
+// is what makes "this scan is finished" readable at a glance, in the result's
+// color, without relying on the border's glow alone.
+function ResultBadge({ severity }: { severity: IndicatorSeverity | null }) {
+  const color = INDICATOR_COLOR[severity ?? 'clean']
+  return (
+    <span
+      className="scan-badge absolute -right-1.5 -top-1.5 rounded-full border bg-neutral-950 px-1.5 py-px text-[9px] font-bold uppercase leading-tight tracking-wide"
+      style={{ color, borderColor: color } as CSSProperties}
+    >
+      {BADGE_LABEL[severity ?? 'clean']}
+    </span>
   )
 }
 
@@ -944,13 +1069,15 @@ function NavTabButton({
 function NavGroupSection({
   group,
   activeTab,
-  dots,
+  indicators,
+  unseen,
   counts,
   onSelect,
 }: {
   group: NavGroup
   activeTab: Tab
-  dots: Record<Tab, string>
+  indicators: Record<string, ScanIndicator>
+  unseen: Record<string, true>
   counts: Record<Tab, number | null>
   onSelect: (tab: Tab) => void
 }) {
@@ -971,7 +1098,7 @@ function NavGroupSection({
       {open && (
         <div className="grid grid-cols-2 gap-1.5 pt-1.5">
           {group.tabs.map((id) => (
-            <NavTabButton key={id} id={id} active={activeTab === id} dot={dots[id]} count={counts[id]} onSelect={() => onSelect(id)} />
+            <NavTabButton key={id} id={id} active={activeTab === id} indicator={indicators[id]} unseen={!!unseen[id]} count={counts[id]} onSelect={() => onSelect(id)} />
           ))}
         </div>
       )}
@@ -980,6 +1107,26 @@ function NavGroupSection({
 }
 
 // --- Targets tab ---
+
+// parseTargetValues splits a batch of pasted/typed/imported targets into
+// individual values. Both newlines and commas count as separators, so a list
+// copied in either shape (one per line, or comma-joined) works. Entries are
+// trimmed, blanks dropped, and duplicates within the batch collapsed so the
+// same host pasted twice is only added once.
+function parseTargetValues(raw: string): string[] {
+  const seen = new Set<string>()
+  const out: string[] = []
+  // A run of any mix of newlines and commas is a single separator, so
+  // "a,b\n\nc," still yields exactly [a, b, c].
+  for (const part of raw.split(/[\n,]+/)) {
+    const v = part.trim()
+    // Skip blanks and values already seen earlier in this same batch.
+    if (!v || seen.has(v)) continue
+    seen.add(v)
+    out.push(v)
+  }
+  return out
+}
 
 // TargetsTab is where the case's target lists themselves are managed --
 // one tab per list (plus "+ New list"), like a row of Spotify playlists.
@@ -1010,6 +1157,9 @@ function TargetsTab({
   const [value, setValue] = useState('')
   const [adding, setAdding] = useState(false)
   const [error, setError] = useState('')
+  // Hidden <input type="file"> driven by the "Import file" button, so the
+  // import affordance reads as a normal button rather than a bare file picker.
+  const fileInputRef = useRef<HTMLInputElement>(null)
 
   const [creatingList, setCreatingList] = useState(false)
   const [newListName, setNewListName] = useState('')
@@ -1075,18 +1225,51 @@ function TargetsTab({
 
   const add = async (e: React.FormEvent) => {
     e.preventDefault()
-    const trimmed = value.trim()
-    if (!trimmed || !activeListId) return
+    const values = parseTargetValues(value)
+    if (values.length === 0 || !activeListId) return
     setAdding(true)
     setError('')
-    try {
-      await api.addTarget(caseId, trimmed, activeListId)
+    // Collect per-value failures so one bad entry (e.g. out of scope) doesn't
+    // discard the rest of the batch or hide which ones didn't make it.
+    const failures: string[] = []
+    await Promise.all(
+      values.map(async (v) => {
+        try {
+          await api.addTarget(caseId, v, activeListId)
+        } catch (err) {
+          failures.push(`${v}: ${err instanceof Error ? err.message : String(err)}`)
+        }
+      }),
+    )
+    const added = values.length - failures.length
+    // Only clear the box and refresh when something actually landed.
+    if (added > 0) {
       setValue('')
       onChange()
+      // Toast only for real batches; a single add stays as quiet as before.
+      if (added > 1) showToast(`Added ${added} targets to ${activeList?.name ?? 'list'}`, 'success')
+    }
+    if (failures.length > 0) {
+      setError(`${failures.length} of ${values.length} failed:\n${failures.join('\n')}`)
+    }
+    setAdding(false)
+  }
+
+  // importFile loads a target file from disk and merges its lines into the
+  // input box, so the user can review/trim the batch before hitting Add rather
+  // than having the file committed straight to the list.
+  const importFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    // Clear the picker so choosing the same file again still fires onChange.
+    e.target.value = ''
+    if (!file) return
+    try {
+      const text = await file.text()
+      // Append to whatever is already typed rather than clobbering it, keeping
+      // a newline between the existing entry and the imported block.
+      setValue((prev) => (prev.trim() ? `${prev.trim()}\n${text}` : text))
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setAdding(false)
     }
   }
 
@@ -1179,21 +1362,41 @@ function TargetsTab({
       ) : (
         <>
           <form onSubmit={add} className="flex gap-2">
-            <input
+            <textarea
               value={value}
               onChange={(e) => setValue(e.target.value)}
-              placeholder={activeList ? TARGET_LIST_KIND_PLACEHOLDERS[activeList.kind] : ''}
-              className="flex-1 rounded-lg border border-neutral-700 bg-neutral-900 px-3 py-2 text-sm text-neutral-100 outline-none focus:border-sky-500"
+              onKeyDown={(e) => {
+                // Cmd/Ctrl+Enter submits; a bare Enter adds a newline so the
+                // box can hold a multi-line batch.
+                if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+                  e.preventDefault()
+                  add(e as unknown as React.FormEvent)
+                }
+              }}
+              rows={2}
+              placeholder={activeList ? `${TARGET_LIST_KIND_PLACEHOLDERS[activeList.kind]} — one per line or comma-separated` : ''}
+              className="flex-1 resize-y rounded-lg border border-neutral-700 bg-neutral-900 px-3 py-2 text-sm text-neutral-100 outline-none focus:border-sky-500"
             />
-            <button
-              type="submit"
-              disabled={adding || !value.trim()}
-              className="rounded-lg bg-sky-600 px-4 py-2 text-sm font-medium text-white hover:bg-sky-500 disabled:opacity-50"
-            >
-              {adding ? 'Adding…' : `Add to ${activeList?.name ?? 'list'}`}
-            </button>
+            <div className="flex flex-col gap-2">
+              <button
+                type="submit"
+                disabled={adding || parseTargetValues(value).length === 0}
+                className="rounded-lg bg-sky-600 px-4 py-2 text-sm font-medium text-white hover:bg-sky-500 disabled:opacity-50"
+              >
+                {adding ? 'Adding…' : `Add to ${activeList?.name ?? 'list'}`}
+              </button>
+              {/* Hidden picker; the visible button below triggers it. */}
+              <input ref={fileInputRef} type="file" accept=".txt,.csv,.lst,text/*" onChange={importFile} className="hidden" />
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                className="rounded-lg border border-neutral-700 bg-neutral-900 px-4 py-2 text-sm font-medium text-neutral-300 hover:border-sky-600 hover:text-sky-400"
+              >
+                Import file
+              </button>
+            </div>
           </form>
-          {error && <p className="text-sm text-red-400">{error}</p>}
+          {error && <p className="whitespace-pre-wrap text-sm text-red-400">{error}</p>}
 
           <div className="rounded-lg border border-neutral-800">
             <div className="flex items-center gap-2 border-b border-neutral-800 px-3 py-2">

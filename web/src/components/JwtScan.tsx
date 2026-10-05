@@ -14,6 +14,7 @@ import { inputBase } from '../formStyles'
 import { toAbsoluteUrl } from '../url'
 import { sendToTester } from '../testerHandoff'
 import { emptyProgress, runTrackedScan, stopTrackedScan, type TrackedScan } from '../scanProgress'
+import { indicatorOfScans, useReportScanIndicator } from '../scanIndicator'
 import { ScanTargetCard } from './ScanTargetCard'
 import { stoppedSummary, type BatchResultSummary } from './BatchResultsPanel'
 import { ScanErrorNotice } from './ScanErrorNotice'
@@ -88,6 +89,9 @@ export function JwtScan({
   const [result, setResult] = useState<JwtScanResponse | null>(null)
   // live is the run's streamed progress, shown as one card above its results.
   const [live, setLive] = useState<TrackedScan<JwtScanResponse> | null>(null)
+  // Publishes the live run's state to the case nav's border. JWT test results
+  // carry no severity, so a finished run shows the clean green.
+  useReportScanIndicator('jwtscan', indicatorOfScans(live ? { live } : {}, () => []))
   const [view, setView] = useState<'scan' | 'history'>('scan')
 
   // Restores this case's most recent JWT scan on mount/reload -- see

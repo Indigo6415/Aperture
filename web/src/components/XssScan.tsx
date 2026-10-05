@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api } from '../api'
-import type { Credential, Target, XssResponse } from '../types'
+import type { CallbackSelection, Credential, Target, XssResponse } from '../types'
 import { CollapsibleFormPanel } from './CollapsibleFormPanel'
 import { TargetPicker } from './TargetPicker'
 import { CredentialPicker } from './CredentialPicker'
+import { CallbackPicker } from './CallbackPicker'
 import { BatchResultsPanel, stoppedSummary, type BatchResultSummary } from './BatchResultsPanel'
 import { ScanHistoryPanel } from './ScanHistoryPanel'
 import { ScanWindowTabs } from './ScanWindowTabs'
@@ -12,10 +13,12 @@ import { useAutoCollapseOnce, useCollapsible } from '../collapsible'
 import { inputBase } from '../formStyles'
 import { toAbsoluteUrl } from '../url'
 import { emptyProgress, runTrackedScan, type TrackedScan, runBatch, stopTrackedScan, useScanBatch, stopAllScans } from '../scanProgress'
+import { indicatorOfScans, useReportScanIndicator } from '../scanIndicator'
 import { SeverityTiles, ModuleResultsList, totalFindingsOf, hasSevereFindings } from './ScanModuleResults'
 
 import { ScanErrorNotice } from './ScanErrorNotice'
 import { useScanSpeed } from './scanSpeed'
+import { ParamMiningToggle } from './ParamMiningToggle'
 
 type TargetScanState = TrackedScan<XssResponse>
 
@@ -40,6 +43,7 @@ export function XssScan({ caseId, targets, credentials }: { caseId: string; targ
   const [scans, setScans] = useState<Record<string, TargetScanState>>({})
   const batch = useScanBatch()
   const [credentialId, setCredentialId] = useState<string | undefined>()
+  const [callback, setCallback] = useState<CallbackSelection | null>(null)
   const [extraParams, setExtraParams] = useState('')
   const [recursionDepth, setRecursionDepth] = useState(1)
   const [maxPages, setMaxPages] = useState(25)
@@ -69,8 +73,11 @@ export function XssScan({ caseId, targets, credentials }: { caseId: string; targ
   const manualTargets = useMemo(() => manualTarget.split(/[,\n]+/).map((s) => s.trim()).filter(Boolean), [manualTarget])
   const runTargets = useMemo(() => [...new Set([...selected, ...manualTargets])], [selected, manualTargets])
   const params = useMemo(() => extraParams.split(',').map((s) => s.trim()).filter(Boolean), [extraParams])
+  const [mineParams, setMineParams] = useState(false)
 
   const running = Object.values(scans).some((s) => s.status === 'running')
+  // Publishes this tab's scan state to the case nav's border.
+  useReportScanIndicator('xss', indicatorOfScans(scans, (s) => s.result?.modules ?? []))
   // stopScan stops one target's running scan. Its card settles itself once the
   // server's terminal event arrives.
   const stopScan = (t: string) => stopTrackedScan(scans[t])
@@ -100,10 +107,13 @@ export function XssScan({ caseId, targets, credentials }: { caseId: string; targ
       () => api.xssScan({ requestsPerSecond: speed.rps ?? undefined,
         url: toAbsoluteUrl(targetValue),
         params: params.length ? params : undefined,
+
+        mineParams: mineParams || undefined,
         recursionDepth,
         maxPages,
         credentialId,
         caseId,
+        callback: callback ?? undefined,
       }),
       (update) => setScans((prev) => (prev[targetValue] ? { ...prev, [targetValue]: update(prev[targetValue]) } : prev)),
       signal,
@@ -177,6 +187,8 @@ export function XssScan({ caseId, targets, credentials }: { caseId: string; targ
           />
         </label>
 
+        <ParamMiningToggle checked={mineParams} onChange={setMineParams} />
+
         <div className="flex flex-wrap items-end gap-3">
           <label className="flex items-center gap-1 text-xs text-neutral-400">
             Crawl depth
@@ -207,6 +219,18 @@ export function XssScan({ caseId, targets, credentials }: { caseId: string; targ
 
 
         <CredentialPicker credentials={credentials} selected={credentialId} onSelect={setCredentialId} />
+
+        <div>
+          <span className="text-xs font-medium text-neutral-300">Out-of-band callback (blind XSS)</span>
+          <span className="mt-0.5 block text-[11px] text-neutral-600">
+            Off unless a shared server is picked here. Pick one to store callback payloads at every injection point and
+            get a finding only once the target's own infrastructure calls back -- confirms a stored XSS that renders
+            somewhere the scan never sees. Without a pick, each point gets its own token on this instance's collaborator.
+          </span>
+          <div className="mt-1">
+            <CallbackPicker value={callback} onChange={setCallback} />
+          </div>
+        </div>
 
         <button
           onClick={runScan}

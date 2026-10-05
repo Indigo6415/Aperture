@@ -11,6 +11,7 @@ import { latestByTarget, loadCaseScans } from '../scanHistory'
 import { useAutoCollapseOnce, useCollapsible } from '../collapsible'
 import { inputBase } from '../formStyles'
 import { emptyProgress, runTrackedScan, type TrackedScan, runBatch, stopTrackedScan, useScanBatch, stopAllScans } from '../scanProgress'
+import { indicatorOfScans, useReportScanIndicator } from '../scanIndicator'
 import { ScanErrorNotice } from './ScanErrorNotice'
 import { useScanSpeed } from './scanSpeed'
 
@@ -58,6 +59,8 @@ export function GitDump({ caseId, targets, credentials }: { caseId: string; targ
   const runTargets = useMemo(() => [...new Set([...selected, ...manualTargets])], [selected, manualTargets])
 
   const running = Object.values(scans).some((s) => s.status === 'running')
+  // Publishes this tab's scan state to the case nav's border.
+  useReportScanIndicator('gitdump', indicatorOfScans(scans, () => []))
   const stopScan = (t: string) => stopTrackedScan(scans[t])
   const speed = useScanSpeed()
   const canRun = runTargets.length > 0 && !running && speed.rps !== null

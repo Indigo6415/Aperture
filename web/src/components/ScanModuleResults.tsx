@@ -34,6 +34,9 @@ export interface GenericFinding {
   // callback is true when the target called back to Aperture's collaborator
   // listener, which proves the finding; the row shows a CALLBACK tag for it.
   callback?: boolean
+  // exploitation is how an attacker would turn the finding into a real attack.
+  // Only the CORS scanner sets it today; rows without it render as before.
+  exploitation?: string
 }
 
 // CONFIDENCE_BADGE gives each confidence grade its label and colour in a
@@ -152,7 +155,7 @@ function ModuleCard({ module }: { module: GenericModuleResult }) {
 function FindingRow({ finding }: { finding: GenericFinding }) {
   const [expanded, setExpanded] = useState(false)
   const { openMenu } = useContextMenu()
-  const hasExpandable = Boolean(finding.evidence || finding.method || finding.statusCode !== undefined || finding.request || finding.chain?.length)
+  const hasExpandable = Boolean(finding.evidence || finding.method || finding.statusCode !== undefined || finding.request || finding.chain?.length || finding.exploitation)
 
   return (
     <li className="py-2 text-xs">
@@ -196,6 +199,12 @@ function FindingRow({ finding }: { finding: GenericFinding }) {
               {finding.method && finding.statusCode !== undefined ? ' → HTTP ' : finding.statusCode !== undefined ? 'HTTP ' : ''}
               {finding.statusCode}
             </p>
+          )}
+          {finding.exploitation && (
+            <div className="flex items-start gap-2">
+              <span className="mt-0.5 shrink-0 text-[10px] uppercase tracking-wide text-neutral-600">Exploit</span>
+              <p className="min-w-0 flex-1 text-[11px] text-neutral-400">{finding.exploitation}</p>
+            </div>
           )}
           {finding.chain && finding.chain.length > 0 && <RedirectChain chain={finding.chain} />}
           {finding.request && (

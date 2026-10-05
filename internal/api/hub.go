@@ -84,7 +84,25 @@ type RunEvent struct {
 	CheckID  string               `json:"checkId,omitempty"`
 	Findings int                  `json:"findings,omitempty"`
 	Result   json.RawMessage      `json:"result,omitempty"`
+
+	// Host/HostKind are set only on a "hostEvent" -- a network-governor state
+	// change (see internal/netgov.Event) broadcast on the global events
+	// channel (globalEventsKey) rather than any one job's channel, since
+	// throttling/drift/block events are a property of a target host, not of a
+	// single scan. HostKind is netgov's event kind ("throttled" | "drift" |
+	// "breaker-open" | "host-blocked" | "rebaselined" | "recovered"); the
+	// human-readable reason rides along in Message. The notification engine in
+	// the frontend listens for these over /ws/events (see watchEvents in
+	// api.ts) so a rule can alert on a host throttling the operator's requests.
+	Host     string `json:"host,omitempty"`
+	HostKind string `json:"hostKind,omitempty"`
 }
+
+// globalEventsKey is the hub channel that carries events not tied to any one
+// job -- currently network-governor "hostEvent"s fanned out to every client
+// watching /ws/events. It is deliberately a string no real job ID can collide
+// with (a jobID/scanID is always a UUID, never prefixed with "@").
+const globalEventsKey = "@events"
 
 // hub fans out RunEvents to any number of WebSocket subscribers per job.
 // A job that finishes before a client connects is fine: the client only

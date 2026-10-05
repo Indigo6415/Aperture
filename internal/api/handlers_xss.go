@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Indigo6415/Aperture/internal/collaborator"
 	"github.com/Indigo6415/Aperture/internal/scanprogress"
 	"github.com/Indigo6415/Aperture/internal/store"
 	"github.com/Indigo6415/Aperture/internal/xss"
@@ -22,16 +23,23 @@ type xssScanRequest struct {
 	RequestsPerSecond float64           `json:"requestsPerSecond,omitempty"`
 	URL               string            `json:"url"`
 	Params            []string          `json:"params,omitempty"`
+	MineParams        bool              `json:"mineParams,omitempty"`
 	CredentialID      string            `json:"credentialId,omitempty"`
 	Headers           map[string]string `json:"headers,omitempty"`
 	CaseID            string            `json:"caseId,omitempty"`
 	RecursionDepth    int               `json:"recursionDepth,omitempty"`
 	MaxPages          int               `json:"maxPages,omitempty"`
+	// PayloadBudget caps how many payloads each injection point is tried with; zero means xss's default.
+	PayloadBudget int `json:"payloadBudget,omitempty"`
+	// Callback optionally names a callback server the operator picked from their
+	// Callback picker (see collaborator.Ref). Blind XSS uses it; without it the
+	// blind module mints a token per point on this instance's collaborator.
+	Callback *collaborator.Ref `json:"callback,omitempty"`
 }
 
 // xssScanTimeout mirrors sstiScanTimeout's own reasoning: the crawl itself
-// fetches pages sequentially (up to crawlMaxPagesCap of them), and fifteen
-// payload modules then each fan out across every discovered point.
+// fetches pages sequentially (up to crawlMaxPagesCap of them), and then every
+// discovered point is probed and tried with up to its payload budget.
 const xssScanTimeout = 150 * time.Second
 
 // handleXSSScan runs internal/xss.Run against req.URL synchronously and
@@ -68,6 +76,15 @@ func (s *Server) handleXSSScan(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Headers = s.applyDomainCookie(req.CaseID, req.URL, req.Headers)
 
+	oob := xss.OOBConfig{
+		Registry:        s.collab,
+		CallbackBaseURL: s.collabCallbackBase(r),
+	}
+	if req.Callback != nil {
+		oob.SharedToken = req.Callback.Token
+		oob.SharedProvider = req.Callback.Provider
+	}
+
 	s.queueScan(w, streamedScan{
 		rps:     rps,
 		caseID:  req.CaseID,
@@ -76,9 +93,9 @@ func (s *Server) handleXSSScan(w http.ResponseWriter, r *http.Request) {
 		timeout: xssScanTimeout,
 		run: func(ctx context.Context, rep scanprogress.Reporter) (scanOutcome, error) {
 			resp, err := xss.Run(ctx, xss.Request{Progress: rep,
-				URL: req.URL, Params: req.Params, Headers: req.Headers,
-				RecursionDepth: req.RecursionDepth, MaxPages: req.MaxPages,
-			})
+				URL: req.URL, Params: req.Params, MineParams: req.MineParams, Headers: req.Headers,
+				RecursionDepth: req.RecursionDepth, MaxPages: req.MaxPages, PayloadBudget: req.PayloadBudget,
+			}, oob)
 			if err != nil {
 				return scanOutcome{}, err
 			}

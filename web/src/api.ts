@@ -48,6 +48,7 @@ import type {
   SsrfRequest,
   SstiScanRequest,
   PathTraversalRequest,
+  IdorRequest,
   XxeRequest,
   Target,
   TargetList,
@@ -331,6 +332,7 @@ export const api = {
   sstiScan: (scanReq: SstiScanRequest) => req<ScanStartResult>('/api/sstiscan/scan', { method: 'POST', body: JSON.stringify(scanReq) }),
 
   pathTraversalScan: (scanReq: PathTraversalRequest) => req<ScanStartResult>('/api/pathtraversal/scan', { method: 'POST', body: JSON.stringify(scanReq) }),
+  idorScan: (scanReq: IdorRequest) => req<ScanStartResult>('/api/idor/scan', { method: 'POST', body: JSON.stringify(scanReq) }),
   xxeScan: (scanReq: XxeRequest) => req<ScanStartResult>('/api/xxe/scan', { method: 'POST', body: JSON.stringify(scanReq) }),
 
   xssScan: (scanReq: XssRequest) => req<ScanStartResult>('/api/xss/scan', { method: 'POST', body: JSON.stringify(scanReq) }),
@@ -401,12 +403,43 @@ export function watchScan(scanId: string, onEvent: (ev: RunEvent) => void, onClo
   return watchSocket(`/ws/scans/${scanId}`, onEvent, onClose)
 }
 
+// watchEvents opens the global events socket (see handleWatchEvents in
+// internal/api) and keeps it open for the whole session -- unlike the
+// per-job watchers above, it is not tied to any one scan. The notification
+// engine uses it to hear network-governor "hostEvent"s (throttling/drift/
+// block). onClose lets the caller reconnect if the socket drops.
+export function watchEvents(onEvent: (ev: RunEvent) => void, onClose?: () => void): () => void {
+  return watchSocket('/ws/events', onEvent, onClose)
+}
+
+// notificationTap, when set, receives every RunEvent off every watched
+// socket (keyed by the socket's path) in addition to the event's own
+// handler. It is the single chokepoint the notification engine hooks so it
+// can observe findings/callbacks/scan-completion across every active scan
+// stream without each scanner component having to opt in. Set it once near
+// app startup (see notifications.ts).
+let notificationTap: ((path: string, ev: RunEvent) => void) | null = null
+export function setNotificationTap(tap: ((path: string, ev: RunEvent) => void) | null): void {
+  notificationTap = tap
+}
+
 function watchSocket(path: string, onEvent: (ev: RunEvent) => void, onClose?: () => void): () => void {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
   const ws = new WebSocket(`${proto}//${location.host}${path}`)
   ws.onmessage = (ev) => {
     try {
-      onEvent(JSON.parse(ev.data))
+      const parsed: RunEvent = JSON.parse(ev.data)
+      onEvent(parsed)
+      // Mirror the event into the notification engine, if one is listening.
+      // Wrapped so a throwing tap can never break the scanner that owns the
+      // socket.
+      if (notificationTap) {
+        try {
+          notificationTap(path, parsed)
+        } catch {
+          // a misbehaving tap must not disrupt the scan stream
+        }
+      }
     } catch {
       // ignore malformed frames
     }

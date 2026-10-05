@@ -32,7 +32,10 @@ var (
 type orResult struct {
 	StatusCode int
 	Location   string
-	Body       string
+	// Header is the full response header set. The CRLF check reads injected
+	// headers (a Set-Cookie canary) from it, which Location alone can't show.
+	Header http.Header
+	Body   string
 	// Request is exactly what was sent on the wire for this check --
 	// attached to any Finding it produced so "Send to Tester" (see
 	// web/src/components/ScanModuleResults.tsx) can load the exact request
@@ -140,6 +143,7 @@ func sendWithin(ctx context.Context, sem chan struct{}, timeout time.Duration, r
 	return &orResult{
 		StatusCode: resp.StatusCode,
 		Location:   resp.Header.Get("Location"),
+		Header:     resp.Header,
 		Body:       string(raw),
 		Request:    CapturedRequest{Method: http.MethodGet, URL: rawURL, Headers: sentHeaders},
 	}, nil

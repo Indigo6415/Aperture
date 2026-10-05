@@ -21,6 +21,7 @@ import { toAbsoluteUrl } from '../url'
 import { SEVERITY_META, SEVERITY_ORDER } from '../severityColor'
 import { sendToTester } from '../testerHandoff'
 import { applyScanEvent, emptyProgress, finishProgress, type ScanProgress, runBatch, stopTrackedScan, useScanBatch, stopAllScans } from '../scanProgress'
+import { indicatorOfScans, useReportScanIndicator } from '../scanIndicator'
 
 // TestState/TargetScanState mirror Probe.tsx's own -- one registered
 // module's place in a running scan, and one target's place in a (possibly
@@ -95,6 +96,8 @@ export function DomainScan({
   const runTargets = useMemo(() => [...new Set([...selected, ...manualTargets])], [selected, manualTargets])
 
   const running = Object.values(scans).some((s) => s.status === 'running')
+  // Publishes this tab's scan state to the case nav's border.
+  useReportScanIndicator('domainscan', indicatorOfScans(scans, (s) => s.result?.modules ?? []))
   const speed = useScanSpeed()
   const canRun = runTargets.length > 0 && !running && speed.rps !== null
 

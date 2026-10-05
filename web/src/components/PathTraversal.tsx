@@ -13,9 +13,11 @@ import { useAutoCollapseOnce, useCollapsible } from '../collapsible'
 import { inputBase } from '../formStyles'
 import { toAbsoluteUrl } from '../url'
 import { emptyProgress, runTrackedScan, type TrackedScan, runBatch, stopTrackedScan, useScanBatch, stopAllScans } from '../scanProgress'
+import { indicatorOfScans, useReportScanIndicator } from '../scanIndicator'
 import { SeverityTiles, ModuleResultsList, totalFindingsOf, hasSevereFindings } from './ScanModuleResults'
 import { ScanErrorNotice } from './ScanErrorNotice'
 import { useScanSpeed } from './scanSpeed'
+import { ParamMiningToggle } from './ParamMiningToggle'
 
 type TargetScanState = TrackedScan<PathTraversalResponse>
 
@@ -67,8 +69,11 @@ export function PathTraversal({ caseId, targets, credentials }: { caseId: string
   const manualTargets = useMemo(() => manualTarget.split(/[,\n]+/).map((s) => s.trim()).filter(Boolean), [manualTarget])
   const runTargets = useMemo(() => [...new Set([...selected, ...manualTargets])], [selected, manualTargets])
   const params = useMemo(() => extraParams.split(',').map((s) => s.trim()).filter(Boolean), [extraParams])
+  const [mineParams, setMineParams] = useState(false)
 
   const running = Object.values(scans).some((s) => s.status === 'running')
+  // Publishes this tab's scan state to the case nav's border.
+  useReportScanIndicator('pathtraversal', indicatorOfScans(scans, (s) => s.result?.modules ?? []))
   // stopScan stops one target's running scan. Its card settles itself once the
   // server's terminal event arrives.
   const stopScan = (t: string) => stopTrackedScan(scans[t])
@@ -103,6 +108,8 @@ export function PathTraversal({ caseId, targets, credentials }: { caseId: string
         body: body.trim() ? body : undefined,
         contentType: body.trim() && contentType.trim() ? contentType.trim() : undefined,
         params: params.length ? params : undefined,
+
+        mineParams: mineParams || undefined,
         headers: cookie.trim() ? { Cookie: cookie.trim() } : undefined,
         recursionDepth,
         maxPages,
@@ -181,6 +188,8 @@ export function PathTraversal({ caseId, targets, credentials }: { caseId: string
             className={`mt-1 ${inputBase}`}
           />
         </label>
+
+        <ParamMiningToggle checked={mineParams} onChange={setMineParams} />
 
         <div className="space-y-2">
           <span className="text-xs font-medium text-neutral-300">Request body (optional)</span>

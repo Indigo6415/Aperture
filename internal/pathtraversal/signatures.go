@@ -87,6 +87,17 @@ var fileSigs = []fileSig{
 	// sample has it too. It matters for the php://filter module, which reads
 	// a PHP file's source as base64.
 	regexSig("PHP source", false, `<\?php\b`),
+	// /etc/issue's agetty escape sequences. "\r on an \m" is the RHEL/CentOS
+	// default and "\n \l" the Debian/Ubuntu one; both are literal backslash
+	// escapes that a normal page essentially never contains, so a match is
+	// strong. dotdotpwn reads /etc/issue as a second Unix oracle, useful when
+	// /etc/passwd is readable by a different account than the web server.
+	regexSig("/etc/issue", true, `\\r on an \\m|\\n \\l`),
+	// IIS web.config. Weak: <configuration> with a <system.web...> child is
+	// specific to an ASP.NET config file, but fragments appear in tutorials
+	// and error pages, so it is reported as "likely" and only after the
+	// negative control. dotdotpwn lists web.config among its extra targets.
+	substrSig("web.config", false, "<configuration>", "<system.web"),
 }
 
 // base64Pattern picks out runs of base64 alphabet characters long enough to

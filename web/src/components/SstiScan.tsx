@@ -13,10 +13,12 @@ import { useAutoCollapseOnce, useCollapsible } from '../collapsible'
 import { inputBase } from '../formStyles'
 import { toAbsoluteUrl } from '../url'
 import { emptyProgress, runTrackedScan, type TrackedScan, runBatch, stopTrackedScan, useScanBatch, stopAllScans } from '../scanProgress'
+import { indicatorOfScans, useReportScanIndicator } from '../scanIndicator'
 import { SeverityTiles, ModuleResultsList, totalFindingsOf, hasSevereFindings } from './ScanModuleResults'
 
 import { ScanErrorNotice } from './ScanErrorNotice'
 import { useScanSpeed } from './scanSpeed'
+import { ParamMiningToggle } from './ParamMiningToggle'
 
 type TargetScanState = TrackedScan<SstiScanResponse>
 
@@ -67,8 +69,11 @@ export function SstiScan({ caseId, targets, credentials }: { caseId: string; tar
   const manualTargets = useMemo(() => manualTarget.split(/[,\n]+/).map((s) => s.trim()).filter(Boolean), [manualTarget])
   const runTargets = useMemo(() => [...new Set([...selected, ...manualTargets])], [selected, manualTargets])
   const params = useMemo(() => extraParams.split(',').map((s) => s.trim()).filter(Boolean), [extraParams])
+  const [mineParams, setMineParams] = useState(false)
 
   const running = Object.values(scans).some((s) => s.status === 'running')
+  // Publishes this tab's scan state to the case nav's border.
+  useReportScanIndicator('sstiscan', indicatorOfScans(scans, (s) => s.result?.modules ?? []))
   // stopScan stops one target's running scan. Its card settles itself once the
   // server's terminal event arrives.
   const stopScan = (t: string) => stopTrackedScan(scans[t])
@@ -98,6 +103,8 @@ export function SstiScan({ caseId, targets, credentials }: { caseId: string; tar
       () => api.sstiScan({ requestsPerSecond: speed.rps ?? undefined,
         url: toAbsoluteUrl(targetValue),
         params: params.length ? params : undefined,
+
+        mineParams: mineParams || undefined,
         recursionDepth,
         maxPages,
         credentialId,
@@ -175,6 +182,8 @@ export function SstiScan({ caseId, targets, credentials }: { caseId: string; tar
             className={`mt-1 ${inputBase}`}
           />
         </label>
+
+        <ParamMiningToggle checked={mineParams} onChange={setMineParams} />
 
         <div className="flex flex-wrap items-end gap-3">
           <label className="flex items-center gap-1 text-xs text-neutral-400">

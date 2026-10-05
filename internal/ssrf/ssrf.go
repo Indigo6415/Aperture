@@ -30,11 +30,22 @@
 //   - fileSchemeModule: reads a file:// URL and matches a known file's
 //     content (/etc/passwd, win.ini), with the same control gating as the
 //     cloud module.
+//   - protocolModule: sends read-only detection probes over gopher:// and
+//     dict:// at loopback services (Redis, memcached, SMTP, FastCGI, MySQL)
+//     and reports a response carrying that service's own signature. Probes
+//     never write to a service; see protocols.go.
 //   - oobCallbackModule: the actually-reliable confirmation for a *blind*
 //     SSRF (one whose response gives no visible signal either way) --
 //     points a payload at an internal/collaborator token and checks whether
 //     the target's own infrastructure ever reached back out to it. See that
 //     package's doc comment for how the listener itself works.
+//
+// Two inputs widen what those modules test, both optional:
+//   - MineParams runs internal/paramminer against the URL first, folding
+//     undocumented parameter names into the candidate set.
+//   - Known product endpoints (endpoints.go) are fetch-style paths from the
+//     nuclei SSRF templates, each probed only after an existence check, and
+//     each tested through its own parameter alone. On by default.
 //
 // Shaped like every other scanner in Aperture: a baseline plus a battery of
 // check modules, each with fixed severity and findings present even when

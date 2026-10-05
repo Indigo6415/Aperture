@@ -172,6 +172,90 @@ func TestJSONEnvelopeWithoutTypenameIsNotGraphQL(t *testing.T) {
 	}
 }
 
+// TestPersistedQueryEndpointConfirmsViaError is the headline case this change
+// adds: an endpoint that refuses arbitrary queries (a persisted-query-only
+// endpoint, like Netflix's /graphql) answers the "{__typename}" probe with a
+// GraphQL-shaped error rather than data. It must still confirm, record how, and
+// let the rest of the scan run.
+func TestPersistedQueryEndpointConfirmsViaError(t *testing.T) {
+	srv := gqlFake(t, func(string) string {
+		// No persisted-query id on the probe -> the server rejects it, the way
+		// an operation-safelisting endpoint does, but as a GraphQL error.
+		return `{"errors":[{"message":"PersistedQueryNotFound","extensions":{"code":"PERSISTED_QUERY_NOT_FOUND"}}]}`
+	})
+
+	res, err := Run(context.Background(), Request{URL: srv.URL + "/graphql"})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !res.Baseline.Confirmed {
+		t.Fatal("persisted-query endpoint was not confirmed as GraphQL")
+	}
+	if res.Baseline.DetectedVia != detectedViaError {
+		t.Errorf("DetectedVia = %q, want %q", res.Baseline.DetectedVia, detectedViaError)
+	}
+	if res.Baseline.Evidence == "" {
+		t.Error("expected the matched error message as baseline evidence")
+	}
+	// Confirmation must actually enable the rest of the run.
+	if len(res.Modules) == 0 {
+		t.Error("no modules ran against a confirmed endpoint")
+	}
+}
+
+// TestErrorLocationsConfirmGraphQL: the error carries no recognizable phrase or
+// extensions code, only a line/column location -- which is itself GraphQL-spec
+// shape and enough to confirm.
+func TestErrorLocationsConfirmGraphQL(t *testing.T) {
+	srv := gqlFake(t, func(string) string {
+		return `{"errors":[{"message":"unauthorized","locations":[{"line":1,"column":2}]}]}`
+	})
+	res, err := Run(context.Background(), Request{URL: srv.URL + "/graphql"})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !res.Baseline.Confirmed || res.Baseline.DetectedVia != detectedViaError {
+		t.Errorf("not confirmed via error locations: %+v", res.Baseline)
+	}
+}
+
+// TestGenericRESTErrorEnvelopeIsNotGraphQL is the false-positive guard for the
+// new path: a REST API that answers a POST with a bare {"errors":[...]} list --
+// no GraphQL location, extensions code, or error phrase -- must not confirm.
+func TestGenericRESTErrorEnvelopeIsNotGraphQL(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"errors":[{"message":"Bad Request: missing required field 'name'"}]}`)
+	}))
+	defer srv.Close()
+
+	res, err := Run(context.Background(), Request{URL: srv.URL + "/api/items"})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Baseline.Confirmed {
+		t.Errorf("a generic REST error envelope was confirmed as GraphQL: %+v", res.Baseline)
+	}
+}
+
+// TestTypenameStillWinsOverError: when the probe does return a typed data
+// object, confirmation stays on the stronger "typename" path (not the new
+// error fallback), and TypeName is still reported.
+func TestTypenameStillWinsOverError(t *testing.T) {
+	srv := gqlFake(t, func(query string) string {
+		body, _ := typenameOnly(query, "Query")
+		return body
+	})
+	res, err := Run(context.Background(), Request{URL: srv.URL + "/graphql"})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Baseline.DetectedVia != detectedViaTypename || res.Baseline.TypeName != "Query" {
+		t.Errorf("DetectedVia/TypeName = %q/%q, want %q/Query", res.Baseline.DetectedVia, res.Baseline.TypeName, detectedViaTypename)
+	}
+}
+
 // TestSuggestionWalkFollowsHints is the positive case for schema recovery:
 // `ledger` is never a seed name and is reachable only through a hint the server
 // attaches to `invoices`, so the walk has to follow a hint from a probe that

@@ -279,7 +279,7 @@ func pointDescriptor(pt injectionPoint) string {
 func runMathEvalModule(ctx context.Context, deps runDeps) []Finding {
 	client := newClient()
 	return runPointModule(deps, mathEvalModule, func(pt injectionPoint) (Finding, bool) {
-		return probeMathPoint(ctx, deps, client, pt)
+		return probeEnginePoint(ctx, deps, client, pt)
 	})
 }
 

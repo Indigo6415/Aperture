@@ -18,10 +18,10 @@ const verifyTimeout = 20 * time.Second
 // verifyMarkerAttr is the attribute a verification payload writes onto <html>.
 const verifyMarkerAttr = "data-apx"
 
-// alertCall matches the alert(...) call, or the tagged-template alert`...`
-// form, that payload modules use to show that code ran. verifyPayload swaps
+// alertCall matches the alert, prompt or confirm call (the parenthesized or
+// tagged-template form) that payloads use to show that code ran. verifyPayload swaps
 // it for a DOM write.
-var alertCall = regexp.MustCompile("alert(?:\\([^)]*\\)|`[^`]*`)")
+var alertCall = regexp.MustCompile("(?:alert|prompt|confirm)(?:\\([^)]*\\)|`[^`]*`)")
 
 // verifyPayload rewrites a module payload so that, when executed, it sets an
 // attribute carrying canary on the document element instead of calling alert.

@@ -21,7 +21,7 @@
 //     (User-Agent, Referer, X-Forwarded-For, ...) -- a classic SSTI vector
 //     entirely outside any visible form field.
 //
-// Three module categories, run concurrently against every discovered point:
+// Four module categories, run concurrently against every discovered point:
 //   - mathEvalModule: engine-tagged arithmetic payloads ({{1337*7331}},
 //     ${1337*7331}, <%= 1337*7331 %>, ...) -- a response that contains the
 //     evaluated result but not the literal payload text proves the engine
@@ -29,6 +29,14 @@
 //     The multiplicands are deliberately large (product: 9801547) rather
 //     than the classic 7*7=49, since 49 is common enough to already appear
 //     in unrelated page content and cause a false positive. High precision.
+//     Each probe is also sent from inside an existing template tag, with the
+//     closing escape that tag needs (see engines.go, ported from tplmap's
+//     per-engine context tables), so input that lands in {{ '...' }} or
+//     ${ f(...) } is found as well as bare-text input.
+//   - inBandRCEModule: the same engine-specific command payloads as the
+//     OOB module, but the command only echoes a fresh random word back and
+//     the word is checked in the response body (see inband.go). Proves
+//     execution without any collaborator listener.
 //   - errorSignatureModule: a single syntax-breaking polyglot, checked
 //     against a table of engine-specific error/exception strings -- catches
 //     a template engine that chokes on malformed syntax even when its
@@ -223,6 +231,7 @@ func Run(ctx context.Context, req Request, oob OOBConfig) (*Result, error) {
 		{mathEvalModule.id, mathEvalModule.name, mathEvalModule.severity, func() []Finding { return runMathEvalModule(ctx, deps) }},
 		{errorSignatureModule.id, errorSignatureModule.name, errorSignatureModule.severity, func() []Finding { return runErrorSignatureModule(ctx, deps) }},
 		{oobRCEModule.id, oobRCEModule.name, oobRCEModule.severity, func() []Finding { return runOOBRCEModule(ctx, deps, oob) }},
+		{inBandRCEModule.id, inBandRCEModule.name, inBandRCEModule.severity, func() []Finding { return runInBandRCEModule(ctx, deps) }},
 	}
 
 	results := make([]ModuleResult, len(runs))

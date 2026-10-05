@@ -109,6 +109,8 @@ func Mine(ctx context.Context, opts Options) (Result, error) {
 	}
 	baseline := observe(b1)
 
+	// Collect every name the caller or the URL already carries, so those are
+	// skipped rather than re-probed.
 	known := map[string]bool{}
 	for _, k := range opts.Known {
 		known[k] = true
@@ -117,12 +119,15 @@ func Mine(ctx context.Context, opts Options) (Result, error) {
 		known[k] = true
 	}
 	var candidates []string
+	// Keep the wordlist order and drop anything already known or empty.
 	for _, name := range pickWordlist(opts.Names) {
 		if name != "" && !known[name] {
 			candidates = append(candidates, name)
 		}
 	}
 
+	// Walk the candidates one chunk at a time, so a dead endpoint costs one
+	// request per chunk and a cancelled run stops between chunks.
 	for start := 0; start < len(candidates); start += chunkSize {
 		if ctx.Err() != nil {
 			return res, ctx.Err()
@@ -141,6 +146,7 @@ func bisect(ctx context.Context, opts Options, method string, names []string, ba
 		return
 	}
 	set := make(map[string]string, len(names))
+	// Every name in this chunk gets the same canary value.
 	for _, n := range names {
 		set[n] = canary
 	}
@@ -154,6 +160,8 @@ func bisect(ctx context.Context, opts Options, method string, names []string, ba
 	if !changed && !reflected {
 		return
 	}
+	// A single name that differs is a confirmed hit; a larger group is split
+	// so each responsive name ends up alone.
 	if len(names) == 1 {
 		res.Names = append(res.Names, names[0])
 		if reflected {
@@ -179,6 +187,7 @@ type probeResponse struct {
 func probe(ctx context.Context, opts Options, method string, set map[string]string) (probeResponse, error) {
 	reqURL := *opts.URL
 	var body io.Reader
+	// POST carries the probe names as a form body; GET puts them in the query.
 	if method == http.MethodPost {
 		form := url.Values{}
 		for k, v := range set {

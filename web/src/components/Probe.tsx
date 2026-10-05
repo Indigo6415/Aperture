@@ -3,6 +3,7 @@ import { api, ApiError, watchProbeScan } from '../api'
 import type { ProbeRequest } from '../probeHandoff'
 import type { Credential, ProbeFinding, ProbeModuleResult, ProbeScanResponse, ProbeSeverity, Target } from '../types'
 import { applyScanEvent, emptyProgress, finishProgress, type ScanProgress, runBatch, stopTrackedScan, useScanBatch, stopAllScans } from '../scanProgress'
+import { indicatorOfScans, useReportScanIndicator } from '../scanIndicator'
 import { CollapsibleFormPanel } from './CollapsibleFormPanel'
 import { TargetPicker } from './TargetPicker'
 import { CredentialPicker } from './CredentialPicker'
@@ -100,6 +101,8 @@ export function Probe({
   const runTargets = useMemo(() => [...new Set([...selected, ...manualTargets])], [selected, manualTargets])
 
   const running = Object.values(scans).some((s) => s.status === 'running')
+  // Publishes this tab's scan state to the case nav's border.
+  useReportScanIndicator('probe', indicatorOfScans(scans, (s) => s.result?.modules ?? []))
   const speed = useScanSpeed()
   const canRun = runTargets.length > 0 && !running && speed.rps !== null
 

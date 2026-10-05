@@ -119,8 +119,14 @@ type Request struct {
 	// MineParams, when true, runs parameter mining (internal/paramminer) against
 	// the GET query of URL and folds every hidden parameter it finds into Params,
 	// so the rest of the run tests them too. Off by default.
-	MineParams bool              `json:"mineParams,omitempty"`
-	Headers    map[string]string `json:"headers,omitempty"`
+	MineParams bool `json:"mineParams,omitempty"`
+	// Discover, when true, asks Common Crawl's index for URLs it has seen under
+	// the target's host that take a destination parameter, and runs every
+	// module against up to maxDiscoveredEndpoints of them as well (see
+	// discoverEndpoints). Off by default: it sends a query about the target's
+	// host to a third party.
+	Discover bool              `json:"discover,omitempty"`
+	Headers  map[string]string `json:"headers,omitempty"`
 	// CallbackBase is a live callback server's bare "host[:port]/path" (no
 	// scheme, no trailing slash -- e.g. "aperture.example.com/collab/deadbeef0123"
 	// or "webhook.site/9f2e1234-…"), built by the HTTP handler either from an
@@ -240,9 +246,12 @@ func confirmModule(ctx context.Context, rep scanprogress.Reporter, cb CallbackPo
 	return findings
 }
 
-// Run resolves req.URL, takes a plain baseline request (no payload), then
-// runs every module concurrently, confirms candidate hits against the
-// callback listener, and assembles one ModuleResult per vector family.
+// Run resolves req.URL and runs every module against it. With req.Discover
+// set, it also runs the same modules against the redirect-shaped URLs
+// Common Crawl has seen under the same host (see discoverEndpoints), and
+// merges their results into one. The first endpoint keeps the operator's own
+// progress reporter. Discovered endpoints run silently, since their modules
+// would reuse the same check IDs.
 func Run(ctx context.Context, req Request) (*Result, error) {
 	rep := scanprogress.Or(req.Progress)
 
@@ -257,6 +266,32 @@ func Run(ctx context.Context, req Request) (*Result, error) {
 		req.Params = append(append([]string{}, req.Params...), paramminer.Names(ctx, target, req.Headers, netgov.NewClient(8*time.Second, false), req.Params)...)
 	}
 
+	res, err := runEndpoint(ctx, req, target, rep)
+	if err != nil || !req.Discover {
+		return res, err
+	}
+
+	// Each discovered endpoint is scanned on its own, with progress reporting off.
+	for _, raw := range discoverEndpoints(ctx, target) {
+		discovered, err := parseTarget(raw)
+		if err != nil {
+			continue
+		}
+		sub := req
+		sub.URL = raw
+		subRes, err := runEndpoint(ctx, sub, discovered, scanprogress.Discard)
+		if err != nil {
+			continue
+		}
+		mergeResults(res, subRes)
+	}
+	return res, nil
+}
+
+// runEndpoint runs every module against one endpoint: the baseline, then each
+// module's probes, confirmed against the callback listener. Run calls it for
+// the operator's URL and again for each discovered one.
+func runEndpoint(ctx context.Context, req Request, target *url.URL, rep scanprogress.Reporter) (*Result, error) {
 	// The baseline is informational only: probes and callback confirmation do
 	// not depend on it, so a failure is recorded on the result and the run
 	// carries on rather than aborting.
@@ -276,23 +311,6 @@ func Run(ctx context.Context, req Request) (*Result, error) {
 
 	mods := openRedirectModules
 	results := make([]ModuleResult, len(mods))
-	// Without a callback server nothing can be confirmed, so every module
-	// reports the same notice and no probes are sent.
-	if req.CallbackBase == "" {
-		// One progress check per module, each reported finished straight away.
-		for i, m := range mods {
-			rep.Plan(scanprogress.Check{ID: m.id, Label: m.name})
-			rep.Start(m.id)
-			rep.Done(m.id, 0, nil)
-			results[i] = ModuleResult{ID: m.id, Name: m.name, Severity: m.severity, Findings: []Finding{{
-				Label:  "Callback listener not configured",
-				Detail: "This module only reports a redirect once following it actually reaches a live callback server -- a response that merely contains an attacker-controlled host in its Location header or body isn't enough on its own, since many apps echo an unrecognized value back without ever redirecting to it. No callback server was configured for this run.",
-			}}}
-		}
-		sort.Slice(results, func(i, j int) bool { return results[i].Name < results[j].Name })
-		return &Result{Baseline: baseline, Modules: results, ParamsTested: params, FollowRedirects: req.FollowRedirects, Requests: int(stats.requests.Load()), TimedOut: int(stats.timedOut.Load())}, nil
-	}
-
 	// sent is shared by every module goroutine, so it has to be atomic.
 	var sent atomic.Int64
 	// Every module is its own progress check. Each plans them all up front and
@@ -307,8 +325,7 @@ func Run(ctx context.Context, req Request) (*Result, error) {
 	scanprogress.Each(rep, moduleConcurrency, idx, func(i int) scanprogress.Check {
 		return scanprogress.Check{ID: mods[i].id, Label: mods[i].name}
 	}, func(i int) (int, error) {
-		cands := runModule(ctx, deps, mods[i], &sent)
-		findings := confirmModule(ctx, rep, req.CallbackPoll, cands)
+		findings := runModuleFindings(ctx, deps, mods[i], rep, &sent)
 		results[i] = ModuleResult{ID: mods[i].id, Name: mods[i].name, Severity: mods[i].severity, Findings: findings}
 		return len(findings), nil
 	})
@@ -323,6 +340,63 @@ func Run(ctx context.Context, req Request) (*Result, error) {
 		Requests:        int(stats.requests.Load()),
 		TimedOut:        int(stats.timedOut.Load()),
 	}, nil
+}
+
+// runModuleFindings produces one module's findings for a run. Direct modules
+// judge their own responses. Callback modules need a callback listener, and
+// without one they report the same notice and send no probes.
+func runModuleFindings(ctx context.Context, d runDeps, m moduleDef, rep scanprogress.Reporter, sent *atomic.Int64) []Finding {
+	if m.direct != nil {
+		return m.direct(ctx, d, sent)
+	}
+	// Without a callback server nothing can be confirmed, so the module
+	// reports why it sent nothing.
+	if d.req.CallbackBase == "" {
+		return []Finding{{
+			Label:  "Callback listener not configured",
+			Detail: "This module only reports a redirect once following it actually reaches a live callback server -- a response that merely contains an attacker-controlled host in its Location header or body isn't enough on its own, since many apps echo an unrecognized value back without ever redirecting to it. No callback server was configured for this run.",
+		}}
+	}
+	cands := runModule(ctx, d, m, sent)
+	return confirmModule(ctx, rep, d.req.CallbackPoll, cands)
+}
+
+// maxDiscoveredEndpoints caps how many Common Crawl URLs a Discover run scans
+// in addition to the operator's own URL. Each endpoint costs a full module
+// pass, so the cap keeps a large host from multiplying the run's length.
+const maxDiscoveredEndpoints = 5
+
+// mergeResults folds add into into: findings are appended per module, the
+// probe, request and timeout counts are summed, and the tested parameter names
+// are unioned. into keeps its own baseline, since that is the operator's URL.
+func mergeResults(into, add *Result) {
+	byID := make(map[string]int, len(into.Modules))
+	// Index the operator's modules by ID, so discovered findings land in the right one.
+	for i, m := range into.Modules {
+		byID[m.ID] = i
+	}
+	// Append each discovered module's findings to the matching module.
+	for _, m := range add.Modules {
+		if i, ok := byID[m.ID]; ok {
+			into.Modules[i].Findings = append(into.Modules[i].Findings, m.Findings...)
+		}
+	}
+	seen := make(map[string]bool, len(into.ParamsTested))
+	// Seed the set with the names already tested.
+	for _, p := range into.ParamsTested {
+		seen[p] = true
+	}
+	// Add only the names not already in the set.
+	for _, p := range add.ParamsTested {
+		if !seen[p] {
+			seen[p] = true
+			into.ParamsTested = append(into.ParamsTested, p)
+		}
+	}
+	sort.Strings(into.ParamsTested)
+	into.ProbesSent += add.ProbesSent
+	into.Requests += add.Requests
+	into.TimedOut += add.TimedOut
 }
 
 // newRunNonce returns a fresh random suffix for one run's identifiers. Eight

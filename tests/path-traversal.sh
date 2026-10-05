@@ -48,6 +48,9 @@ CONTENTS = {
     "etc/passwd": "root:x:0:0:root:/root:/bin/bash\n"
                   "daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n"
                   "www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin\n",
+    # Second Unix oracle: the scanner also reads /etc/issue, whose "\n \l"
+    # agetty escape is its signature.
+    "etc/issue": "Ubuntu 22.04.3 LTS \\n \\l\n",
     "windows/win.ini": "; for 16-bit app support\n[fonts]\n[extensions]\n[mci extensions]\n[files]\n",
     "var/www/html/index.html": "<html><body><h1>Path traversal lab</h1>"
                                "<a href='/download?file=report.pdf'>report</a> "

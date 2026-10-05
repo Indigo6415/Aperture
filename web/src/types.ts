@@ -70,7 +70,14 @@ export interface RunEvent {
     | 'checkDone'
     | 'phase'
     | 'done'
+    // hostEvent is not tied to a job: it is a network-governor state change
+    // (throttling/drift/block) broadcast on the global /ws/events channel
+    // (see internal/api hub.go). host names the affected host, hostKind is
+    // netgov's event kind, and message carries the human-readable reason.
+    | 'hostEvent'
   nodeId?: string
+  host?: string
+  hostKind?: string
   // Set on a "plan" event: checks a streamed scan has registered (see
   // internal/scanprogress). checkId is set on "checkStart"/"checkDone";
   // findings on "checkDone" (message carries its error, if any). A "phase"
@@ -697,6 +704,7 @@ export type ScanTool =
   | 'csrf'
   | 'sstiscan'
   | 'pathtraversal'
+  | 'idor'
   | 'xxe'
   | 'xss'
   | 'tester'
@@ -964,6 +972,13 @@ export interface GraphqlEnumBaseline {
   // resolvedUrl is set only when the checks ran against a different path than url
   // (the requested URL did not answer as GraphQL and an alternate did).
   resolvedUrl?: string
+  // detectedVia says how the endpoint was confirmed: "typename" when the
+  // universal query returned a typed data object, or "error-signature" when it
+  // refused that query but answered with a GraphQL-shaped error (a
+  // persisted-query-only, auth-gated, or introspection-disabled endpoint).
+  detectedVia?: 'typename' | 'error-signature'
+  // evidence is the error message the "error-signature" detection matched on.
+  evidence?: string
 }
 
 export interface GraphqlFieldSummary {
@@ -1205,6 +1220,9 @@ export interface CorsScanFinding {
   // confidence is "confirmed" when the behavior was reproduced, "likely" or
   // "heuristic" otherwise (empty on findings saved before it was recorded).
   confidence?: Confidence
+  // exploitation says how an attacker would use the misconfiguration (see
+  // internal/corsscan.Finding.Exploitation).
+  exploitation?: string
 }
 
 export interface CorsScanModuleResult {
@@ -1226,6 +1244,11 @@ export interface OpenRedirectRequest {
   requestsPerSecond?: number
   url: string
   params?: string[]
+  // mineParams runs parameter mining against the URL and tests whatever it finds.
+  mineParams?: boolean
+  // discover also scans redirect-shaped URLs Common Crawl has seen under the
+  // same host. It sends a query about the host to a third party, so it is opt-in.
+  discover?: boolean
   credentialId?: string
   headers?: Record<string, string>
   caseId?: string
@@ -1308,6 +1331,8 @@ export interface SsrfRequest {
   requestsPerSecond?: number
   url: string
   params?: string[]
+  // mineParams runs parameter mining against the URL and tests whatever it finds.
+  mineParams?: boolean
   credentialId?: string
   headers?: Record<string, string>
   caseId?: string
@@ -1319,6 +1344,8 @@ export interface SsrfRequest {
   // parameter at that one shared, long-lived server (with a per-parameter
   // identifier) instead of minting a fresh throwaway token per parameter.
   callback?: CallbackSelection
+  // noKnownEndpoints turns off the product-specific endpoint probes (on by default).
+  noKnownEndpoints?: boolean
 }
 
 export interface SsrfBaseline {
@@ -1427,11 +1454,18 @@ export interface XssRequest {
   requestsPerSecond?: number
   url: string
   params?: string[]
+  // mineParams runs parameter mining against the URL and tests whatever it finds.
+  mineParams?: boolean
   credentialId?: string
   headers?: Record<string, string>
   caseId?: string
   recursionDepth?: number
   maxPages?: number
+  // callback names a shared callback server for blind XSS. Omitted means the
+  // blind module mints one token per injection point on this instance.
+  callback?: CallbackSelection
+  // payloadBudget caps the payloads tried per injection point; omitted means the server default.
+  payloadBudget?: number
 }
 
 export interface XssBaseline {
@@ -1541,6 +1575,8 @@ export interface SstiScanRequest {
   requestsPerSecond?: number
   url: string
   params?: string[]
+  // mineParams runs parameter mining against the URL and tests whatever it finds.
+  mineParams?: boolean
   credentialId?: string
   headers?: Record<string, string>
   caseId?: string
@@ -1597,6 +1633,8 @@ export interface PathTraversalRequest {
   body?: string
   contentType?: string
   params?: string[]
+  // mineParams runs parameter mining against the URL and tests whatever it finds.
+  mineParams?: boolean
   credentialId?: string
   headers?: Record<string, string>
   caseId?: string
@@ -1636,6 +1674,66 @@ export interface PathTraversalResponse {
   modules: PathTraversalModuleResult[]
   pagesScanned: string[]
   pointsTested: number
+}
+
+// --- IDOR / broken object-level authorization (mirrors internal/idor) ---
+
+export interface IdorRequest {
+  // requestsPerSecond is the scan speed (Slow/Normal/Fast/Custom); omitted means the server default.
+  requestsPerSecond?: number
+  url: string
+  // method is GET or POST; omitted means POST when a body is set, GET otherwise.
+  method?: string
+  // body is an optional request body, mined for JSON/form reference fields.
+  body?: string
+  contentType?: string
+  // params are extra query-parameter names tried on the URL as id candidates.
+  params?: string[]
+  // mineParams runs parameter mining against the URL and tests whatever it finds.
+  mineParams?: boolean
+  // credentialId is the owner identity whose objects form the baseline.
+  credentialId?: string
+  // attackerCredentialId is an optional second identity; when set the cross-identity module replays under it.
+  attackerCredentialId?: string
+  headers?: Record<string, string>
+  // attackerHeaders are extra headers (e.g. a Cookie) for the second identity.
+  attackerHeaders?: Record<string, string>
+  caseId?: string
+}
+
+export interface IdorBaseline {
+  url: string
+  statusCode: number
+}
+
+export interface IdorFinding {
+  label: string
+  detail?: string
+  evidence?: string
+  payload?: string
+  method?: string
+  statusCode?: number
+  // confidence is "confirmed" (cross-identity proof), "likely" (distinct object), or "heuristic" (a lead).
+  confidence?: Confidence
+  request?: CapturedRequest
+}
+
+export interface IdorModuleResult {
+  id: string
+  name: string
+  severity: ProbeSeverity
+  findings: IdorFinding[]
+}
+
+export interface IdorResponse {
+  baseline: IdorBaseline
+  modules: IdorModuleResult[]
+  // pointsTested is how many distinct reference-bearing points were found.
+  pointsTested: number
+  // testsRun is the total number of individual probes sent to the host.
+  testsRun: number
+  // identities names the alternate identities the cross-identity modules ran under.
+  identities: string[]
 }
 
 // --- Out-of-band collaborator listener (mirrors internal/collaborator +

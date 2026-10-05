@@ -20,12 +20,16 @@ import (
 // wiring every other tool's request carries (see pwResetRequest).
 type openRedirectRequest struct {
 	// RequestsPerSecond is the scan speed the Slow/Normal/Fast/Custom control sends; zero means scanRate's default.
-	RequestsPerSecond float64           `json:"requestsPerSecond,omitempty"`
-	URL               string            `json:"url"`
-	Params            []string          `json:"params,omitempty"`
-	CredentialID      string            `json:"credentialId,omitempty"`
-	Headers           map[string]string `json:"headers,omitempty"`
-	CaseID            string            `json:"caseId,omitempty"`
+	RequestsPerSecond float64  `json:"requestsPerSecond,omitempty"`
+	URL               string   `json:"url"`
+	Params            []string `json:"params,omitempty"`
+	MineParams        bool     `json:"mineParams,omitempty"`
+	// Discover also scans redirect-shaped URLs Common Crawl has seen under the
+	// same host (see openredirect.Request.Discover). Off by default.
+	Discover     bool              `json:"discover,omitempty"`
+	CredentialID string            `json:"credentialId,omitempty"`
+	Headers      map[string]string `json:"headers,omitempty"`
+	CaseID       string            `json:"caseId,omitempty"`
 	// Callback optionally names a long-lived callback server the operator
 	// picked from their own Callback picker (see collaborator.Ref) instead of
 	// the fresh throwaway token handleOpenRedirect mints by default -- lets a
@@ -49,11 +53,17 @@ func collabCallbackHost(base string) string {
 	return strings.TrimPrefix(base, "http://")
 }
 
-// openRedirectTimeout bounds a full run: every module's probes (about a dozen
-// payload shapes per candidate parameter, roughly 30 parameters by default,
-// plus path-segment, Referer, and header probes) share one concurrency limit,
-// so the total run time is what needs the headroom.
-const openRedirectTimeout = 3 * time.Minute
+// openRedirectTimeout bounds a full run: every module's probes (about two
+// dozen payload shapes per candidate parameter, roughly 35 parameters by
+// default, plus CR/LF, IP-literal, path-segment, Referer, and header probes)
+// share one concurrency limit, so the total run time is what needs the
+// headroom.
+const openRedirectTimeout = 6 * time.Minute
+
+// openRedirectDiscoverTimeout bounds a run that also scans Common Crawl's
+// discovered endpoints. Each endpoint is a full pass of its own, so the budget
+// covers the base run plus that many more.
+const openRedirectDiscoverTimeout = 20 * time.Minute
 
 // handleOpenRedirect runs internal/openredirect.Run against req.URL
 // synchronously and returns the full result in one response -- same posture
@@ -96,7 +106,7 @@ func (s *Server) handleOpenRedirect(w http.ResponseWriter, r *http.Request) {
 		followRedirects = *req.FollowRedirects
 	}
 
-	orReq := openredirect.Request{URL: req.URL, Params: req.Params, Headers: req.Headers, FollowRedirects: followRedirects}
+	orReq := openredirect.Request{URL: req.URL, Params: req.Params, MineParams: req.MineParams, Discover: req.Discover, Headers: req.Headers, FollowRedirects: followRedirects}
 	// CallbackBase is a bare "host[:port]/path" with no scheme -- every
 	// payload module's build() prepends its own scheme (or none at all, for
 	// the protocol-relative/backslash-trick payloads), so baking one in here
@@ -132,12 +142,16 @@ func (s *Server) handleOpenRedirect(w http.ResponseWriter, r *http.Request) {
 		orReq.CallbackPoll = openredirect.CallbackPollConfig{Registry: s.collab, Token: token, Provider: "aperture"}
 	}
 
+	timeout := openRedirectTimeout
+	if req.Discover {
+		timeout = openRedirectDiscoverTimeout
+	}
 	s.queueScan(w, streamedScan{
 		rps:     rps,
 		caseID:  req.CaseID,
 		target:  req.URL,
 		tool:    "openredirect",
-		timeout: openRedirectTimeout,
+		timeout: timeout,
 		run: func(ctx context.Context, rep scanprogress.Reporter) (scanOutcome, error) {
 			orReq.Progress = rep
 			resp, err := openredirect.Run(ctx, orReq)

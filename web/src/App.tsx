@@ -6,8 +6,10 @@ import { CaseView } from './components/CaseView'
 import { Wordlists } from './components/Wordlists'
 import { Login } from './components/Login'
 import { Settings } from './components/Settings'
+import { NotificationCenter } from './components/NotificationCenter'
 import { ContextMenuProvider } from './contextMenu'
 import { ToastHost } from './toast'
+import { initNotifications, stopNotifications } from './notifications'
 
 // View is a small discriminated union instead of a plain string so a view
 // that needs an id (which case) carries it along rather than living in a
@@ -34,6 +36,16 @@ export default function App() {
         throw err
       })
   }, [])
+
+  // Start the notification engine once a user is authenticated (the global
+  // events socket it opens needs the session cookie), and tear it down on
+  // logout so a later session starts clean.
+  useEffect(() => {
+    if (user) {
+      initNotifications()
+      return () => stopNotifications()
+    }
+  }, [user])
 
   const logout = async () => {
     await api.logout()
@@ -80,6 +92,7 @@ export default function App() {
             <button onClick={() => setView({ name: 'settings' })} className={navClass(view.name === 'settings')}>
               Settings
             </button>
+            <NotificationCenter />
             <span className="text-neutral-600">|</span>
             <span className="text-neutral-500">{user.email}</span>
             <button onClick={logout} className="text-neutral-400 hover:text-neutral-200">

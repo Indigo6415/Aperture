@@ -18,6 +18,7 @@ import (
 	"github.com/Indigo6415/Aperture/internal/adapters"
 	"github.com/Indigo6415/Aperture/internal/collaborator"
 	"github.com/Indigo6415/Aperture/internal/engine"
+	"github.com/Indigo6415/Aperture/internal/netgov"
 	"github.com/Indigo6415/Aperture/internal/store"
 )
 
@@ -134,6 +135,16 @@ func NewServer(st *store.Store, eng *engine.Engine, uiFS fs.FS, wordlistsDir str
 	// its run and node, so "Inspect requests" can show it after the scan.
 	eng.SetExchangeSink(requestLogSink(st))
 
+	// Fan every network-governor state change (throttling, drift, circuit
+	// breaker, host block, recovery) out to the global events channel so the
+	// frontend notification engine can alert on it, while still logging it the
+	// way the default hook did -- these events are otherwise invisible to the
+	// operator, who only ever sees the scan silently slow down.
+	netgov.SetEventHook(func(e netgov.Event) {
+		log.Printf("netgov: %s %s: %s", e.Host, e.Kind, e.Detail)
+		s.hub.publish(globalEventsKey, RunEvent{Type: "hostEvent", Host: e.Host, HostKind: e.Kind, Message: e.Detail})
+	})
+
 	// Resume the DNS listener across a restart if it was previously
 	// configured -- best-effort, same posture as every other background
 	// setup in this constructor: a bind failure here (e.g. the process no
@@ -235,6 +246,11 @@ func NewServer(st *store.Store, eng *engine.Engine, uiFS fs.FS, wordlistsDir str
 	// its scan here and hands back the ID this route is watched by.
 	s.mux.HandleFunc("GET /ws/scans/{id}", s.requireAuth(s.handleWatchScan))
 
+	// Global events stream -- not keyed by a job. Carries "hostEvent"s (see
+	// the netgov hook in NewServer) that the frontend notification engine
+	// subscribes to for the whole session.
+	s.mux.HandleFunc("GET /ws/events", s.requireAuth(s.handleWatchEvents))
+
 	s.mux.HandleFunc("POST /api/secrets/scan", s.requireAuth(s.handleSecretScan))
 	s.mux.HandleFunc("POST /api/breach/check", s.requireAuth(s.handleBreachCheck))
 	s.mux.HandleFunc("POST /api/breach/crawl-emails", s.requireAuth(s.handleBreachCrawlEmails))
@@ -248,6 +264,7 @@ func NewServer(st *store.Store, eng *engine.Engine, uiFS fs.FS, wordlistsDir str
 	s.mux.HandleFunc("POST /api/xss/scan", s.requireAuth(s.handleXSSScan))
 	s.mux.HandleFunc("POST /api/sstiscan/scan", s.requireAuth(s.handleSSTIScan))
 	s.mux.HandleFunc("POST /api/pathtraversal/scan", s.requireAuth(s.handlePathTraversal))
+	s.mux.HandleFunc("POST /api/idor/scan", s.requireAuth(s.handleIDOR))
 	s.mux.HandleFunc("POST /api/xxe/scan", s.requireAuth(s.handleXXE))
 
 	s.mux.HandleFunc("POST /api/gitdump/scan", s.requireAuth(s.handleGitDump))

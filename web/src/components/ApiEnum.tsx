@@ -20,6 +20,7 @@ import { CredentialPicker } from './CredentialPicker'
 import { BatchResultsPanel, stoppedSummary, type BatchResultSummary } from './BatchResultsPanel'
 import { ScanHistoryPanel } from './ScanHistoryPanel'
 import { applyScanEvent, emptyProgress, finishProgress, type ScanProgress, runBatch, stopTrackedScan, useScanBatch, stopAllScans } from '../scanProgress'
+import { indicatorOfScans, useReportScanIndicator } from '../scanIndicator'
 import { ScanWindowTabs } from './ScanWindowTabs'
 import { latestByTarget, loadCaseScans } from '../scanHistory'
 import { useAutoCollapseOnce, useCollapsible } from '../collapsible'
@@ -143,6 +144,8 @@ export function ApiEnum({
   const extraWordlistEntries = useMemo(() => extraWordlist.split(/[,\n]+/).map((s) => s.trim()).filter(Boolean), [extraWordlist])
 
   const running = Object.values(scans).some((s) => s.status === 'running')
+  // Publishes this tab's scan state to the case nav's border.
+  useReportScanIndicator('apienum', indicatorOfScans(scans, () => []))
   const speed = useScanSpeed()
   const canRun = runTargets.length > 0 && !running && speed.rps !== null
 
@@ -598,7 +601,8 @@ function RouteTree({ routes }: { routes: ApiRoute[] }) {
         ) : (
           groups.map(([group, groupRoutes]) => {
             const open = openGroups.has(group)
-            const flaggedInGroup = groupRoutes.reduce((n, r) => n + r.params.filter((p) => p.flagged).length, 0)
+            // Go sends a route with no discovered params as null, not [], so guard each one.
+            const flaggedInGroup = groupRoutes.reduce((n, r) => n + (r.params ?? []).filter((p) => p.flagged).length, 0)
             return (
               <div key={group}>
                 <button type="button" onClick={() => toggleGroup(group)} className="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-neutral-900/60">
@@ -627,7 +631,9 @@ function RouteTree({ routes }: { routes: ApiRoute[] }) {
 
 function RouteRow({ route }: { route: ApiRoute }) {
   const [expanded, setExpanded] = useState(false)
-  const flaggedCount = route.params.filter((p) => p.flagged).length
+  // Go sends null for a route with no params, so treat a missing list as empty.
+  const params = route.params ?? []
+  const flaggedCount = params.filter((p) => p.flagged).length
 
   return (
     <div className="py-1.5">
@@ -681,7 +687,7 @@ function RouteRow({ route }: { route: ApiRoute }) {
             )}
           </div>
 
-          {route.params.length > 0 && <ParamList params={route.params} />}
+          {params.length > 0 && <ParamList params={params} />}
         </div>
       )}
     </div>

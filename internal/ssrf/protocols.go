@@ -99,8 +99,11 @@ func (p serviceProbe) protocolURL() string {
 		return fmt.Sprintf("dict://%s:%d/%s", p.host, p.port, p.raw)
 	}
 	var b strings.Builder
+	// Each raw byte is either kept as-is or escaped to its two-digit hex form.
 	for i := 0; i < len(p.raw); i++ {
 		c := p.raw[i]
+		// Unreserved bytes need no escaping, and everything else must be
+		// escaped so CRLF and binary bytes reach the service intact.
 		if isUnreserved(c) {
 			b.WriteByte(c)
 		} else {
@@ -121,6 +124,7 @@ func isUnreserved(c byte) bool {
 // not be mistaken for the service answering.
 func protocolProbeURLs() []string {
 	out := make([]string, 0, len(protocolProbes))
+	// Build each probe's URL once, in the same order as protocolProbes.
 	for _, p := range protocolProbes {
 		out = append(out, p.protocolURL())
 	}
@@ -138,6 +142,8 @@ func runProtocolModule(ctx context.Context, deps runDeps) []Finding {
 		var mu sync.Mutex
 		var out []Finding
 		var wg sync.WaitGroup
+		// One goroutine per service probe; the shared request semaphore bounds
+		// how many of them are in flight at once.
 		for _, probe := range protocolProbes {
 			wg.Add(1)
 			go func(probe serviceProbe) {
@@ -165,6 +171,8 @@ func runProtocolModule(ctx context.Context, deps runDeps) []Finding {
 // finding always reads as a parameter.
 func protocolFinding(pt probePoint, method string, probe serviceProbe, evidence string, res *ssrfResult) Finding {
 	scheme := probe.scheme + "://"
+	// Label names the service and scheme so the operator sees which protocol
+	// reached it.
 	return Finding{
 		Label: fmt.Sprintf("Parameter %q reaches internal %s service via %s", pt.name, probe.service, scheme),
 		Detail: fmt.Sprintf(

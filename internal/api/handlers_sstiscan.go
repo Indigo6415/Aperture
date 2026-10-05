@@ -23,6 +23,7 @@ type sstiScanRequest struct {
 	RequestsPerSecond float64           `json:"requestsPerSecond,omitempty"`
 	URL               string            `json:"url"`
 	Params            []string          `json:"params,omitempty"`
+	MineParams        bool              `json:"mineParams,omitempty"`
 	CredentialID      string            `json:"credentialId,omitempty"`
 	Headers           map[string]string `json:"headers,omitempty"`
 	CaseID            string            `json:"caseId,omitempty"`
@@ -97,7 +98,7 @@ func (s *Server) handleSSTIScan(w http.ResponseWriter, r *http.Request) {
 		timeout: sstiScanTimeout,
 		run: func(ctx context.Context, rep scanprogress.Reporter) (scanOutcome, error) {
 			resp, err := sstiscan.Run(ctx, sstiscan.Request{Progress: rep,
-				URL: req.URL, Params: req.Params, Headers: req.Headers,
+				URL: req.URL, Params: req.Params, MineParams: req.MineParams, Headers: req.Headers,
 				RecursionDepth: req.RecursionDepth, MaxPages: req.MaxPages,
 			}, oob)
 			if err != nil {

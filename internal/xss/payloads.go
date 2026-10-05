@@ -35,6 +35,9 @@ func newCanary() string {
 type payloadDef struct {
 	id, name, severity string
 	build              func(canary string) string
+	// list, when set, makes this a payload family: it returns the ordered
+	// candidates for one technique (see catalog.go), and build is unused.
+	list func(canary string) []string
 	// match reports whether body shows payload landed somewhere it would
 	// actually be parsed/executed, returning the evidence snippet to
 	// surface in the Finding.
@@ -117,7 +120,8 @@ func javascriptURIMatch(body, payload, canary string) (string, bool) {
 //     block parentheses.
 //
 // Every payload embeds the run's canary, so a match can only come from this
-// request. The payload set is 22 modules in all.
+// request. These are the single-payload techniques; the dalfox catalog families
+// (catalog.go) are appended after them in the run's try order.
 var payloadModules = []payloadDef{
 	{
 		id: "script-tag", name: "Raw <script> tag injection", severity: "critical",

@@ -209,7 +209,7 @@ func Run(ctx context.Context, rawURL string, opts Options) (*Result, error) {
 		baselineTarget += "?" + u.RawQuery
 	}
 
-	baselineResp, err := doAttempt(ctx, client, http.MethodGet, u.Scheme, u.Host, u.Host, baselineTarget, opts.Headers)
+	baselineResp, err := doAttempt(ctx, client, http.MethodGet, u.Scheme, u.Host, u.Host, baselineTarget, "", opts.Headers)
 	if err != nil {
 		return nil, fmt.Errorf("bypass403: baseline request failed: %w", err)
 	}
@@ -239,6 +239,7 @@ func Run(ctx context.Context, rawURL string, opts Options) (*Result, error) {
 	if !opts.AllowWriteMethods {
 		specs = withoutWriteMethods(specs)
 	}
+	specs = withoutNoOpHostMutations(specs, u.Host)
 
 	conc := opts.Concurrency
 	if conc <= 0 {
@@ -300,6 +301,11 @@ func runAttempt(ctx context.Context, client *http.Client, scheme, host string, s
 	if spec.hostHeader != "" {
 		hostHeader = spec.hostHeader
 	}
+	// A derived Host spelling is computed from the real host, which only this
+	// function knows, so it takes precedence over a fixed hostHeader.
+	if spec.hostMutation != "" {
+		hostHeader = mutateHost(host, spec.hostMutation)
+	}
 	reqScheme := scheme
 	if spec.scheme != "" {
 		reqScheme = spec.scheme
@@ -320,7 +326,7 @@ func runAttempt(ctx context.Context, client *http.Client, scheme, host string, s
 	case strings.HasPrefix(spec.target, "//"):
 		res, err = doRawRequest(ctx, reqScheme, host, hostHeader, spec.target, headers, rawRequestOptions{proto: "1.1"})
 	default:
-		res, err = doAttempt(ctx, client, spec.method, reqScheme, host, hostHeader, spec.target, headers)
+		res, err = doAttempt(ctx, client, spec.method, reqScheme, host, hostHeader, spec.target, spec.body, headers)
 	}
 	if err != nil {
 		out.Error = err.Error()
@@ -418,7 +424,7 @@ func buildCatchAll(ctx context.Context, client *http.Client, scheme, host, baseP
 	var samples []fingerprint.Observation
 	for i := 0; i < catchAllSamples && i < len(shapes); i++ {
 		target := dir + strings.Replace(shapes[i], "%s", randomProbeName(), 1)
-		res, err := doAttempt(ctx, client, http.MethodGet, scheme, host, host, target, headers)
+		res, err := doAttempt(ctx, client, http.MethodGet, scheme, host, host, target, "", headers)
 		if err != nil {
 			continue
 		}

@@ -250,6 +250,15 @@ export const IconCookie = (p: IconProps) =>
 // own query syntax.
 export const IconCode = (p: IconProps) => base(p, <path d="M9.5 6 4 12l5.5 6M14.5 6 20 12l-5.5 6" />)
 
+export const IconBell = (p: IconProps) =>
+  base(
+    p,
+    <>
+      <path d="M6 9a6 6 0 0 1 12 0c0 4 1.5 5 2 6H4c.5-1 2-2 2-6Z" />
+      <path d="M10 19a2 2 0 0 0 4 0" />
+    </>,
+  )
+
 // IconGitBranch is two commit nodes joined by a branch line -- the Git Dump
 // tab's icon, standing in for a repository's history.
 export const IconGitBranch = (p: IconProps) =>

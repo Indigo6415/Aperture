@@ -517,6 +517,15 @@ func verifyRead(ctx context.Context, deps runDeps, m module, pt point, p payload
 		detail += " " + c
 	}
 
+	// Pin down the exact traversal depth, the way dotdotpwn's bisection
+	// algorithm does, when this module's payloads are a plain repetition of
+	// one step. It is best effort: a failure just leaves the depth unstated.
+	if m.depthStep != "" {
+		if n, ok := findMinDepth(ctx, deps, m, pt, p.target, m.depthStep, maxTraversalDepth); ok {
+			detail += fmt.Sprintf(" The minimal traversal depth that still reads the file is %d (%d×%q).", n, n, m.depthStep)
+		}
+	}
+
 	captured := res.Request
 	return Finding{
 		Label:      "Arbitrary file read via " + pt.label,
@@ -528,6 +537,31 @@ func verifyRead(ctx context.Context, deps runDeps, m module, pt point, p payload
 		Confidence: confidence,
 		Request:    &captured,
 	}, verdictReported
+}
+
+// maxTraversalDepth is how many steps findMinDepth searches up to. It matches
+// the deepest repetition the classic module sends, so the minimal depth is
+// never reported as deeper than a payload actually climbed.
+const maxTraversalDepth = 16
+
+// findMinDepth finds the smallest number of traversal steps that still reads
+// the target file, the way dotdotpwn's bisection algorithm reports a
+// vulnerability's exact depth. It tries depths from 1 upward and stops at the
+// first that reads, checking the same signatures the finding used. It is best
+// effort: a transport error or a cancelled run returns ok=false, and the
+// caller then leaves the depth out of the report.
+func findMinDepth(ctx context.Context, deps runDeps, m module, pt point, target, step string, maxDepth int) (int, bool) {
+	// Climb one step deeper each time until the file reads or the cap is hit.
+	for n := 1; n <= maxDepth; n++ {
+		res := send(ctx, deps.client, deps.sem, pt.build(repeatSeq(step, n)+target))
+		if res.Err != nil {
+			return 0, false
+		}
+		if _, _, ok := matchFile(res.Body, deps.baseline, m.decodeBase64); ok {
+			return n, true
+		}
+	}
+	return 0, false
 }
 
 // sendWithRetry sends spec and sends it once more on a transport error, unless

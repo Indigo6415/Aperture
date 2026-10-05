@@ -57,6 +57,15 @@ func (s *Server) watch(w http.ResponseWriter, r *http.Request, id string) {
 	s.watchWithStart(w, r, id, nil)
 }
 
+// handleWatchEvents streams the global events channel (network-governor
+// state changes -- see the netgov hook in NewServer) to a client for the
+// whole session, rather than for one job. The frontend keeps a single such
+// socket open so notification rules can alert on throttling/drift the moment
+// it happens, whichever scan triggered it.
+func (s *Server) handleWatchEvents(w http.ResponseWriter, r *http.Request) {
+	s.watch(w, r, globalEventsKey)
+}
+
 // watchWithStart is watch, plus an optional start callback invoked right
 // after subscribing to id's hub channel and before relaying begins --
 // handleWatchProbeScan uses this to only start a probe scan once a client

@@ -14,9 +14,11 @@ import { inputBase } from '../formStyles'
 import { toAbsoluteUrl } from '../url'
 import { SeverityTiles, ModuleResultsList, totalFindingsOf, hasSevereFindings } from './ScanModuleResults'
 import { emptyProgress, runTrackedScan, type TrackedScan, runBatch, stopTrackedScan, useScanBatch, stopAllScans } from '../scanProgress'
+import { indicatorOfScans, useReportScanIndicator } from '../scanIndicator'
 
 import { ScanErrorNotice } from './ScanErrorNotice'
 import { useScanSpeed } from './scanSpeed'
+import { ParamMiningToggle } from './ParamMiningToggle'
 
 type TargetScanState = TrackedScan<SsrfResponse>
 
@@ -40,6 +42,7 @@ export function Ssrf({ caseId, targets, credentials }: { caseId: string; targets
   const [credentialId, setCredentialId] = useState<string | undefined>()
   const [extraParams, setExtraParams] = useState('')
   const [autoDiscover, setAutoDiscover] = useState(false)
+  const [noKnownEndpoints, setNoKnownEndpoints] = useState(false)
   const [callback, setCallback] = useState<CallbackSelection | null>(null)
 
   const hasScans = Object.keys(scans).length > 0
@@ -67,8 +70,11 @@ export function Ssrf({ caseId, targets, credentials }: { caseId: string; targets
   const manualTargets = useMemo(() => manualTarget.split(/[,\n]+/).map((s) => s.trim()).filter(Boolean), [manualTarget])
   const runTargets = useMemo(() => [...new Set([...selected, ...manualTargets])], [selected, manualTargets])
   const params = useMemo(() => extraParams.split(',').map((s) => s.trim()).filter(Boolean), [extraParams])
+  const [mineParams, setMineParams] = useState(false)
 
   const running = Object.values(scans).some((s) => s.status === 'running')
+  // Publishes this tab's scan state to the case nav's border.
+  useReportScanIndicator('ssrf', indicatorOfScans(scans, (s) => s.result?.modules ?? []))
   // stopScan stops one target's running scan. Its card settles itself once the
   // server's terminal event arrives.
   const stopScan = (t: string) => stopTrackedScan(scans[t])
@@ -99,9 +105,12 @@ export function Ssrf({ caseId, targets, credentials }: { caseId: string; targets
         api.ssrfScan({ requestsPerSecond: speed.rps ?? undefined,
           url: toAbsoluteUrl(targetValue),
           params: params.length ? params : undefined,
+
+          mineParams: mineParams || undefined,
           credentialId,
           caseId,
           autoDiscover: autoDiscover || undefined,
+          noKnownEndpoints: noKnownEndpoints || undefined,
           callback: callback ?? undefined,
         }),
       (update) => setScans((prev) => (prev[targetValue] ? { ...prev, [targetValue]: update(prev[targetValue]) } : prev)),
@@ -172,6 +181,16 @@ export function Ssrf({ caseId, targets, credentials }: { caseId: string; targets
             placeholder="sourceUrl, previewUrl"
             className={`mt-1 ${inputBase}`}
           />
+        </label>
+
+        <ParamMiningToggle checked={mineParams} onChange={setMineParams} />
+
+        <label
+          className="flex items-center gap-1.5 text-xs text-neutral-400"
+          title="Also checks product-specific fetch endpoints (image proxies, oEmbed, WebLogic/Umbraco/WordPress helpers, ...) converted from the nuclei SSRF templates. Each path is first checked for existence and skipped if it 404s or matches the site's catch-all page. On by default; untick to test only the target URL and its own parameters."
+        >
+          <input type="checkbox" checked={!noKnownEndpoints} onChange={(e) => setNoKnownEndpoints(!e.target.checked)} className="accent-sky-500" />
+          Probe known product endpoints (nuclei-derived)
         </label>
 
         <label

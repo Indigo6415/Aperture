@@ -24,15 +24,16 @@
 // blocks the literal string "script" case-sensitively, another encodes
 // everything reflected into HTML body text but not what lands inside an
 // already-open inline <script> block. See payloads.go's payloadModules doc
-// comment for the full battery and what each one targets.
+// comment for the single-payload techniques, and catalog.go for the families
+// ported from dalfox's payload tables.
 //
-// One further module rounds this out beyond pure reflection:
-// runDomSinkModule (checks.go) is a static heuristic over crawled pages'
-// own inline scripts for a client-side (DOM) XSS pattern -- a tainted
-// browser-side source (location.hash, document.referrer, ...) flowing into
-// a dangerous rendering sink (innerHTML, document.write, eval, ...) -- that
-// a pure request/response reflection check can never see, since nothing
-// about it touches the server at all.
+// Two modules go beyond pure reflection. runDomSinkModule (checks.go) looks
+// for a client-side (DOM) XSS flow: a tainted browser-side source (location.hash,
+// localStorage, postMessage data, ...) reaching a dangerous rendering sink
+// (innerHTML, document.write, eval, ...). It abstractly interprets each page's
+// script (domflow.go) and falls back to a regex heuristic only for a script that
+// does not parse. blind.go stores callback payloads and waits for the callbacks,
+// which finds stored XSS the scanner never sees rendered.
 //
 // Shaped like every other scanner in Aperture: a baseline plus a battery of
 // check modules, each with fixed severity and findings present even when
@@ -46,7 +47,6 @@ import (
 	"github.com/Indigo6415/Aperture/internal/scanprogress"
 	"sort"
 	"strings"
-	"sync"
 )
 
 // Confidence levels for a Finding. "confirmed" means a headless browser ran the
@@ -100,6 +100,13 @@ type Request struct {
 	// Progress, when set, receives one check per (payload module, injection
 	// point) pair as it runs. Nil means nobody is watching.
 	Progress scanprogress.Reporter `json:"-"`
+	// SkipBrowser turns off the headless-browser confirmation pass, so every
+	// finding keeps its static confidence. The corpus test sets it: it runs
+	// hundreds of scans and needs the static detector measured on its own.
+	SkipBrowser bool `json:"-"`
+	// PayloadBudget caps how many payloads one injection point is tried with.
+	// Zero means defaultPayloadBudget; the value is capped at maxPayloadBudget.
+	PayloadBudget int `json:"payloadBudget,omitempty"`
 }
 
 type Baseline struct {
@@ -117,16 +124,19 @@ type Result struct {
 	PointsTested int `json:"pointsTested"`
 }
 
+// runDeps is the state one run shares across its injection points.
 type runDeps struct {
 	req    Request
 	points []injectionPoint
 	canary string
+	// families are the payload techniques in try order: the original modules,
+	// then the dalfox catalog families (see catalog.go).
+	families []payloadDef
+	// budget is how many payloads one point is tried with, in total across families.
+	budget int
 	sem    chan struct{}
-	// rep receives one progress check per (payload module, point) pair.
+	// rep receives one progress check per injection point.
 	rep scanprogress.Reporter
-	// confirmed holds the point keys an earlier module has already confirmed,
-	// so later modules skip them. Modules run concurrently, so it is a sync.Map.
-	confirmed *sync.Map
 }
 
 // maxBrowserChecks caps how many candidates are replayed in a headless browser
@@ -135,18 +145,38 @@ type runDeps struct {
 // at their static confidence.
 const maxBrowserChecks = 20
 
-// maxConcurrentRequests bounds how many requests this scanner has in
-// flight at once, across every payload module combined -- fifteen payload
-// modules each testing every discovered point (often several dozen between
-// query params, form fields across every crawled page, and headers) would
-// otherwise all fire at essentially the same instant. Same reasoning as
-// sstiscan/ssrf/openredirect's own constant of the same name.
+// maxConcurrentRequests bounds how many requests this scanner has in flight at
+// once, across every injection point. Same reasoning as sstiscan/ssrf/
+// openredirect's own constant of the same name.
 const maxConcurrentRequests = 16
 
+// defaultPayloadBudget is how many payloads one injection point is tried with
+// when the request does not set PayloadBudget. The budget is spent round-robin
+// across the techniques, so each technique's best candidates come first. Forty
+// matched the detection of a 200-payload budget on dalfox's corpus at a fifth of
+// the requests, and each request is paced to the scan's rate, so the count matters.
+const defaultPayloadBudget = 40
+
+// maxPayloadBudget caps a caller-supplied PayloadBudget.
+const maxPayloadBudget = 2000
+
+// payloadBudgetFor resolves a request's budget to the value the run uses.
+func payloadBudgetFor(requested int) int {
+	switch {
+	case requested <= 0:
+		return defaultPayloadBudget
+	case requested > maxPayloadBudget:
+		return maxPayloadBudget
+	}
+	return requested
+}
+
 // Run crawls req.URL to discover candidate injection points (see crawl.go),
-// takes a plain baseline request, then runs every payload module (plus the
-// DOM-sink module) concurrently against every point.
-func Run(ctx context.Context, req Request) (*Result, error) {
+// takes a plain baseline request, then probes each point (see probe.go) and
+// tries the payload techniques that survive the probe, in budget order. When oob
+// names a callback listener, it also stores blind payloads at every point and
+// waits for their callbacks (see blind.go).
+func Run(ctx context.Context, req Request, oob OOBConfig) (*Result, error) {
 	rep := scanprogress.Or(req.Progress)
 
 	seed, err := parseTarget(req.URL)
@@ -194,48 +224,53 @@ func Run(ctx context.Context, req Request) (*Result, error) {
 		points = append(points, p)
 	}
 
-	rep.Phase(fmt.Sprintf("Testing %d injection point(s) with %d payload module(s)", len(points), len(payloadModules)))
-	deps := runDeps{req: req, points: points, canary: newCanary(), sem: make(chan struct{}, maxConcurrentRequests), confirmed: &sync.Map{}, rep: rep}
+	canary := newCanary()
+	// The original single-payload modules run first, then the dalfox catalog
+	// families. Each keeps its own module in the result.
+	families := append(append([]payloadDef{}, payloadModules...), buildCatalogFamilies(canary)...)
 
-	type moduleOutcome struct {
-		id, name, severity string
-		findings           []pointFinding
+	rep.Phase(fmt.Sprintf("Testing %d injection point(s) with %d payload technique(s)", len(points), len(families)))
+	deps := runDeps{
+		req:      req,
+		points:   points,
+		canary:   canary,
+		families: families,
+		budget:   payloadBudgetFor(req.PayloadBudget),
+		sem:      make(chan struct{}, maxConcurrentRequests),
+		rep:      rep,
+	}
+	outcomes := scanPoints(ctx, deps)
+
+	// Every technique gets a module, even one that found nothing, so the
+	// result shape does not depend on what the target reflected.
+	modules := make([]ModuleResult, len(families))
+	for i, fam := range families {
+		modules[i] = ModuleResult{ID: fam.id, Name: fam.name, Severity: fam.severity, Findings: []Finding{}}
 	}
 
-	results := make([]moduleOutcome, len(payloadModules))
-	allEscaped := make([][]escapedSighting, len(payloadModules))
-	var wg sync.WaitGroup
-	for i, m := range payloadModules {
-		wg.Add(1)
-		go func(i int, m payloadDef) {
-			defer wg.Done()
-			findings, escaped := runPayloadModule(ctx, deps, m)
-			results[i] = moduleOutcome{id: m.id, name: m.name, severity: m.severity, findings: findings}
-			allEscaped[i] = escaped
-		}(i, m)
-	}
-	wg.Wait()
-
-	modules := make([]ModuleResult, 0, len(payloadModules)+2)
 	browserChecks := 0
-	confirmedPoints := map[string]bool{}
+	confirmed := map[string]bool{}
 	var escapedFlat []escapedSighting
-	for i, m := range results {
-		flat := make([]Finding, 0, len(m.findings))
-		for _, pf := range m.findings {
-			// Browser replay happens here, after every module has finished, so the
+	for _, o := range outcomes {
+		if o.finding != nil {
+			// Browser replay happens here, after every point has been probed, so the
 			// probing itself never waits on Chrome.
-			if browserChecks < maxBrowserChecks {
+			pf := *o.finding
+			if browserChecks < maxBrowserChecks && !req.SkipBrowser {
 				pf = verifyPointFinding(ctx, pf, deps.canary)
 				browserChecks++
 			}
-			confirmedPoints[pf.key] = true
-			flat = append(flat, pf.finding)
+			confirmed[pf.key] = true
+			modules[o.family].Findings = append(modules[o.family].Findings, pf.finding)
 		}
-		modules = append(modules, ModuleResult{ID: m.id, Name: m.name, Severity: m.severity, Findings: flat})
-		escapedFlat = append(escapedFlat, allEscaped[i]...)
+		if o.escaped != nil {
+			escapedFlat = append(escapedFlat, *o.escaped)
+		}
 	}
-	modules = append(modules, aggregateEscapedModule(escapedFlat, confirmedPoints))
+	modules = append(modules, aggregateEscapedModule(escapedFlat, confirmed))
+	if blindUsable(oob) {
+		modules = append(modules, ModuleResult{ID: "blind-xss", Name: "Blind XSS (out-of-band callback)", Severity: "high", Findings: runBlindXSSModule(ctx, deps, oob)})
+	}
 	modules = append(modules, ModuleResult{ID: "dom-xss-sink", Name: "DOM XSS sink (static heuristic)", Severity: "low", Findings: runDomSinkModule(cr.Pages)})
 
 	sort.Slice(modules, func(i, j int) bool { return modules[i].Name < modules[j].Name })

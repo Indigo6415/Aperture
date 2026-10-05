@@ -199,7 +199,7 @@ func TestNonHTMLAndTextareaReflectionsAreNotFindings(t *testing.T) {
 	defer srv.Close()
 
 	for _, path := range []string{"/json", "/download", "/encoded-textarea"} {
-		res, err := Run(context.Background(), Request{URL: srv.URL + path + "?q=seed", RecursionDepth: 0})
+		res, err := Run(context.Background(), Request{URL: srv.URL + path + "?q=seed", RecursionDepth: 0}, OOBConfig{})
 		if err != nil {
 			t.Fatalf("Run(%s): %v", path, err)
 		}

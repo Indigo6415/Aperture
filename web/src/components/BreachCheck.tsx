@@ -11,6 +11,7 @@ import { CopyButton } from './CopyButton'
 import { BatchResultsPanel, stoppedSummary, type BatchResultSummary } from './BatchResultsPanel'
 import { ScanTargetCard } from './ScanTargetCard'
 import { emptyProgress, runTrackedScan, stopAllScans, stopTrackedScan, useScanBatch, type TrackedScan } from '../scanProgress'
+import { useReportScanIndicator } from '../scanIndicator'
 import { ScanHistoryPanel } from './ScanHistoryPanel'
 import { ScanWindowTabs } from './ScanWindowTabs'
 import { latestByTarget, loadCaseScans } from '../scanHistory'
@@ -159,6 +160,11 @@ export function BreachCheck({ caseId, targets, credentials }: { caseId: string; 
   const [checks, setChecks] = useState<Record<string, EmailCheckState>>({})
   // checkRun is the live batch behind the email lookups, shown as one card with a square per address.
   const [checkRun, setCheckRun] = useState<TrackedScan<BreachCheckResponse> | null>(null)
+  // Publishes the crawl and email check runs to the case nav's border. Neither
+  // grades its results, so a finished run shows the clean green.
+  const breachRunning = checkRun?.status === 'running' || Object.values(scans).some((s) => s.status === 'running')
+  const breachRan = checkRun !== null || Object.keys(scans).length > 0
+  useReportScanIndicator('breach', { phase: breachRunning ? 'running' : breachRan ? 'done' : 'idle', severity: null })
 
   // Restores this case's most recent breach-check result per email on
   // mount/reload -- see saveCaseScan in internal/api/handlers_breach.go

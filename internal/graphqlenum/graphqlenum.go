@@ -109,7 +109,22 @@ type Baseline struct {
 	// when it differs from URL -- the requested URL didn't answer as GraphQL,
 	// and an alternate path under the same origin did (see discover.go).
 	ResolvedURL string `json:"resolvedUrl,omitempty"`
+	// DetectedVia says how the endpoint was confirmed: "typename" when the
+	// universal query returned a typed data object, or "error-signature" when
+	// it refused that query but answered with a GraphQL-shaped error (a
+	// persisted-query-only, auth-gated, or introspection-disabled endpoint --
+	// see confirmEndpoint and looksLikeGraphQLErrors).
+	DetectedVia string `json:"detectedVia,omitempty"`
+	// Evidence is the error message the "error-signature" detection matched on,
+	// kept so the operator can see exactly what the endpoint said.
+	Evidence string `json:"evidence,omitempty"`
 }
+
+// Detection method values for Baseline.DetectedVia.
+const (
+	detectedViaTypename = "typename"
+	detectedViaError    = "error-signature"
+)
 
 // Result is one run's full output.
 type Result struct {
@@ -236,22 +251,53 @@ func confirmEndpoint(ctx context.Context, client *http.Client, target *url.URL, 
 	if err != nil {
 		return Baseline{}, target, fmt.Errorf("graphqlenum: baseline request failed: %w", err)
 	}
-	env, _ := parseEnvelope(res.Body)
-	if typeName := env.typename(); env.hasData() && typeName != "" {
-		return Baseline{StatusCode: res.StatusCode, Confirmed: true, TypeName: typeName}, target, nil
+	if b, ok := confirmFromResponse(res); ok {
+		return b, target, nil
 	}
 
 	// The requested URL isn't GraphQL. Try the usual alternate locations
 	// before giving up, since a GraphQL API is often mounted at a path other
 	// than the one the operator pasted in.
 	if alt, altRes, ok := findAlternateEndpoint(ctx, client, target, headers); ok {
-		altEnv, _ := parseEnvelope(altRes.Body)
-		return Baseline{
-			StatusCode: altRes.StatusCode, Confirmed: true, TypeName: altEnv.typename(),
-			ResolvedURL: alt.String(),
-		}, alt, nil
+		b, _ := confirmFromResponse(altRes)
+		b.ResolvedURL = alt.String()
+		return b, alt, nil
 	}
 	return Baseline{StatusCode: res.StatusCode}, target, nil
+}
+
+// confirmFromResponse decides whether res (a "{__typename}" probe response) is
+// a GraphQL endpoint, returning the baseline that describes how. It confirms in
+// two ways, most-to-least certain:
+//
+//   - the probe returned a typed data object (data.__typename) -- an endpoint
+//     that runs arbitrary queries, the original and strongest signal;
+//   - the probe was refused but the endpoint answered with a GraphQL-shaped
+//     error (see looksLikeGraphQLErrors) -- a persisted-query-only, auth-gated,
+//     or introspection-disabled endpoint, which is still worth scanning.
+//
+// ok is false when neither held, in which case the returned baseline carries
+// just the status code (Confirmed stays false).
+func confirmFromResponse(res *httpResult) (Baseline, bool) {
+	env, parsed := parseEnvelope(res.Body)
+	if !parsed {
+		return Baseline{StatusCode: res.StatusCode}, false
+	}
+	// Strongest signal: the endpoint actually executed the universal query.
+	if typeName := env.typename(); env.hasData() && typeName != "" {
+		return Baseline{
+			StatusCode: res.StatusCode, Confirmed: true,
+			TypeName: typeName, DetectedVia: detectedViaTypename,
+		}, true
+	}
+	// Fallback: it refused the query but did so as GraphQL.
+	if env.looksLikeGraphQLErrors() {
+		return Baseline{
+			StatusCode: res.StatusCode, Confirmed: true,
+			DetectedVia: detectedViaError, Evidence: env.firstErrorText(),
+		}, true
+	}
+	return Baseline{StatusCode: res.StatusCode}, false
 }
 
 // orEmpty turns a nil findings slice into an empty (but non-nil) one -- a

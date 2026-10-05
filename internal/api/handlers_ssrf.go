@@ -23,14 +23,18 @@ type ssrfRequest struct {
 	RequestsPerSecond float64           `json:"requestsPerSecond,omitempty"`
 	URL               string            `json:"url"`
 	Params            []string          `json:"params,omitempty"`
+	MineParams        bool              `json:"mineParams,omitempty"`
 	CredentialID      string            `json:"credentialId,omitempty"`
 	Headers           map[string]string `json:"headers,omitempty"`
 	CaseID            string            `json:"caseId,omitempty"`
 	// AutoDiscover/RecursionDepth/MaxPages mirror ssrf.Request's own fields
 	// of the same names -- see that type's doc comments.
-	AutoDiscover   bool `json:"autoDiscover,omitempty"`
-	RecursionDepth int  `json:"recursionDepth,omitempty"`
-	MaxPages       int  `json:"maxPages,omitempty"`
+	// NoKnownEndpoints turns off the product-specific endpoint probes; see
+	// ssrf.Request.NoKnownEndpoints. They run by default.
+	NoKnownEndpoints bool `json:"noKnownEndpoints,omitempty"`
+	AutoDiscover     bool `json:"autoDiscover,omitempty"`
+	RecursionDepth   int  `json:"recursionDepth,omitempty"`
+	MaxPages         int  `json:"maxPages,omitempty"`
 	// Callback optionally names a callback server the operator picked from
 	// their own Callback picker (see collaborator.Ref) -- when set, the
 	// OOB-callback module points every parameter at that one shared,
@@ -106,6 +110,7 @@ func (s *Server) handleSSRF(w http.ResponseWriter, r *http.Request) {
 			resp, err := ssrf.Run(ctx, ssrf.Request{
 				URL: req.URL, Params: req.Params, Headers: req.Headers,
 				AutoDiscover: req.AutoDiscover, RecursionDepth: req.RecursionDepth, MaxPages: req.MaxPages,
+				MineParams: req.MineParams, NoKnownEndpoints: req.NoKnownEndpoints,
 				Progress: rep,
 			}, oob)
 			if err != nil {
