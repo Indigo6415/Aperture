@@ -421,7 +421,7 @@ func (s *Server) handleCollaboratorCallback(w http.ResponseWriter, r *http.Reque
 }
 
 // collabGreeting is the fixed body returned for a plain callback hit.
-const collabGreeting = "HELL YEA BABY!\nHELL YEA BABY!\nHELL YEA BABY!\n"
+const collabGreeting = "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠲⠾⢶⣦⠀⠀\n⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣶⣾⣿⣹⣇⡶⠆\n⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣼⣿⣿⣿⣿⣿⡇⠀\n⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣼⣿⣿⣿⣿⡇⡇⠀⠀\n⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣤⡴⣿⣿⣿⣿⣿⣿⡗⡁⠀⠀\n⢀⣾⣿⠷⣶⣄⡀⠀⠀⠀⠀⠀⠀⣀⣀⣴⣿⣿⣷⣽⣿⣿⣿⣿⣟⣠⣧⠀⠀\n⢣⣀⣿⣿⣾⣝⢷⣄⠀⠀⢀⣤⣶⣿⣿⣿⣿⣿⣿⣿⣷⣞⡻⡿⣿⣿⣿⠀⠀\n⠘⢖⣈⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠋⣱⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⣷⣵⡽⠀⠀\n⠀⠀⠉⠻⢿⣿⣿⣿⣿⣿⣿⣿⢖⣴⣿⣿⣿⣿⣿⣿⣿⣿⢿⣿⣿⣿⠇⠀⠀\n⠀⠀⠀⠀⠀⢻⣿⣿⣿⣿⢿⣷⣿⣿⣿⣿⣿⣿⣿⣿⣿⢃⣼⣿⣿⡟⠀⠀⠀\n⠀⠀⠀⠀⠀⠀⠹⣿⣯⣵⣿⠿⠋⠿⠿⠿⠿⣿⣟⣛⣭⣵⣿⣿⣿⠏⠀⠀⠀⠀\n⠀⠀⠀⠀⠀⠀⠀⠈⠛⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠛⠉⠀⠀⠀⠀⠀\n⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡟⠀⠀⠀⠀⠀⠀⠀⠀\n⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⣿⣿⣿⣿⣿⣿⣿⣿⠛⠉⠀⠀⠀⠀⠀⠀⠀⠀⠀\n⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠉⠙⠛⣿⠋⠁⠉⢳⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀\n⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠙⢧⠀⠀⠔⠻⠿⡶⠤⠀⠀⠀⠀⠀⠀\n⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⣷⣤⠤⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\n⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠙⠏⠓⠀⠀⠀⠀⠀⠀⠀⠀⠀\n"
 
 // splitIdentifier splits a "/collab/{token}/..." route's remaining path
 // (rawPath, without its leading "/") into its leading identifier segment and
