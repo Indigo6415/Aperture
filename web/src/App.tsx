@@ -6,20 +6,27 @@ import { CaseView } from './components/CaseView'
 import { Wordlists } from './components/Wordlists'
 import { Login } from './components/Login'
 import { Settings } from './components/Settings'
-import { NotificationCenter } from './components/NotificationCenter'
+import { Navbar } from './components/Navbar'
 import { ContextMenuProvider } from './contextMenu'
 import { ToastHost } from './toast'
 import { initNotifications, stopNotifications } from './notifications'
+import { isVertical, useNavStyle } from './navStyle'
 
 // View is a small discriminated union instead of a plain string so a view
 // that needs an id (which case) carries it along rather than living in a
-// second piece of state that could get out of sync.
-type View = { name: 'caseList' } | { name: 'case'; caseId: string } | { name: 'wordlists' } | { name: 'settings' }
+// second piece of state that could get out of sync. Exported so Navbar.tsx
+// (which renders the active view's highlight/back-button) can share it
+// instead of redeclaring an equivalent type that could drift from this one.
+export type View = { name: 'caseList' } | { name: 'case'; caseId: string } | { name: 'wordlists' } | { name: 'settings' }
 
 export default function App() {
   const [view, setView] = useState<View>({ name: 'caseList' })
   // undefined = still probing api.me() on load; null = signed out.
   const [user, setUser] = useState<AuthUser | null | undefined>(undefined)
+  // Only the orientation (horizontal top bar vs. vertical rail) matters up
+  // here -- which of the four styles that resolves to, and everything about
+  // how it looks, is Navbar's own concern (see navStyle.ts/Navbar.tsx).
+  const navStyle = useNavStyle()
 
   useEffect(() => {
     api
@@ -75,31 +82,12 @@ export default function App() {
 
   return (
     <ContextMenuProvider>
-      <div className="flex h-screen flex-col bg-neutral-950">
-        <nav className="flex shrink-0 items-center gap-4 border-b border-neutral-800 px-4 py-2 text-sm">
-          <button onClick={() => setView({ name: 'caseList' })} className="font-semibold text-neutral-100 hover:text-sky-400">
-            Aperture
-          </button>
-          {(view.name === 'wordlists' || view.name === 'settings') && (
-            <button onClick={() => setView({ name: 'caseList' })} className="text-neutral-400 hover:text-neutral-200">
-              ← Back to cases
-            </button>
-          )}
-          <div className="ml-auto flex items-center gap-4">
-            <button onClick={() => setView({ name: 'wordlists' })} className={navClass(view.name === 'wordlists')}>
-              Wordlists
-            </button>
-            <button onClick={() => setView({ name: 'settings' })} className={navClass(view.name === 'settings')}>
-              Settings
-            </button>
-            <NotificationCenter />
-            <span className="text-neutral-600">|</span>
-            <span className="text-neutral-500">{user.email}</span>
-            <button onClick={logout} className="text-neutral-400 hover:text-neutral-200">
-              Log out
-            </button>
-          </div>
-        </nav>
+      {/* The rail navbar style is a left sidebar rather than a top bar, so the
+          outer shell needs to stack as a row instead of a column whenever
+          it's active -- see navStyle.ts's isVertical. Every other style is
+          horizontal and gets the original column layout. */}
+      <div className={`flex h-screen bg-neutral-950 ${isVertical(navStyle) ? 'flex-row' : 'flex-col'}`}>
+        <Navbar view={view} user={user} onNavigate={setView} onLogout={logout} />
 
         <div className="flex-1 overflow-hidden">
           {view.name === 'caseList' && <CaseList onOpen={(caseId) => setView({ name: 'case', caseId })} />}
@@ -111,8 +99,4 @@ export default function App() {
       <ToastHost />
     </ContextMenuProvider>
   )
-}
-
-function navClass(active: boolean): string {
-  return active ? 'text-sky-400' : 'text-neutral-400 hover:text-neutral-200'
 }

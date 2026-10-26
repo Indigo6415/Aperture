@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react'
 import { api } from '../api'
 import type { SettingsInfo } from '../types'
 import { applyMode, applyTheme, getStoredMode, getStoredTheme, THEMES, type Mode, type Theme } from '../theme'
+import { applyNavStyle, getStoredNavStyle, NAV_STYLES, type NavStyle } from '../navStyle'
+import { applyScannerNavStyle, getStoredScannerNavStyle, SCANNER_NAV_STYLES, type ScannerNavStyle } from '../scannerNavStyle'
 import { NotificationSettings } from './NotificationSettings'
 
 // SettingsTab is which section of the settings page is showing. The page used
@@ -130,6 +132,8 @@ function AppearanceTab() {
     <div className="space-y-6">
       <ModeToggle />
       <ThemePicker />
+      <NavStylePicker />
+      <ScannerNavStylePicker />
     </div>
   )
 }
@@ -267,6 +271,80 @@ function ThemePicker() {
           >
             <span className="block font-medium">{t.label}</span>
             <span className="mt-0.5 block text-[11px] text-neutral-500">{t.description}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+// NavStylePicker is ThemePicker's counterpart for the navbar layout itself
+// (see navStyle.ts) -- also a per-browser preference, applied instantly with
+// nothing to save. Kept as a separate card from ThemePicker since the two
+// are independent choices: any palette can pair with any of the four
+// layouts below.
+function NavStylePicker() {
+  const [navStyle, setNavStyle] = useState<NavStyle>(() => getStoredNavStyle())
+
+  const pick = (id: NavStyle) => {
+    applyNavStyle(id)
+    setNavStyle(id)
+  }
+
+  return (
+    <div className="space-y-2 rounded-lg border border-neutral-800 bg-neutral-900 p-4">
+      <h2 className="text-sm font-medium text-neutral-100">Navbar layout</h2>
+      <p className="text-xs text-neutral-500">Changes the shape of the navbar -- applies instantly, nothing to save.</p>
+      <div className="grid grid-cols-1 gap-2 pt-1 sm:grid-cols-2">
+        {NAV_STYLES.map((s) => (
+          <button
+            key={s.id}
+            type="button"
+            onClick={() => pick(s.id)}
+            className={`rounded border px-3 py-2 text-left text-xs ${
+              navStyle === s.id ? 'border-sky-500 bg-sky-950/40 text-sky-300' : 'border-neutral-700 bg-neutral-950 text-neutral-300 hover:border-sky-600'
+            }`}
+          >
+            <span className="block font-medium">{s.label}</span>
+            <span className="mt-0.5 block text-[11px] text-neutral-500">{s.description}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+// ScannerNavStylePicker is NavStylePicker's counterpart for the sidebar
+// inside a case -- the one switching between Targets, Identify, and every
+// scanner tab (see scannerNavStyle.ts). Also a per-browser preference,
+// applied instantly with nothing to save, and independent of every other
+// choice on this page.
+function ScannerNavStylePicker() {
+  const [style, setStyle] = useState<ScannerNavStyle>(() => getStoredScannerNavStyle())
+
+  const pick = (id: ScannerNavStyle) => {
+    applyScannerNavStyle(id)
+    setStyle(id)
+  }
+
+  return (
+    <div className="space-y-2 rounded-lg border border-neutral-800 bg-neutral-900 p-4">
+      <h2 className="text-sm font-medium text-neutral-100">Case sidebar layout</h2>
+      <p className="text-xs text-neutral-500">
+        Changes the shape of the scanner sidebar inside a case -- applies instantly, nothing to save.
+      </p>
+      <div className="grid grid-cols-1 gap-2 pt-1 sm:grid-cols-2">
+        {SCANNER_NAV_STYLES.map((s) => (
+          <button
+            key={s.id}
+            type="button"
+            onClick={() => pick(s.id)}
+            className={`rounded border px-3 py-2 text-left text-xs ${
+              style === s.id ? 'border-sky-500 bg-sky-950/40 text-sky-300' : 'border-neutral-700 bg-neutral-950 text-neutral-300 hover:border-sky-600'
+            }`}
+          >
+            <span className="block font-medium">{s.label}</span>
+            <span className="mt-0.5 block text-[11px] text-neutral-500">{s.description}</span>
           </button>
         ))}
       </div>

@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useRef, useState, type CSSProperties, type ReactElement, type SVGProps } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, watchJob } from '../api'
-import { BADGE_LABEL, IDLE_INDICATOR, INDICATOR_COLOR, ScanIndicatorContext, severityOfName, worseSeverity, type IndicatorSeverity, type ScanIndicator, type ScanPhase } from '../scanIndicator'
+import { IDLE_INDICATOR, INDICATOR_COLOR, ScanIndicatorContext, severityOfName, worseSeverity, type IndicatorSeverity, type ScanIndicator, type ScanPhase } from '../scanIndicator'
 import type { Case, Check, CheckKind, CookieVaultEntry, Credential, Finding, Job, JobOptions, JobOptionsPreset, NodeStatus, RunStatus, Target, TargetList, TargetListKind, TargetPingResult, Tool } from '../types'
 import { JOB_PRESETS } from '../presets'
 import { statusHexColor } from '../statusColor'
@@ -44,39 +44,13 @@ import { sendToBypass403, onBypass403Request, type Bypass403HandoffRequest } fro
 import { sendToTester, onTesterRequest, type TesterHandoffRequest } from '../testerHandoff'
 import { CollapsibleFormPanel } from './CollapsibleFormPanel'
 import { ScopeEditor } from './ScopeEditor'
-import { useAutoCollapseOnce, useAutoExpandOnce, useCollapsible } from '../collapsible'
+import { useAutoCollapseOnce, useCollapsible } from '../collapsible'
 import { CredentialVault } from './CredentialVault'
 import { CredentialPicker } from './CredentialPicker'
 import { CookieVault } from './CookieVault'
 import { JobTemplatePicker } from './JobTemplatePicker'
-import {
-  IconActivity,
-  IconBraces,
-  IconBug,
-  IconCode,
-  IconCookie,
-  IconCrosshair,
-  IconFolder,
-  IconFolderSearch,
-  IconGlobe,
-  IconKey,
-  IconLightning,
-  IconLock,
-  IconMailQuestion,
-  IconRadar,
-  IconRepeat,
-  IconRouteTree,
-  IconScan,
-  IconSend,
-  IconServer,
-  IconShieldKey,
-  IconSitemap,
-  IconTarget,
-  IconGitBranch,
-  IconUnlock,
-  IconWarning,
-  IconWrench,
-} from './icons'
+import { ScannerNav, scanBorderProps } from './ScannerNav'
+import { NAV_GROUPS, PINNED_TABS, TAB_META, type Tab } from '../scannerNavData'
 
 const CHECK_LABELS: Record<CheckKind, string> = {
   dns: 'DNS',
@@ -102,133 +76,10 @@ function keyFor(target: string, kind: CheckKind): string {
   return `${target}::${kind}`
 }
 
-type Tab =
-  | 'targets'
-  | 'credentials'
-  | 'cookieVault'
-  | 'identify'
-  | 'feroxbuster'
-  | 'ffuf-subdomain'
-  | 'ffuf-vhost'
-  | 'ffuf-custom'
-  | 'subfinder'
-  | 'katana'
-  | 'nuclei'
-  | 'jwtscan'
-  | 'probe'
-  | 'domainscan'
-  | 'secrets'
-  | 'breach'
-  | 'bypass403'
-  | 'gitdump'
-  | 'pwreset'
-  | 'graphqlenum'
-  | 'apienum'
-  | 'corsscan'
-  | 'openredirect'
-  | 'ssrf'
-  | 'csrf'
-  | 'sstiscan'
-  | 'pathtraversal'
-  | 'idor'
-  | 'xxe'
-  | 'xss'
-  | 'tester'
-  | 'collaborator'
-
-type IconType = (props: SVGProps<SVGSVGElement>) => ReactElement
-
-const TAB_META: Record<Tab, { label: string; icon: IconType }> = {
-  targets: { label: 'Targets', icon: IconTarget },
-  credentials: { label: 'Credentials', icon: IconKey },
-  cookieVault: { label: 'Cookie Vault', icon: IconCookie },
-  identify: { label: 'Identify', icon: IconRadar },
-  feroxbuster: { label: 'Directory', icon: IconFolderSearch },
-  'ffuf-subdomain': { label: 'Subdomain', icon: IconGlobe },
-  'ffuf-vhost': { label: 'VHost', icon: IconServer },
-  'ffuf-custom': { label: 'FFuF', icon: IconLightning },
-  subfinder: { label: 'Subfinder', icon: IconGlobe },
-  katana: { label: 'Katana Crawler', icon: IconFolder },
-  nuclei: { label: 'Nuclei', icon: IconWarning },
-  jwtscan: { label: 'JWT', icon: IconShieldKey },
-  probe: { label: 'Probe', icon: IconCrosshair },
-  domainscan: { label: 'Domain Scan', icon: IconBug },
-  secrets: { label: 'Secrets', icon: IconLock },
-  breach: { label: 'Breach Check', icon: IconKey },
-  bypass403: { label: '403 Bypass', icon: IconUnlock },
-  gitdump: { label: 'Git Dump', icon: IconGitBranch },
-  pwreset: { label: 'Password Reset', icon: IconMailQuestion },
-  graphqlenum: { label: 'GraphQL Enumeration', icon: IconBraces },
-  apienum: { label: 'API Enumerator', icon: IconRouteTree },
-  corsscan: { label: 'CORS', icon: IconGlobe },
-  openredirect: { label: 'Open Redirect', icon: IconRepeat },
-  ssrf: { label: 'SSRF', icon: IconServer },
-  csrf: { label: 'CSRF Sweep', icon: IconSitemap },
-  sstiscan: { label: 'SSTI', icon: IconBraces },
-  pathtraversal: { label: 'Path Traversal', icon: IconFolder },
-  idor: { label: 'IDOR', icon: IconUnlock },
-  xxe: { label: 'XXE', icon: IconCode },
-  xss: { label: 'XSS', icon: IconCode },
-  tester: { label: 'Tester', icon: IconSend },
-  collaborator: { label: 'Collaborator', icon: IconActivity },
-}
-
-// NAV_GROUPS is the left navbar's shape. PINNED_TABS sit at the top with no
-// group around them: the case-management tabs, plus Identify, since that's
-// the first thing a case is worked with and shouldn't be hidden inside a
-// collapsible section. Below them, each group is independently collapsible
-// and ordered the way a case is actually worked: recon to discover the
-// attack surface, vulnerability scanners against that surface, then the
-// standalone utilities for targeted manual work.
-type NavGroup = { id: string; label: string; icon: IconType; tabs: Tab[] }
-
-const PINNED_TABS: Tab[] = ['targets', 'identify', 'credentials', 'cookieVault']
-
 // JOB_INDICATOR_TABS are the tabs whose scans run as jobs tracked here in
 // CaseView (identify and the recon tools), so their nav border is derived
 // from those jobs rather than reported by the tab itself.
 const JOB_INDICATOR_TABS: Tool[] = ['identify', 'feroxbuster', 'ffuf-subdomain', 'ffuf-vhost', 'ffuf-custom', 'subfinder', 'katana', 'nuclei']
-
-const NAV_GROUPS: NavGroup[] = [
-  {
-    id: 'recon',
-    label: 'Recon',
-    icon: IconRadar,
-    tabs: ['feroxbuster', 'ffuf-subdomain', 'ffuf-vhost', 'ffuf-custom', 'subfinder', 'katana', 'nuclei'],
-  },
-  {
-    id: 'vulnerabilities',
-    label: 'Vulnerabilities',
-    icon: IconScan,
-    tabs: [
-      'jwtscan',
-      'probe',
-      'domainscan',
-      'secrets',
-      'breach',
-      'bypass403',
-      'gitdump',
-      'pwreset',
-      'graphqlenum',
-      'apienum',
-      'corsscan',
-      'openredirect',
-      'ssrf',
-      'csrf',
-      'sstiscan',
-      'pathtraversal',
-      'idor',
-      'xxe',
-      'xss',
-    ],
-  },
-  {
-    id: 'utilities',
-    label: 'Utilities',
-    icon: IconWrench,
-    tabs: ['tester', 'collaborator'],
-  },
-]
 
 // CaseView is one case's workspace: a left navbar switching between Targets,
 // Identify, and each scanning tool, each rendered as its own tab
@@ -655,21 +506,11 @@ export function CaseView({ caseId }: { caseId: string }) {
 
         <div className="flex flex-1 overflow-hidden">
           {navOpen ? (
-            <aside className="flex w-56 shrink-0 flex-col overflow-y-auto border-r border-neutral-800 bg-neutral-950 p-2">
+            <aside className="flex shrink-0 flex-col overflow-y-auto border-r border-neutral-800 bg-neutral-950 p-2">
               <button onClick={() => setNavOpen(false)} title="Collapse" className="mb-1 self-end px-1 text-xs text-neutral-600 hover:text-neutral-300">
                 ◂
               </button>
-              <div className="grid grid-cols-2 gap-1.5">
-                {PINNED_TABS.map((id) => (
-                  <NavTabButton key={id} id={id} active={tab === id} indicator={indicators[id]} unseen={!!unseen[id]} count={counts[id]} onSelect={() => setTab(id)} />
-                ))}
-              </div>
-              <div className="my-2 border-t border-neutral-900" />
-              <div className="space-y-3">
-                {NAV_GROUPS.map((group) => (
-                  <NavGroupSection key={group.id} group={group} activeTab={tab} indicators={indicators} unseen={unseen} counts={counts} onSelect={setTab} />
-                ))}
-              </div>
+              <ScannerNav activeTab={tab} indicators={indicators} unseen={unseen} counts={counts} onSelect={setTab} />
             </aside>
           ) : (
             <aside className="flex w-9 shrink-0 flex-col items-center gap-1 overflow-y-auto border-r border-neutral-800 bg-neutral-950 py-2">
@@ -680,7 +521,7 @@ export function CaseView({ caseId }: { caseId: string }) {
                 const Icon = TAB_META[id].icon
                 // The rail is too small for the tile's text, so it shows the same
                 // scan border on the icon button alone.
-                const scan = scanTileProps(indicators[id], !!unseen[id])
+                const scan = scanBorderProps(indicators[id], !!unseen[id])
                 return (
                   <button
                     key={id}
@@ -969,140 +810,6 @@ export function CaseView({ caseId }: { caseId: string }) {
         )}
       </div>
     </ScanIndicatorContext.Provider>
-  )
-}
-
-// --- Nav (left sidebar) ---
-
-// ScanTileProps is what a nav tile needs from its scan state: the classes and
-// inline style for its border, and whether that border is colored by the scan
-// (in which case the tile's own active/idle border colors step aside).
-interface ScanTileProps {
-  className: string
-  style: CSSProperties
-  ownBorder: boolean
-}
-
-// scanTileProps turns a tab's indicator into how its nav tile looks. A running
-// tab gets a comet sweeping its border and a soft pulse. When the run finishes
-// the comet closes into a ring and flashes out, and the border settles into a
-// solid outline in the result's color, which breathes until the user opens the
-// tab. A tab that never ran keeps its plain look.
-function scanTileProps(indicator: ScanIndicator | undefined, unseen: boolean): ScanTileProps {
-  if (!indicator || indicator.phase === 'idle') return { className: '', style: {}, ownBorder: false }
-  if (indicator.phase === 'running') {
-    return { className: 'scan-live', style: { '--scan-color': INDICATOR_COLOR.running } as CSSProperties, ownBorder: false }
-  }
-  // A finished run with nothing worth a look shows the clean green.
-  const color = INDICATOR_COLOR[indicator.severity ?? 'clean']
-  return {
-    className: unseen ? 'scan-done scan-breathe' : 'scan-done scan-outline',
-    style: { '--scan-color': color, borderColor: color } as CSSProperties,
-    ownBorder: true,
-  }
-}
-
-// NavTabButton is one rectangular tile in the nav's 2-column grid -- either
-// pinned at the top (Targets/Identify/Credentials/Cookie Vault) or inside a
-// NavGroupSection below. The icon and label fill the tile, the item count sits
-// in the top-left, and a scanner tab's border shows its scan state (see
-// scanTileProps).
-function NavTabButton({
-  id,
-  active,
-  indicator,
-  unseen,
-  count,
-  onSelect,
-}: {
-  id: Tab
-  active: boolean
-  indicator: ScanIndicator | undefined
-  unseen: boolean
-  count: number | null
-  onSelect: () => void
-}) {
-  const { label, icon: Icon } = TAB_META[id]
-  const scan = scanTileProps(indicator, unseen)
-  // The border color comes from the scan when there is one, so the active
-  // tab only gets its sky border when no scan color is shown.
-  const borderClass = scan.ownBorder ? '' : active ? 'border-sky-500' : 'border-neutral-800 hover:border-neutral-600'
-  return (
-    <button
-      onClick={onSelect}
-      title={`${label}${count !== null ? ` (${count})` : ''}`}
-      style={scan.style}
-      className={`relative flex h-16 flex-col items-center justify-center gap-1.5 rounded-md border px-1.5 text-center text-[11px] leading-tight ${scan.className} ${borderClass} ${
-        active ? 'bg-sky-950/40 text-sky-300' : 'bg-neutral-900 text-neutral-400 hover:text-neutral-200'
-      }`}
-    >
-      <Icon className="h-4 w-4 shrink-0" />
-      <span className="line-clamp-2">{label}</span>
-      {count !== null && <span className="absolute left-1.5 top-1 text-[10px] text-neutral-500">{count}</span>}
-      {indicator?.phase === 'done' && <ResultBadge severity={indicator.severity} />}
-    </button>
-  )
-}
-
-// ResultBadge is the labelled pill on a finished tile's top-right corner. It
-// is what makes "this scan is finished" readable at a glance, in the result's
-// color, without relying on the border's glow alone.
-function ResultBadge({ severity }: { severity: IndicatorSeverity | null }) {
-  const color = INDICATOR_COLOR[severity ?? 'clean']
-  return (
-    <span
-      className="scan-badge absolute -right-1.5 -top-1.5 rounded-full border bg-neutral-950 px-1.5 py-px text-[9px] font-bold uppercase leading-tight tracking-wide"
-      style={{ color, borderColor: color } as CSSProperties}
-    >
-      {BADGE_LABEL[severity ?? 'clean']}
-    </span>
-  )
-}
-
-// NavGroupSection renders one collapsible group (Recon/Vulnerabilities/
-// Utilities) as a header plus its tiles in a 2-column grid. Each group
-// remembers its own open/closed state under its own key so collapsing
-// "Utilities" doesn't affect "Recon" -- and it starts open, expanding to
-// reveal the active tab if a group is reopened to reveal a saved-collapsed
-// tab that later becomes active (e.g. via a "Send to X" handoff from
-// elsewhere in the case).
-function NavGroupSection({
-  group,
-  activeTab,
-  indicators,
-  unseen,
-  counts,
-  onSelect,
-}: {
-  group: NavGroup
-  activeTab: Tab
-  indicators: Record<string, ScanIndicator>
-  unseen: Record<string, true>
-  counts: Record<Tab, number | null>
-  onSelect: (tab: Tab) => void
-}) {
-  const [open, setOpen] = useCollapsible(`caseNav.group.${group.id}`, true)
-  const hasActive = group.tabs.includes(activeTab)
-  useAutoExpandOnce(hasActive, setOpen)
-  const Icon = group.icon
-  return (
-    <div>
-      <button
-        onClick={() => setOpen(!open)}
-        className="flex w-full items-center gap-1.5 border-l-2 border-sky-700/70 py-1.5 pl-2 pr-1 text-left text-[11px] font-bold uppercase tracking-wider text-sky-400 hover:border-sky-500 hover:text-sky-300"
-      >
-        <Icon className="h-3.5 w-3.5 shrink-0 text-sky-500" />
-        <span className="flex-1">{group.label}</span>
-        <span className="text-sky-700">{open ? '▾' : '▸'}</span>
-      </button>
-      {open && (
-        <div className="grid grid-cols-2 gap-1.5 pt-1.5">
-          {group.tabs.map((id) => (
-            <NavTabButton key={id} id={id} active={activeTab === id} indicator={indicators[id]} unseen={!!unseen[id]} count={counts[id]} onSelect={() => onSelect(id)} />
-          ))}
-        </div>
-      )}
-    </div>
   )
 }
 
